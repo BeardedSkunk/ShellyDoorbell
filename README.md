@@ -96,6 +96,7 @@ Beim ersten Start führt die App durch die nötigen Berechtigungen
 | `dbell_cfg_threshold_w` | Watt-Schwelle für „es klingelt“ (Default 2.0)      |
 | `dbell_cfg_debounce_s`  | Sperrzeit nach einem Klingeln in s (Default 30)    |
 | `dbell_ring_ids`        | Klingelzeiten: JSON-Liste der Schedule-Job-Paare `[[einId,ausId],…]` |
+| `dbell_mute_until`      | „Ruhe bis“: Unix-Zeit, bis zu der die Klingel stumm ist |
 | `dbell_log_head`        | Index des aktuellen Log-Chunks                     |
 | `dbell_log_0` … `_9`    | Ringpuffer: JSON-Arrays mit Unix-Timestamps        |
 
@@ -106,8 +107,14 @@ Beim ersten Start führt die App durch die nötigen Berechtigungen
 - Klingelzeiten schalten zeitgesteuert ein (Fensterbeginn) und aus
   (Fensterende). Ein manueller Eingriff gilt damit höchstens bis zur
   nächsten Schaltflanke.
+- **„Ruhe bis HH:MM“** schaltet die Klingel sofort stumm – ohne Schedule.
+  Beim Ablauf schaltet das Script auf dem Shelly gemäß Klingelzeiten zurück,
+  löscht den KVS-Key und informiert alle Apps; es bleibt nichts zurück, das
+  am nächsten Tag erneut zuschlagen könnte. Der laufende Ruhe-Timer ist auf
+  allen Geräten sichtbar und kann überall geändert oder beendet werden.
 - Nach einem Stromausfall/Neustart gleicht das Script den Zustand ab:
-  innerhalb irgendeiner Klingelzeit an, sonst aus (ohne Klingelzeiten: an).
+  laufende „Ruhe bis“ → aus; sonst innerhalb irgendeiner Klingelzeit an,
+  sonst aus (ohne Klingelzeiten: an).
 - Wochentage einer Klingelzeit = Tage, an denen sie **beginnt** (Fenster über
   Mitternacht laufen in den Folgetag). In der App beginnt die Woche mit
   Montag, anders als in der Shelly-Oberfläche.

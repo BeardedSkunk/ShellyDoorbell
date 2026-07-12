@@ -88,6 +88,10 @@ class DoorbellService : Service() {
     private val _bellTimes = MutableStateFlow<List<BellEntry>?>(null)
     val bellTimes: StateFlow<List<BellEntry>?> = _bellTimes
 
+    /** "Ruhe bis": Unix-Sekunden, null = keine temporaere Stummschaltung. */
+    private val _muteUntil = MutableStateFlow<Long?>(null)
+    val muteUntil: StateFlow<Long?> = _muteUntil
+
     /** null = unbekannt, false = doorbell-Script fehlt/gestoppt auf dem Shelly. */
     private val _scriptOk = MutableStateFlow<Boolean?>(null)
     val scriptOk: StateFlow<Boolean?> = _scriptOk
@@ -133,6 +137,10 @@ class DoorbellService : Service() {
                     if (!pollingActive) return@collectLatest
                     while (true) {
                         runCatching { pollStatus() }
+                        // abgelaufene "Ruhe bis" aus der Anzeige nehmen (das
+                        // Script auf dem Shelly schaltet den Trafo selbst zurueck)
+                        _muteUntil.value = _muteUntil.value
+                            ?.takeIf { it > System.currentTimeMillis() / 1000 }
                         delay(2_000)
                     }
                 }
@@ -212,6 +220,8 @@ class DoorbellService : Service() {
                 debounceS = kv.num("dbell_cfg_debounce_s")?.toInt() ?: DEFAULT_DEBOUNCE_S,
             )
             refreshBellTimes(kv)
+            _muteUntil.value = kv.num("dbell_mute_until")?.toLong()
+                ?.takeIf { it > System.currentTimeMillis() / 1000 }
             runCatching { pollStatus() }
             mergeKvsLog(kv)
         }
@@ -411,6 +421,35 @@ class DoorbellService : Service() {
 
     private fun currentIds(): List<Pair<Int, Int>> = _bellTimes.value.orEmpty().map { it.onId to it.offId }
 
+    /** "Ruhe bis": Klingel sofort stumm, das Shelly-Script schaltet bei Ablauf zurueck. */
+    fun setMute(untilTs: Long) {
+        scope.launch {
+            runCatching {
+                kvsSet("dbell_mute_until", untilTs)
+                _muteUntil.value = untilTs
+                alignBell()
+                notifyScriptCfgChanged()
+            }.onFailure {
+                _messages.tryEmit("Ruhe setzen fehlgeschlagen: ${it.message}")
+                runCatching { refreshSettings() }
+            }
+        }
+    }
+
+    fun clearMute() {
+        scope.launch {
+            runCatching {
+                kvsDelete("dbell_mute_until")
+                _muteUntil.value = null
+                alignBell()
+                notifyScriptCfgChanged()
+            }.onFailure {
+                _messages.tryEmit("Ruhe beenden fehlgeschlagen: ${it.message}")
+                runCatching { refreshSettings() }
+            }
+        }
+    }
+
     private fun switchCall(on: Boolean): JSONArray = JSONArray().put(
         JSONObject()
             .put("method", "Switch.Set")
@@ -438,11 +477,13 @@ class DoorbellService : Service() {
     }
 
     private suspend fun alignBell() {
-        // Der Nutzer hat gerade bewusst an den Klingelzeiten gedreht: Schalter
-        // sofort auf den erwarteten Zustand bringen (innerhalb eines Fensters ->
-        // an, ausserhalb -> aus; ohne Klingelzeiten gehoert die Klingel an).
+        // Der Nutzer hat gerade bewusst an Klingelzeiten oder Ruhe gedreht:
+        // Schalter sofort auf den erwarteten Zustand bringen. Laufende "Ruhe
+        // bis" hat Vorrang; sonst: innerhalb eines Fensters -> an, ausserhalb
+        // -> aus; ohne Klingelzeiten gehoert die Klingel an.
+        val muted = (_muteUntil.value ?: 0) > System.currentTimeMillis() / 1000
         val windows = _bellTimes.value.orEmpty().filter { it.enabled }
-        val expectedOn = windows.isEmpty() || windows.any { it.window.isInsideNow() }
+        val expectedOn = !muted && (windows.isEmpty() || windows.any { it.window.isInsideNow() })
         if (_bellOn.value != expectedOn) {
             client.call("Switch.Set", JSONObject().put("id", 0).put("on", expectedOn))
         }

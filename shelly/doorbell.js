@@ -16,6 +16,9 @@
 //   dbell_cfg_debounce_s   Sperrzeit nach einem Klingeln in Sekunden (Default 30)
 //   dbell_ring_ids         Klingelzeiten als JSON-Liste von Schedule-Job-Paaren
 //                          "[[einId,ausId],...]" (ein = Fenster-Beginn, aus = Ende)
+//   dbell_mute_until       "Ruhe bis": Unix-Zeit (Sekunden), bis zu der die
+//                          Klingel stumm ist; laeuft ueber einen Script-Timer
+//                          ab (kein Schedule, hinterlaesst nichts)
 //   dbell_log_head         Index des aktuellen Log-Chunks (0..9)
 //   dbell_log_0 .. _9      Log-Chunks: JSON-Array von Unix-Timestamps als String
 //
@@ -34,7 +37,8 @@ let LOG_PER_CHUNK = 20; // 20 Timestamps ~ 221 Zeichen JSON, KVS-Limit ist 253
 let cfg = {
   thr: DEF_THRESHOLD_W,
   deb: DEF_DEBOUNCE_S,
-  ring: [] // Klingelzeiten: Array von Schedule-Job-Paaren [einId, ausId]
+  ring: [],    // Klingelzeiten: Array von Schedule-Job-Paaren [einId, ausId]
+  muteUntil: 0 // "Ruhe bis" als Unix-Sekunden, 0 = keine Ruhe
 };
 
 let lastRingMs = 0;
@@ -95,7 +99,7 @@ function toNum(v, dflt) {
 // ---------- Konfiguration aus dem KVS ----------
 
 function loadCfg(cb) {
-  Shelly.call("KVS.GetMany", { match: "dbell_cfg_*,dbell_ring_*" }, function (res) {
+  Shelly.call("KVS.GetMany", { match: "dbell_cfg_*,dbell_ring_*,dbell_mute_until" }, function (res) {
     let items = {};
     if (res && res.items) {
       if (res.items.length !== undefined) {
@@ -114,6 +118,12 @@ function loadCfg(cb) {
       let a = JSON.parse(items.dbell_ring_ids);
       if (a && a.length !== undefined) cfg.ring = a;
     }
+    cfg.muteUntil = toNum(items.dbell_mute_until, 0);
+    if (res && cfg.muteUntil !== 0 && cfg.muteUntil <= Math.floor(Date.now() / 1000)) {
+      // abgelaufene Ruhe aufraeumen (z. B. Ablauf waehrend Stromausfall)
+      Shelly.call("KVS.Delete", { key: "dbell_mute_until" });
+      cfg.muteUntil = 0;
+    }
     // Defaults einmalig ablegen, damit die Apps sie vorfinden — aber nur, wenn
     // die Abfrage wirklich geklappt hat (sonst wuerden echte Werte ueberschrieben).
     if (res) {
@@ -130,9 +140,36 @@ function loadCfg(cb) {
 // geaendert haben: Konfig neu laden und alle Apps informieren.
 function cfgChanged() {
   loadCfg(function () {
+    scheduleMuteTimer();
     Shelly.emitEvent("doorbell_cfg", null);
   });
   return true;
+}
+
+// ---------- "Ruhe bis" (temporaere Stummschaltung) ----------
+//
+// Die App schaltet den Trafo beim Setzen sofort aus; dieses Script schaltet
+// beim Ablauf wieder gemaess Klingelzeiten, loescht den KVS-Key und
+// broadcastet doorbell_cfg an alle Apps. Kein Schedule -> nichts, was am
+// naechsten Tag faelschlich erneut zuschlagen koennte.
+
+let muteTimer = null;
+
+function scheduleMuteTimer() {
+  if (muteTimer !== null) {
+    Timer.clear(muteTimer);
+    muteTimer = null;
+  }
+  let nowS = Math.floor(Date.now() / 1000);
+  if (cfg.muteUntil <= nowS) return;
+  muteTimer = Timer.set((cfg.muteUntil - nowS) * 1000 + 1000, false, function () {
+    muteTimer = null;
+    cfg.muteUntil = 0;
+    print("doorbell: Ruhe abgelaufen, schalte gemaess Klingelzeiten");
+    Shelly.call("KVS.Delete", { key: "dbell_mute_until" });
+    reconcileBell();
+    Shelly.emitEvent("doorbell_cfg", null);
+  });
 }
 
 // ---------- Klingel-Log (Ringpuffer im KVS) ----------
@@ -286,6 +323,11 @@ function setBell(on) {
 }
 
 function reconcileBell() {
+  // Laufende "Ruhe bis"-Stummschaltung hat Vorrang.
+  if (cfg.muteUntil > Math.floor(Date.now() / 1000)) {
+    setBell(false);
+    return;
+  }
   // Ohne Klingelzeiten gilt: Klingel gehoert an.
   if (cfg.ring.length === 0) {
     setBell(true);
@@ -337,6 +379,7 @@ function reconcileBell() {
 // ---------- Start ----------
 
 loadCfg(function () {
+  scheduleMuteTimer();
   reconcileBell();
 });
 initLog();

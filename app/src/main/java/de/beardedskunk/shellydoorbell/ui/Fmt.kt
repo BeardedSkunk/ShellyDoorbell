@@ -54,6 +54,17 @@ object Fmt {
         return parts.joinToString(", ")
     }
 
+    /** Zielzeit der "Ruhe bis"-Anzeige: "17:30" bzw. "morgen 08:00". */
+    fun muteUntil(ts: Long): String {
+        val d = localDate(ts)
+        val t = time(ts)
+        return when (d) {
+            LocalDate.now() -> t
+            LocalDate.now().plusDays(1) -> "morgen $t"
+            else -> "${date(d)}, $t"
+        }
+    }
+
     /** "Mo–Fr 08:00–20:00" — Anzeige einer Klingelzeit. */
     fun window(w: BellWindow): String =
         "${dayRange(w.days)} ${minutes(w.startMin)}–${minutes(w.endMin)}"

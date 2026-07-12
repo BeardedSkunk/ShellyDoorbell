@@ -65,6 +65,10 @@ import de.beardedskunk.shellydoorbell.shelly.BellTimes
 import de.beardedskunk.shellydoorbell.shelly.BellWindow
 import de.beardedskunk.shellydoorbell.shelly.ConnectionState
 import de.beardedskunk.shellydoorbell.shelly.SharedSettings
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.LocalTime
+import java.time.ZoneId
 import kotlin.math.roundToInt
 
 @Composable
@@ -81,6 +85,7 @@ fun MainScreen(
     val bellOn by service.bellOn.collectAsState()
     val shared by service.shared.collectAsState()
     val bellTimes by service.bellTimes.collectAsState()
+    val muteUntil by service.muteUntil.collectAsState()
     val scriptOk by service.scriptOk.collectAsState()
     val alarmActive by service.alarmActive.collectAsState()
     val connected = conn is ConnectionState.Connected
@@ -108,7 +113,14 @@ fun MainScreen(
             if (alarmActive) AlarmBanner(onStop = { service.stopAlarm() })
             ConnectionCard(conn, watts, onReconnect = { service.reconnect() })
             if (connected && scriptOk == false) ScriptWarning()
-            BellCard(bellOn, connected, onToggle = { service.setBell(it) })
+            BellCard(
+                bellOn = bellOn,
+                muteUntil = muteUntil,
+                connected = connected,
+                onToggle = { service.setBell(it) },
+                onMute = { service.setMute(it) },
+                onClearMute = { service.clearMute() },
+            )
             BellTimesCard(
                 entries = bellTimes,
                 connected = connected,
@@ -190,7 +202,15 @@ private fun ScriptWarning() {
 }
 
 @Composable
-private fun BellCard(bellOn: Boolean?, connected: Boolean, onToggle: (Boolean) -> Unit) {
+private fun BellCard(
+    bellOn: Boolean?,
+    muteUntil: Long?,
+    connected: Boolean,
+    onToggle: (Boolean) -> Unit,
+    onMute: (Long) -> Unit,
+    onClearMute: () -> Unit,
+) {
+    var pickMute by remember { mutableStateOf(false) }
     val off = bellOn == false
     Card(
         colors = if (off) {
@@ -199,26 +219,67 @@ private fun BellCard(bellOn: Boolean?, connected: Boolean, onToggle: (Boolean) -
             CardDefaults.cardColors()
         }
     ) {
-        Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Filled.Notifications, contentDescription = null)
-            Column(Modifier.weight(1f).padding(start = 12.dp)) {
-                Text("Klingel", style = MaterialTheme.typography.titleMedium)
-                Text(
-                    when (bellOn) {
-                        true -> "Trafo eingeschaltet – Klingel funktioniert"
-                        false -> "Trafo AUS – es kann niemand klingeln!"
-                        null -> "Status unbekannt"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Filled.Notifications, contentDescription = null)
+                Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                    Text("Klingel", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        when (bellOn) {
+                            true -> "Trafo eingeschaltet – Klingel funktioniert"
+                            false -> "Trafo AUS – es kann niemand klingeln!"
+                            null -> "Status unbekannt"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Switch(
+                    checked = bellOn == true,
+                    onCheckedChange = onToggle,
+                    enabled = connected && bellOn != null,
                 )
             }
-            Switch(
-                checked = bellOn == true,
-                onCheckedChange = onToggle,
-                enabled = connected && bellOn != null,
-            )
+            if (muteUntil != null) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        "Ruhe bis ${Fmt.muteUntil(muteUntil)}",
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    OutlinedButton(onClick = { pickMute = true }, enabled = connected) { Text("Ändern") }
+                    OutlinedButton(onClick = onClearMute, enabled = connected) { Text("Beenden") }
+                }
+            } else {
+                OutlinedButton(onClick = { pickMute = true }, enabled = connected) {
+                    Text("Ruhe bis …")
+                }
+            }
         }
     }
+
+    if (pickMute) {
+        // Vorbelegung: laufende Ruhe, sonst in einer Stunde
+        val initial = muteUntil
+            ?.let { Instant.ofEpochSecond(it).atZone(ZoneId.systemDefault()).toLocalTime() }
+            ?: LocalTime.now().plusHours(1)
+        TimePickerDialog(
+            initialMin = initial.hour * 60 + initial.minute,
+            onDismiss = { pickMute = false },
+            onConfirm = { min -> pickMute = false; onMute(nextOccurrence(min)) },
+        )
+    }
+}
+
+/** Naechster Zeitpunkt mit dieser Uhrzeit als Unix-Sekunden: heute, sonst morgen. */
+private fun nextOccurrence(minuteOfDay: Int): Long {
+    val now = LocalDateTime.now()
+    var t = now.toLocalDate().atTime(minuteOfDay / 60, minuteOfDay % 60)
+    if (!t.isAfter(now)) t = t.plusDays(1)
+    return t.atZone(ZoneId.systemDefault()).toEpochSecond()
 }
 
 @Composable
