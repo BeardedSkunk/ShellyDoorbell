@@ -13,8 +13,8 @@
 // KVS-Schema (alles fuer die Apps les-/schreibbar, kein Passwort):
 //   dbell_cfg_threshold_w  Watt-Schwelle fuer "es klingelt"          (Default 2.0)
 //   dbell_cfg_debounce_s   Sperrzeit nach einem Klingeln in Sekunden (Default 30)
-//   dbell_dnd_off_id       Schedule-Job-ID "Klingel aus" (DND-Beginn)
-//   dbell_dnd_on_id        Schedule-Job-ID "Klingel an"  (DND-Ende)
+//   dbell_dnd_ids          Ruhezeiten als JSON-Liste von Schedule-Job-Paaren
+//                          "[[ausId,einId],...]" (aus = DND-Beginn, ein = DND-Ende)
 //   dbell_log_head         Index des aktuellen Log-Chunks (0..9)
 //   dbell_log_0 .. _9      Log-Chunks: JSON-Array von Unix-Timestamps als String
 //
@@ -33,8 +33,7 @@ let LOG_PER_CHUNK = 20; // 20 Timestamps ~ 221 Zeichen JSON, KVS-Limit ist 253
 let cfg = {
   thr: DEF_THRESHOLD_W,
   deb: DEF_DEBOUNCE_S,
-  offId: null, // Schedule "Klingel aus" (DND-Beginn)
-  onId: null   // Schedule "Klingel an"  (DND-Ende)
+  dnd: [] // Ruhezeiten: Array von Schedule-Job-Paaren [ausId, einId]
 };
 
 let lastRingMs = 0;
@@ -108,8 +107,12 @@ function loadCfg(cb) {
     }
     cfg.thr = toNum(items.dbell_cfg_threshold_w, DEF_THRESHOLD_W);
     cfg.deb = toNum(items.dbell_cfg_debounce_s, DEF_DEBOUNCE_S);
-    cfg.offId = toNum(items.dbell_dnd_off_id, null);
-    cfg.onId = toNum(items.dbell_dnd_on_id, null);
+    cfg.dnd = [];
+    if (typeof items.dbell_dnd_ids === "string") {
+      // Shellys JSON.parse wirft nicht, sondern liefert undefined bei Muell
+      let a = JSON.parse(items.dbell_dnd_ids);
+      if (a && a.length !== undefined) cfg.dnd = a;
+    }
     // Defaults einmalig ablegen, damit die Apps sie vorfinden — aber nur, wenn
     // die Abfrage wirklich geklappt hat (sonst wuerden echte Werte ueberschrieben).
     if (res) {
@@ -204,9 +207,9 @@ Shelly.addStatusHandler(function (st) {
 
 // ---------- DND-Abgleich nach dem Boot ----------
 //
-// Die Ruhezeiten liegen in zwei normalen Shelly-Schedules (aus/ein). Faellt der
+// Jede Ruhezeit liegt in zwei normalen Shelly-Schedules (aus/ein). Faellt der
 // Strom waehrend einer Schaltflanke aus, stellt dieser Abgleich nach dem Boot
-// den erwarteten Zustand her: innerhalb der Ruhezeit aus, ausserhalb an.
+// den erwarteten Zustand her: innerhalb irgendeiner Ruhezeit aus, sonst an.
 
 // Timespec "ss mm hh dom mon dow" -> {min, days[0..6]} (Tage wie cron: 0=Sonntag).
 // Es werden nur numerische Tageslisten/-bereiche unterstuetzt (die App und die
@@ -281,41 +284,51 @@ function setBell(on) {
 }
 
 function reconcileDnd() {
-  // Ohne (aktive) DND-Schedules gilt: Klingel gehoert an.
-  if (cfg.offId === null || cfg.onId === null) {
+  // Ohne Ruhezeiten gilt: Klingel gehoert an.
+  if (cfg.dnd.length === 0) {
     setBell(true);
     return;
   }
   Shelly.call("Schedule.List", {}, function (res) {
-    let off = null;
-    let on = null;
-    if (res && res.jobs) {
-      for (let i = 0; i < res.jobs.length; i++) {
-        if (res.jobs[i].id === cfg.offId) off = res.jobs[i];
-        if (res.jobs[i].id === cfg.onId) on = res.jobs[i];
-      }
-    }
-    if (!off || !on || !off.enable || !on.enable) {
-      setBell(true);
-      return;
-    }
-    let o = parseTimespec(off.timespec);
-    let e = parseTimespec(on.timespec);
+    let jobs = (res && res.jobs) ? res.jobs : [];
     let now = computeNowLocal();
-    if (!o || !e || !now) {
-      print("doorbell: DND-Zeitplan nicht auswertbar, lasse Zustand unveraendert");
+    if (!now) {
+      print("doorbell: keine Uhrzeit verfuegbar, lasse Zustand unveraendert");
       return;
     }
-    let inside = false;
-    if (e.min > o.min) {
-      // Fenster am selben Tag
-      inside = o.days[now.dow] && now.min >= o.min && now.min < e.min;
-    } else {
-      // Fenster ueber Mitternacht: heute begonnen ODER gestern begonnen
-      let prev = (now.dow + 6) % 7;
-      inside = (o.days[now.dow] && now.min >= o.min) || (o.days[prev] && now.min < e.min);
+    let inside = false;  // mindestens eine Ruhezeit laeuft gerade
+    let unknown = false; // mindestens eine Ruhezeit war nicht auswertbar
+    for (let i = 0; i < cfg.dnd.length; i++) {
+      let pair = cfg.dnd[i];
+      if (!pair || pair.length !== 2) continue;
+      let off = null;
+      let on = null;
+      for (let j = 0; j < jobs.length; j++) {
+        if (jobs[j].id === pair[0]) off = jobs[j];
+        if (jobs[j].id === pair[1]) on = jobs[j];
+      }
+      // Fehlende/deaktivierte Jobs schalten nichts -> zaehlen nicht als Ruhezeit
+      if (!off || !on || !off.enable || !on.enable) continue;
+      let o = parseTimespec(off.timespec);
+      let e = parseTimespec(on.timespec);
+      if (!o || !e) {
+        unknown = true;
+        continue;
+      }
+      let ins = false;
+      if (e.min > o.min) {
+        // Fenster am selben Tag
+        ins = o.days[now.dow] && now.min >= o.min && now.min < e.min;
+      } else {
+        // Fenster ueber Mitternacht: heute begonnen ODER gestern begonnen
+        let prev = (now.dow + 6) % 7;
+        ins = (o.days[now.dow] && now.min >= o.min) || (o.days[prev] && now.min < e.min);
+      }
+      if (ins) inside = true;
     }
-    setBell(!inside);
+    if (inside) setBell(false);
+    else if (!unknown) setBell(true);
+    else print("doorbell: DND-Zeitplan nicht auswertbar, lasse Zustand unveraendert");
   });
 }
 

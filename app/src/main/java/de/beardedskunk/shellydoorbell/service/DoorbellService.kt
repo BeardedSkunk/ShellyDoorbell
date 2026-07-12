@@ -28,7 +28,8 @@ import de.beardedskunk.shellydoorbell.data.RingDao
 import de.beardedskunk.shellydoorbell.data.RingEvent
 import de.beardedskunk.shellydoorbell.shelly.ConnectionState
 import de.beardedskunk.shellydoorbell.shelly.Dnd
-import de.beardedskunk.shellydoorbell.shelly.DndSettings
+import de.beardedskunk.shellydoorbell.shelly.DndEntry
+import de.beardedskunk.shellydoorbell.shelly.DndWindow
 import de.beardedskunk.shellydoorbell.shelly.SharedSettings
 import de.beardedskunk.shellydoorbell.shelly.ShellyClient
 import de.beardedskunk.shellydoorbell.shelly.ShellyRpcException
@@ -83,8 +84,9 @@ class DoorbellService : Service() {
     private val _shared = MutableStateFlow<SharedSettings?>(null)
     val shared: StateFlow<SharedSettings?> = _shared
 
-    private val _dnd = MutableStateFlow<DndSettings?>(null)
-    val dnd: StateFlow<DndSettings?> = _dnd
+    /** null = noch nicht geladen; sonst die Liste der Ruhezeiten auf dem Shelly. */
+    private val _dnd = MutableStateFlow<List<DndEntry>?>(null)
+    val dnd: StateFlow<List<DndEntry>?> = _dnd
 
     /** null = unbekannt, false = doorbell-Script fehlt/gestoppt auf dem Shelly. */
     private val _scriptOk = MutableStateFlow<Boolean?>(null)
@@ -209,38 +211,47 @@ class DoorbellService : Service() {
                 thresholdW = kv.num("dbell_cfg_threshold_w") ?: DEFAULT_THRESHOLD_W,
                 debounceS = kv.num("dbell_cfg_debounce_s")?.toInt() ?: DEFAULT_DEBOUNCE_S,
             )
-            refreshDnd(kv.num("dbell_dnd_off_id")?.toInt(), kv.num("dbell_dnd_on_id")?.toInt())
+            refreshDnd(kv)
             runCatching { pollStatus() }
             mergeKvsLog(kv)
         }
     }
 
-    private suspend fun refreshDnd(offId: Int?, onId: Int?) {
-        if (offId == null || onId == null) {
-            _dnd.value = null
+    private suspend fun refreshDnd(kv: Map<String, Any?>) {
+        var ids = parseIdPairs(kv["dbell_dnd_ids"])
+        // Migration: fruehere Version hielt genau eine Ruhezeit in zwei Einzel-Keys
+        val legacyOff = kv.num("dbell_dnd_off_id")?.toInt()
+        val legacyOn = kv.num("dbell_dnd_on_id")?.toInt()
+        if (legacyOff != null && legacyOn != null) {
+            ids = (ids + (legacyOff to legacyOn)).distinct()
+            kvsSet("dbell_dnd_ids", idsJson(ids))
+            kvsDelete("dbell_dnd_off_id")
+            kvsDelete("dbell_dnd_on_id")
+        }
+        if (ids.isEmpty()) {
+            _dnd.value = emptyList()
             return
         }
         val jobs = client.call("Schedule.List").optJSONArray("jobs")
-        var off: JSONObject? = null
-        var on: JSONObject? = null
+        val byId = mutableMapOf<Int, JSONObject>()
         if (jobs != null) {
             for (i in 0 until jobs.length()) {
                 val j = jobs.optJSONObject(i) ?: continue
-                when (j.optInt("id", -1)) {
-                    offId -> off = j
-                    onId -> on = j
-                }
+                byId[j.optInt("id", -1)] = j
             }
         }
-        _dnd.value = if (off != null && on != null) {
-            Dnd.parse(
-                off.optString("timespec"),
-                on.optString("timespec"),
-                off.optBoolean("enable") && on.optBoolean("enable"),
-            )
-        } else {
-            null
+        val entries = ids.mapNotNull { (offId, onId) ->
+            val off = byId[offId] ?: return@mapNotNull null
+            val on = byId[onId] ?: return@mapNotNull null
+            Dnd.parse(off.optString("timespec"), on.optString("timespec"))?.let { w ->
+                DndEntry(offId, onId, w, off.optBoolean("enable") && on.optBoolean("enable"))
+            }
         }
+        if (entries.size != ids.size) {
+            // Jobs wurden extern geloescht/umgebaut -> Id-Liste im KVS aufraeumen
+            kvsSet("dbell_dnd_ids", idsJson(entries.map { it.offId to it.onId }))
+        }
+        _dnd.value = entries
     }
 
     private suspend fun pollStatus() {
@@ -353,32 +364,46 @@ class DoorbellService : Service() {
         }
     }
 
-    fun saveDnd(d: DndSettings) {
+    fun addDnd(w: DndWindow) {
         scope.launch {
-            runCatching { applyDnd(d) }
-                .onFailure {
-                    _messages.tryEmit("Ruhezeit speichern fehlgeschlagen: ${it.message}")
-                    runCatching { refreshSettings() }
+            runCatching {
+                val offId = createSchedule(Dnd.offTimespec(w), switchCall(false))
+                val onId = try {
+                    createSchedule(Dnd.onTimespec(w), switchCall(true))
+                } catch (e: Exception) {
+                    // kein halbes Paar stehen lassen
+                    runCatching { deleteSchedule(offId) }
+                    throw e
                 }
+                kvsSet("dbell_dnd_ids", idsJson(currentIds() + (offId to onId)))
+                _dnd.value = _dnd.value.orEmpty() + DndEntry(offId, onId, w, enabled = true)
+                alignBellWithDnd()
+                notifyScriptCfgChanged()
+            }.onFailure {
+                _messages.tryEmit("Ruhezeit anlegen fehlgeschlagen: ${it.message}")
+                runCatching { refreshSettings() }
+            }
         }
     }
 
-    private suspend fun applyDnd(d: DndSettings) {
-        val kv = kvsGetMany("dbell_dnd_*")
-        val offId = upsertSchedule(kv.num("dbell_dnd_off_id")?.toInt(), d.enabled, Dnd.offTimespec(d), switchCall(false))
-        val onId = upsertSchedule(kv.num("dbell_dnd_on_id")?.toInt(), d.enabled, Dnd.onTimespec(d), switchCall(true))
-        kvsSet("dbell_dnd_off_id", offId)
-        kvsSet("dbell_dnd_on_id", onId)
-        _dnd.value = d
-        // Schalter sofort auf den erwarteten Zustand bringen (der Nutzer hat gerade
-        // bewusst an den Ruhezeiten gedreht): innerhalb -> aus, ausserhalb -> an.
-        val expectedOn = !d.isInsideNow()
-        if (_bellOn.value != expectedOn) {
-            client.call("Switch.Set", JSONObject().put("id", 0).put("on", expectedOn))
+    fun removeDnd(entry: DndEntry) {
+        scope.launch {
+            runCatching {
+                deleteSchedule(entry.offId)
+                deleteSchedule(entry.onId)
+                kvsSet("dbell_dnd_ids", idsJson(currentIds() - (entry.offId to entry.onId)))
+                _dnd.value = _dnd.value.orEmpty()
+                    .filterNot { it.offId == entry.offId && it.onId == entry.onId }
+                alignBellWithDnd()
+                notifyScriptCfgChanged()
+            }.onFailure {
+                _messages.tryEmit("Ruhezeit löschen fehlgeschlagen: ${it.message}")
+                runCatching { refreshSettings() }
+            }
         }
-        notifyScriptCfgChanged()
-        runCatching { pollStatus() }
     }
+
+    private fun currentIds(): List<Pair<Int, Int>> = _dnd.value.orEmpty().map { it.offId to it.onId }
 
     private fun switchCall(on: Boolean): JSONArray = JSONArray().put(
         JSONObject()
@@ -386,31 +411,63 @@ class DoorbellService : Service() {
             .put("params", JSONObject().put("id", 0).put("on", on))
     )
 
-    private suspend fun upsertSchedule(id: Int?, enable: Boolean, timespec: String, calls: JSONArray): Int {
+    private suspend fun createSchedule(timespec: String, calls: JSONArray): Int {
         val params = JSONObject()
-            .put("enable", enable)
+            .put("enable", true)
             .put("timespec", timespec)
             .put("calls", calls)
-        if (id != null) {
-            try {
-                client.call("Schedule.Update", JSONObject(params.toString()).put("id", id))
-                return id
-            } catch (e: ShellyRpcException) {
-                // Nur wenn das Geraet selbst einen Fehler meldet (Job extern geloescht),
-                // neu anlegen. Transportfehler/Timeouts weiterreichen — sonst entstehen
-                // Duplikat-Jobs, wenn nur die Antwort verloren ging.
-                if (e.isTransport) throw e
-            }
+        val id = client.call("Schedule.Create", params).optInt("id", -1)
+        if (id < 0) throw ShellyRpcException(-4, "Schedule.Create lieferte keine id")
+        return id
+    }
+
+    private suspend fun deleteSchedule(id: Int) {
+        try {
+            client.call("Schedule.Delete", JSONObject().put("id", id))
+        } catch (e: ShellyRpcException) {
+            // Geraetefehler = Job existiert nicht mehr -> Ziel erreicht.
+            // Transportfehler weiterreichen, der Job koennte noch da sein.
+            if (e.isTransport) throw e
         }
-        val created = client.call("Schedule.Create", params).optInt("id", -1)
-        if (created < 0) throw ShellyRpcException(-4, "Schedule.Create lieferte keine id")
-        return created
+    }
+
+    private suspend fun alignBellWithDnd() {
+        // Der Nutzer hat gerade bewusst an den Ruhezeiten gedreht: Schalter sofort
+        // auf den erwarteten Zustand bringen (innerhalb -> aus, ausserhalb -> an).
+        val expectedOn = _dnd.value.orEmpty().none { it.enabled && it.window.isInsideNow() }
+        if (_bellOn.value != expectedOn) {
+            client.call("Switch.Set", JSONObject().put("id", 0).put("on", expectedOn))
+        }
+        runCatching { pollStatus() }
     }
 
     // ---------- KVS-Helfer ----------
 
     private suspend fun kvsSet(key: String, value: Any) {
         client.call("KVS.Set", JSONObject().put("key", key).put("value", value))
+    }
+
+    private suspend fun kvsDelete(key: String) {
+        // Fehler ignorieren — der Key kann schon weg sein (z. B. anderes Geraet schneller)
+        runCatching { client.call("KVS.Delete", JSONObject().put("key", key)) }
+    }
+
+    /** KVS-Wert "[[ausId,einId],...]" -> Paarliste; alles Unlesbare wird ignoriert. */
+    private fun parseIdPairs(v: Any?): List<Pair<Int, Int>> {
+        val s = v as? String ?: return emptyList()
+        val arr = runCatching { JSONArray(s) }.getOrNull() ?: return emptyList()
+        val pairs = mutableListOf<Pair<Int, Int>>()
+        for (i in 0 until arr.length()) {
+            val p = arr.optJSONArray(i) ?: continue
+            if (p.length() == 2) pairs += p.optInt(0) to p.optInt(1)
+        }
+        return pairs
+    }
+
+    private fun idsJson(pairs: List<Pair<Int, Int>>): String {
+        val arr = JSONArray()
+        for ((off, on) in pairs) arr.put(JSONArray().put(off).put(on))
+        return arr.toString()
     }
 
     private suspend fun kvsGetMany(match: String): Map<String, Any?> {

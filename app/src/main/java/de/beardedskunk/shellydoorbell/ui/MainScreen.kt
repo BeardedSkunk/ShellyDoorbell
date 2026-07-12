@@ -16,6 +16,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
@@ -27,6 +28,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -46,6 +48,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -58,11 +61,11 @@ import androidx.compose.ui.unit.dp
 import de.beardedskunk.shellydoorbell.data.AppDb
 import de.beardedskunk.shellydoorbell.service.DoorbellService
 import de.beardedskunk.shellydoorbell.shelly.ConnectionState
-import de.beardedskunk.shellydoorbell.shelly.DndSettings
+import de.beardedskunk.shellydoorbell.shelly.Dnd
+import de.beardedskunk.shellydoorbell.shelly.DndEntry
+import de.beardedskunk.shellydoorbell.shelly.DndWindow
 import de.beardedskunk.shellydoorbell.shelly.SharedSettings
 import kotlin.math.roundToInt
-
-private val DAY_LABELS = listOf("Mo", "Di", "Mi", "Do", "Fr", "Sa", "So")
 
 @Composable
 fun MainScreen(
@@ -106,7 +109,12 @@ fun MainScreen(
             ConnectionCard(conn, watts, onReconnect = { service.reconnect() })
             if (connected && scriptOk == false) ScriptWarning()
             BellCard(bellOn, connected, onToggle = { service.setBell(it) })
-            DndCard(dnd, connected, onChange = { service.saveDnd(it) })
+            DndCard(
+                entries = dnd,
+                connected = connected,
+                onAdd = { service.addDnd(it) },
+                onRemove = { service.removeDnd(it) },
+            )
             SharedCard(shared, connected, onSave = { t, d -> service.saveShared(t, d) })
             EventsCard(onHistory)
         }
@@ -214,10 +222,20 @@ private fun BellCard(bellOn: Boolean?, connected: Boolean, onToggle: (Boolean) -
 }
 
 @Composable
-private fun DndCard(dnd: DndSettings?, connected: Boolean, onChange: (DndSettings) -> Unit) {
-    val current = dnd ?: DndSettings.DEFAULT
+private fun DndCard(
+    entries: List<DndEntry>?,
+    connected: Boolean,
+    onAdd: (DndWindow) -> Unit,
+    onRemove: (DndEntry) -> Unit,
+) {
+    // Editor fuer eine NEUE Ruhezeit; uebernommen wird sie erst mit dem Plus.
+    var startMin by remember { mutableIntStateOf(DndWindow.DEFAULT.startMin) }
+    var endMin by remember { mutableIntStateOf(DndWindow.DEFAULT.endMin) }
+    var days by remember { mutableStateOf(DndWindow.DEFAULT.days) }
     var pickStart by remember { mutableStateOf(false) }
     var pickEnd by remember { mutableStateOf(false) }
+    var warning by remember { mutableStateOf<String?>(null) }
+    val ready = connected && entries != null
 
     Card {
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -229,52 +247,92 @@ private fun DndCard(dnd: DndSettings?, connected: Boolean, onChange: (DndSetting
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
-                Switch(
-                    checked = current.enabled,
-                    onCheckedChange = { onChange(current.copy(enabled = it)) },
-                    enabled = connected,
-                )
+                IconButton(
+                    onClick = {
+                        val w = DndWindow(startMin, endMin, days)
+                        val existing = entries.orEmpty()
+                        when {
+                            existing.size >= Dnd.MAX_WINDOWS ->
+                                warning = "Es sind maximal ${Dnd.MAX_WINDOWS} Ruhezeiten möglich " +
+                                    "(Schedule-Limit des Shelly)."
+                            existing.any { Dnd.overlaps(it.window, w) } ->
+                                warning = "Die neue Ruhezeit überschneidet oder berührt eine bereits " +
+                                    "eingerichtete Ruhezeit und wurde deshalb nicht übernommen."
+                            else -> onAdd(w)
+                        }
+                    },
+                    enabled = ready && days.isNotEmpty(),
+                ) {
+                    Icon(Icons.Filled.Add, contentDescription = "Ruhezeit hinzufügen")
+                }
             }
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { pickStart = true }, enabled = connected) {
-                    Text(Fmt.minutes(current.startMin))
+                OutlinedButton(onClick = { pickStart = true }, enabled = ready) {
+                    Text(Fmt.minutes(startMin))
                 }
                 Text("bis")
-                OutlinedButton(onClick = { pickEnd = true }, enabled = connected) {
-                    Text(Fmt.minutes(current.endMin))
+                OutlinedButton(onClick = { pickEnd = true }, enabled = ready) {
+                    Text(Fmt.minutes(endMin))
                 }
-                if (current.endMin <= current.startMin) {
+                if (endMin <= startMin) {
                     Text("(über Nacht)", style = MaterialTheme.typography.bodySmall)
                 }
             }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                DAY_LABELS.forEachIndexed { day, label ->
+                Fmt.DAY_LABELS.forEachIndexed { day, label ->
                     FilterChip(
-                        selected = day in current.days,
-                        onClick = {
-                            val days = if (day in current.days) current.days - day else current.days + day
-                            if (days.isNotEmpty()) onChange(current.copy(days = days))
-                        },
+                        selected = day in days,
+                        onClick = { days = if (day in days) days - day else days + day },
                         label = { Text(label) },
-                        enabled = connected,
+                        enabled = ready,
                     )
+                }
+            }
+            HorizontalDivider()
+            when {
+                entries == null -> Text("Ruhezeiten werden geladen …", style = MaterialTheme.typography.bodySmall)
+                entries.isEmpty() -> Text("Keine Ruhezeiten eingerichtet.", style = MaterialTheme.typography.bodySmall)
+                else -> entries.forEach { entry ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            Fmt.dndWindow(entry.window) +
+                                if (entry.enabled) "" else " (in der Shelly-App deaktiviert)",
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        IconButton(onClick = { onRemove(entry) }, enabled = connected) {
+                            Text(
+                                "−",
+                                style = MaterialTheme.typography.titleLarge,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
                 }
             }
         }
     }
 
+    if (warning != null) {
+        AlertDialog(
+            onDismissRequest = { warning = null },
+            confirmButton = { TextButton(onClick = { warning = null }) { Text("OK") } },
+            title = { Text("Nicht übernommen") },
+            text = { Text(warning!!) },
+        )
+    }
     if (pickStart) {
         TimePickerDialog(
-            initialMin = current.startMin,
+            initialMin = startMin,
             onDismiss = { pickStart = false },
-            onConfirm = { pickStart = false; onChange(current.copy(startMin = it)) },
+            onConfirm = { pickStart = false; startMin = it },
         )
     }
     if (pickEnd) {
         TimePickerDialog(
-            initialMin = current.endMin,
+            initialMin = endMin,
             onDismiss = { pickEnd = false },
-            onConfirm = { pickEnd = false; onChange(current.copy(endMin = it)) },
+            onConfirm = { pickEnd = false; endMin = it },
         )
     }
 }
