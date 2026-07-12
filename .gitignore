@@ -17,3 +17,6 @@
 .claude/
 .codegraph/
 .serena/
+
+# Lokaler Hardlink auf AndroidManifest.xml (Editor-Workaround), nie committen
+*.lmx
