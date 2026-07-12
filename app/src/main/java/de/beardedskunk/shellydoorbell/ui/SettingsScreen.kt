@@ -2,16 +2,12 @@
 
 package de.beardedskunk.shellydoorbell.ui
 
-import android.app.Activity
 import android.app.NotificationManager
 import android.content.Intent
 import android.media.RingtoneManager
-import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -50,7 +46,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import androidx.core.content.IntentCompat
 import androidx.core.net.toUri
 import de.beardedskunk.shellydoorbell.Channels
 import de.beardedskunk.shellydoorbell.data.Prefs
@@ -59,21 +54,17 @@ import kotlinx.coroutines.launch
 
 /** Lokale Einstellungen dieses Geraets + Berechtigungs-Checkliste. */
 @Composable
-fun SettingsScreen(service: DoorbellService, resumeTick: Int, onBack: () -> Unit) {
+fun SettingsScreen(
+    service: DoorbellService,
+    resumeTick: Int,
+    onPickRingtone: (Intent) -> Unit,
+    onBack: () -> Unit,
+) {
     val context = LocalContext.current
     val prefs = remember { Prefs(context) }
     val scope = rememberCoroutineScope()
     val settings by prefs.settings.collectAsState(initial = null)
     var ipField by remember(settings?.ip) { mutableStateOf(settings?.ip ?: "") }
-
-    val ringtonePicker = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            val uri = result.data?.let {
-                IntentCompat.getParcelableExtra(it, RingtoneManager.EXTRA_RINGTONE_PICKED_URI, Uri::class.java)
-            }
-            scope.launch { prefs.setAlarmUri(uri?.toString()) }
-        }
-    }
 
     // Berechtigungs-Status; resumeTick sorgt fuer Neubewertung nach Rueckkehr aus den System-Settings
     val powerManager = context.getSystemService(PowerManager::class.java)
@@ -148,7 +139,7 @@ fun SettingsScreen(service: DoorbellService, resumeTick: Int, onBack: () -> Unit
                                         ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
                                 )
                             }
-                            ringtonePicker.launch(intent)
+                            onPickRingtone(intent)
                         }) {
                             Text("Ton wählen")
                         }
