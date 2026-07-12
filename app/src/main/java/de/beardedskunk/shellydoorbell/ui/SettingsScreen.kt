@@ -23,6 +23,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.materialIcon
+import androidx.compose.material.icons.materialPath
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -45,6 +47,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.IntentCompat
@@ -182,8 +185,12 @@ fun SettingsScreen(service: DoorbellService, resumeTick: Int, onBack: () -> Unit
                     Text("Zuverlässigkeit", style = MaterialTheme.typography.titleMedium)
                     PermissionRow(
                         ok = batteryOk,
-                        title = "Akku-Optimierung aus",
-                        detail = "Verhindert, dass Android den Lausch-Dienst einschläfert",
+                        title = if (batteryOk) "Akku-Optimierung aus" else "Akku-Optimierung aktiv",
+                        detail = if (batteryOk) {
+                            "Android legt den Lausch-Dienst nicht schlafen."
+                        } else {
+                            "Android kann den Lausch-Dienst einschläfern – bitte Ausnahme erlauben."
+                        },
                         buttonText = "Erlauben",
                     ) {
                         @Suppress("BatteryLife")
@@ -212,9 +219,15 @@ fun SettingsScreen(service: DoorbellService, resumeTick: Int, onBack: () -> Unit
                     PermissionRow(
                         ok = dndBypassOk,
                         title = "„Nicht stören“ durchbrechen",
-                        detail = "Alarm-Benachrichtigung erscheint auch bei aktivem Nicht-stören-Modus. " +
-                            "Dafür der App den Nicht-stören-Zugriff geben und danach hierher zurückkehren.",
-                        buttonText = "Zugriff geben",
+                        detail = if (dndBypassOk) {
+                            "Der Alarm erscheint auch bei aktivem Nicht-stören-Modus."
+                        } else {
+                            "Alarm-Benachrichtigung erscheint auch bei aktivem Nicht-stören-Modus. " +
+                                "Dafür der App den Nicht-stören-Zugriff geben und danach hierher zurückkehren."
+                        },
+                        buttonText = if (dndBypassOk) "Ändern" else "Zugriff geben",
+                        notOkIcon = DndIcon,
+                        alwaysShowButton = true,
                     ) {
                         context.startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
                     }
@@ -230,11 +243,13 @@ private fun PermissionRow(
     title: String,
     detail: String,
     buttonText: String,
+    notOkIcon: ImageVector = Icons.Filled.Warning,
+    alwaysShowButton: Boolean = false,
     onClick: () -> Unit,
 ) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Icon(
-            imageVector = if (ok) Icons.Filled.Check else Icons.Filled.Warning,
+            imageVector = if (ok) Icons.Filled.Check else notOkIcon,
             contentDescription = null,
             tint = if (ok) Color(0xFF43A047) else MaterialTheme.colorScheme.error,
         )
@@ -242,8 +257,29 @@ private fun PermissionRow(
             Text(title, style = MaterialTheme.typography.bodyMedium)
             Text(detail, style = MaterialTheme.typography.bodySmall)
         }
-        if (!ok) {
+        if (!ok || alwaysShowButton) {
             OutlinedButton(onClick = onClick) { Text(buttonText) }
         }
+    }
+}
+
+/**
+ * "Nicht stoeren"-Symbol (Kreis mit Querbalken) — die schlanke
+ * material-icons-core-Abhaengigkeit enthaelt es nicht, daher hier als Pfad.
+ */
+private val DndIcon: ImageVector = materialIcon(name = "Filled.DoNotDisturbOn") {
+    materialPath {
+        moveTo(12.0f, 2.0f)
+        curveTo(6.48f, 2.0f, 2.0f, 6.48f, 2.0f, 12.0f)
+        reflectiveCurveToRelative(4.48f, 10.0f, 10.0f, 10.0f)
+        reflectiveCurveToRelative(10.0f, -4.48f, 10.0f, -10.0f)
+        reflectiveCurveTo(17.52f, 2.0f, 12.0f, 2.0f)
+        close()
+        moveTo(17.0f, 13.0f)
+        lineTo(7.0f, 13.0f)
+        verticalLineToRelative(-2.0f)
+        horizontalLineToRelative(10.0f)
+        verticalLineToRelative(2.0f)
+        close()
     }
 }
