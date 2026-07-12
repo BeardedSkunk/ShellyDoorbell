@@ -1,0 +1,34 @@
+[versions]
+agp = "9.0.1"
+kotlin = "2.3.20"
+ksp = "2.3.10"
+composeUi = "1.11.2"
+material3 = "1.4.0"
+# material-icons wurde von Google bei 1.7.8 eingefroren (letzte verfuegbare Version).
+materialIcons = "1.7.8"
+activityCompose = "1.13.0"
+# 1.18+ verlangt compileSdk 37 / AGP 9.1 -> bei 1.17 bleiben, solange compileSdk 36 gilt.
+coreKtx = "1.17.0"
+coroutines = "1.10.2"
+okhttp = "4.12.0"
+room = "2.8.4"
+datastore = "1.2.1"
+
+[libraries]
+core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+compose-ui = { group = "androidx.compose.ui", name = "ui", version.ref = "composeUi" }
+compose-material3 = { group = "androidx.compose.material3", name = "material3", version.ref = "material3" }
+compose-material-icons-core = { group = "androidx.compose.material", name = "material-icons-core", version.ref = "materialIcons" }
+activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
+room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "room" }
+room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "room" }
+datastore-preferences = { group = "androidx.datastore", name = "datastore-preferences", version.ref = "datastore" }
+junit = { group = "junit", name = "junit", version = "4.13.2" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }

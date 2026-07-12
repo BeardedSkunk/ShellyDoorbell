@@ -1,0 +1,19 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+**/build/
+*.apk
+*.keystore
+!debug.keystore
+
+# Lokales Dev-Tooling, nicht eingecheckt
+.mcp.json
+.claude/
+.codegraph/
+.serena/

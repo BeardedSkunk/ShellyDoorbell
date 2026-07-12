@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Klingelüberwachung</string>
+
+    <string name="channel_service">Hintergrunddienst</string>
+    <string name="channel_alarm">Klingel-Alarm</string>
+
+    <string name="notif_listening">Verbunden – lausche auf die Klingel</string>
+    <string name="notif_connecting">Verbinde mit dem Shelly …</string>
+    <string name="notif_no_wifi">Kein WLAN – warte auf Verbindung</string>
+
+    <string name="notif_ring_title">Es klingelt!</string>
+    <string name="notif_ring_text">Jemand ist an der Tür.</string>
+    <string name="notif_ring_stop">Stopp</string>
+</resources>
