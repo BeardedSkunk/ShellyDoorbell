@@ -27,9 +27,9 @@ import de.beardedskunk.shellydoorbell.data.Prefs
 import de.beardedskunk.shellydoorbell.data.RingDao
 import de.beardedskunk.shellydoorbell.data.RingEvent
 import de.beardedskunk.shellydoorbell.shelly.ConnectionState
-import de.beardedskunk.shellydoorbell.shelly.Dnd
-import de.beardedskunk.shellydoorbell.shelly.DndEntry
-import de.beardedskunk.shellydoorbell.shelly.DndWindow
+import de.beardedskunk.shellydoorbell.shelly.BellEntry
+import de.beardedskunk.shellydoorbell.shelly.BellTimes
+import de.beardedskunk.shellydoorbell.shelly.BellWindow
 import de.beardedskunk.shellydoorbell.shelly.SharedSettings
 import de.beardedskunk.shellydoorbell.shelly.ShellyClient
 import de.beardedskunk.shellydoorbell.shelly.ShellyRpcException
@@ -84,9 +84,9 @@ class DoorbellService : Service() {
     private val _shared = MutableStateFlow<SharedSettings?>(null)
     val shared: StateFlow<SharedSettings?> = _shared
 
-    /** null = noch nicht geladen; sonst die Liste der Ruhezeiten auf dem Shelly. */
-    private val _dnd = MutableStateFlow<List<DndEntry>?>(null)
-    val dnd: StateFlow<List<DndEntry>?> = _dnd
+    /** null = noch nicht geladen; sonst die Liste der Klingelzeiten auf dem Shelly. */
+    private val _bellTimes = MutableStateFlow<List<BellEntry>?>(null)
+    val bellTimes: StateFlow<List<BellEntry>?> = _bellTimes
 
     /** null = unbekannt, false = doorbell-Script fehlt/gestoppt auf dem Shelly. */
     private val _scriptOk = MutableStateFlow<Boolean?>(null)
@@ -211,25 +211,17 @@ class DoorbellService : Service() {
                 thresholdW = kv.num("dbell_cfg_threshold_w") ?: DEFAULT_THRESHOLD_W,
                 debounceS = kv.num("dbell_cfg_debounce_s")?.toInt() ?: DEFAULT_DEBOUNCE_S,
             )
-            refreshDnd(kv)
+            refreshBellTimes(kv)
             runCatching { pollStatus() }
             mergeKvsLog(kv)
         }
     }
 
-    private suspend fun refreshDnd(kv: Map<String, Any?>) {
-        var ids = parseIdPairs(kv["dbell_dnd_ids"])
-        // Migration: fruehere Version hielt genau eine Ruhezeit in zwei Einzel-Keys
-        val legacyOff = kv.num("dbell_dnd_off_id")?.toInt()
-        val legacyOn = kv.num("dbell_dnd_on_id")?.toInt()
-        if (legacyOff != null && legacyOn != null) {
-            ids = (ids + (legacyOff to legacyOn)).distinct()
-            kvsSet("dbell_dnd_ids", idsJson(ids))
-            kvsDelete("dbell_dnd_off_id")
-            kvsDelete("dbell_dnd_on_id")
-        }
+    private suspend fun refreshBellTimes(kv: Map<String, Any?>) {
+        cleanupLegacyDnd(kv)
+        val ids = parseIdPairs(kv["dbell_ring_ids"])
         if (ids.isEmpty()) {
-            _dnd.value = emptyList()
+            _bellTimes.value = emptyList()
             return
         }
         val jobs = client.call("Schedule.List").optJSONArray("jobs")
@@ -240,18 +232,32 @@ class DoorbellService : Service() {
                 byId[j.optInt("id", -1)] = j
             }
         }
-        val entries = ids.mapNotNull { (offId, onId) ->
-            val off = byId[offId] ?: return@mapNotNull null
+        val entries = ids.mapNotNull { (onId, offId) ->
             val on = byId[onId] ?: return@mapNotNull null
-            Dnd.parse(off.optString("timespec"), on.optString("timespec"))?.let { w ->
-                DndEntry(offId, onId, w, off.optBoolean("enable") && on.optBoolean("enable"))
+            val off = byId[offId] ?: return@mapNotNull null
+            BellTimes.parse(on.optString("timespec"), off.optString("timespec"))?.let { w ->
+                BellEntry(onId, offId, w, on.optBoolean("enable") && off.optBoolean("enable"))
             }
         }
         if (entries.size != ids.size) {
             // Jobs wurden extern geloescht/umgebaut -> Id-Liste im KVS aufraeumen
-            kvsSet("dbell_dnd_ids", idsJson(entries.map { it.offId to it.onId }))
+            kvsSet("dbell_ring_ids", idsJson(entries.map { it.onId to it.offId }))
         }
-        _dnd.value = entries
+        _bellTimes.value = entries
+    }
+
+    /**
+     * Reste der frueheren Ruhezeiten-Logik (invertierte Fenster) entsorgen: die
+     * alten Schedules wuerden sonst weiter zur falschen Zeit schalten.
+     */
+    private suspend fun cleanupLegacyDnd(kv: Map<String, Any?>) {
+        val keys = listOf("dbell_dnd_ids", "dbell_dnd_off_id", "dbell_dnd_on_id")
+        if (keys.none { kv.containsKey(it) }) return
+        val jobIds = parseIdPairs(kv["dbell_dnd_ids"]).flatMap { listOf(it.first, it.second) } +
+            listOfNotNull(kv.num("dbell_dnd_off_id")?.toInt(), kv.num("dbell_dnd_on_id")?.toInt())
+        for (id in jobIds) runCatching { deleteSchedule(id) }
+        for (key in keys) kvsDelete(key)
+        _messages.tryEmit("Alte Ruhezeiten wurden entfernt – Klingelzeiten bitte neu anlegen")
     }
 
     private suspend fun pollStatus() {
@@ -364,46 +370,46 @@ class DoorbellService : Service() {
         }
     }
 
-    fun addDnd(w: DndWindow) {
+    fun addBellTime(w: BellWindow) {
         scope.launch {
             runCatching {
-                val offId = createSchedule(Dnd.offTimespec(w), switchCall(false))
-                val onId = try {
-                    createSchedule(Dnd.onTimespec(w), switchCall(true))
+                val onId = createSchedule(BellTimes.onTimespec(w), switchCall(true))
+                val offId = try {
+                    createSchedule(BellTimes.offTimespec(w), switchCall(false))
                 } catch (e: Exception) {
                     // kein halbes Paar stehen lassen
-                    runCatching { deleteSchedule(offId) }
+                    runCatching { deleteSchedule(onId) }
                     throw e
                 }
-                kvsSet("dbell_dnd_ids", idsJson(currentIds() + (offId to onId)))
-                _dnd.value = _dnd.value.orEmpty() + DndEntry(offId, onId, w, enabled = true)
-                alignBellWithDnd()
+                kvsSet("dbell_ring_ids", idsJson(currentIds() + (onId to offId)))
+                _bellTimes.value = _bellTimes.value.orEmpty() + BellEntry(onId, offId, w, enabled = true)
+                alignBell()
                 notifyScriptCfgChanged()
             }.onFailure {
-                _messages.tryEmit("Ruhezeit anlegen fehlgeschlagen: ${it.message}")
+                _messages.tryEmit("Klingelzeit anlegen fehlgeschlagen: ${it.message}")
                 runCatching { refreshSettings() }
             }
         }
     }
 
-    fun removeDnd(entry: DndEntry) {
+    fun removeBellTime(entry: BellEntry) {
         scope.launch {
             runCatching {
-                deleteSchedule(entry.offId)
                 deleteSchedule(entry.onId)
-                kvsSet("dbell_dnd_ids", idsJson(currentIds() - (entry.offId to entry.onId)))
-                _dnd.value = _dnd.value.orEmpty()
-                    .filterNot { it.offId == entry.offId && it.onId == entry.onId }
-                alignBellWithDnd()
+                deleteSchedule(entry.offId)
+                kvsSet("dbell_ring_ids", idsJson(currentIds() - (entry.onId to entry.offId)))
+                _bellTimes.value = _bellTimes.value.orEmpty()
+                    .filterNot { it.onId == entry.onId && it.offId == entry.offId }
+                alignBell()
                 notifyScriptCfgChanged()
             }.onFailure {
-                _messages.tryEmit("Ruhezeit löschen fehlgeschlagen: ${it.message}")
+                _messages.tryEmit("Klingelzeit löschen fehlgeschlagen: ${it.message}")
                 runCatching { refreshSettings() }
             }
         }
     }
 
-    private fun currentIds(): List<Pair<Int, Int>> = _dnd.value.orEmpty().map { it.offId to it.onId }
+    private fun currentIds(): List<Pair<Int, Int>> = _bellTimes.value.orEmpty().map { it.onId to it.offId }
 
     private fun switchCall(on: Boolean): JSONArray = JSONArray().put(
         JSONObject()
@@ -431,10 +437,12 @@ class DoorbellService : Service() {
         }
     }
 
-    private suspend fun alignBellWithDnd() {
-        // Der Nutzer hat gerade bewusst an den Ruhezeiten gedreht: Schalter sofort
-        // auf den erwarteten Zustand bringen (innerhalb -> aus, ausserhalb -> an).
-        val expectedOn = _dnd.value.orEmpty().none { it.enabled && it.window.isInsideNow() }
+    private suspend fun alignBell() {
+        // Der Nutzer hat gerade bewusst an den Klingelzeiten gedreht: Schalter
+        // sofort auf den erwarteten Zustand bringen (innerhalb eines Fensters ->
+        // an, ausserhalb -> aus; ohne Klingelzeiten gehoert die Klingel an).
+        val windows = _bellTimes.value.orEmpty().filter { it.enabled }
+        val expectedOn = windows.isEmpty() || windows.any { it.window.isInsideNow() }
         if (_bellOn.value != expectedOn) {
             client.call("Switch.Set", JSONObject().put("id", 0).put("on", expectedOn))
         }
@@ -452,7 +460,7 @@ class DoorbellService : Service() {
         runCatching { client.call("KVS.Delete", JSONObject().put("key", key)) }
     }
 
-    /** KVS-Wert "[[ausId,einId],...]" -> Paarliste; alles Unlesbare wird ignoriert. */
+    /** KVS-Wert "[[id,id],...]" -> Paarliste; alles Unlesbare wird ignoriert. */
     private fun parseIdPairs(v: Any?): List<Pair<Int, Int>> {
         val s = v as? String ?: return emptyList()
         val arr = runCatching { JSONArray(s) }.getOrNull() ?: return emptyList()

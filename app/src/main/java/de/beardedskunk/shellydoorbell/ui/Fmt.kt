@@ -1,6 +1,6 @@
 package de.beardedskunk.shellydoorbell.ui
 
-import de.beardedskunk.shellydoorbell.shelly.DndWindow
+import de.beardedskunk.shellydoorbell.shelly.BellWindow
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -54,7 +54,7 @@ object Fmt {
         return parts.joinToString(", ")
     }
 
-    /** "Mo–Fr 22:00–06:00" — Anzeige einer Ruhezeit. */
-    fun dndWindow(w: DndWindow): String =
+    /** "Mo–Fr 08:00–20:00" — Anzeige einer Klingelzeit. */
+    fun window(w: BellWindow): String =
         "${dayRange(w.days)} ${minutes(w.startMin)}–${minutes(w.endMin)}"
 }

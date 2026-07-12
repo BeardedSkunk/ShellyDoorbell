@@ -60,10 +60,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import de.beardedskunk.shellydoorbell.data.AppDb
 import de.beardedskunk.shellydoorbell.service.DoorbellService
+import de.beardedskunk.shellydoorbell.shelly.BellEntry
+import de.beardedskunk.shellydoorbell.shelly.BellTimes
+import de.beardedskunk.shellydoorbell.shelly.BellWindow
 import de.beardedskunk.shellydoorbell.shelly.ConnectionState
-import de.beardedskunk.shellydoorbell.shelly.Dnd
-import de.beardedskunk.shellydoorbell.shelly.DndEntry
-import de.beardedskunk.shellydoorbell.shelly.DndWindow
 import de.beardedskunk.shellydoorbell.shelly.SharedSettings
 import kotlin.math.roundToInt
 
@@ -80,7 +80,7 @@ fun MainScreen(
     val watts by service.watts.collectAsState()
     val bellOn by service.bellOn.collectAsState()
     val shared by service.shared.collectAsState()
-    val dnd by service.dnd.collectAsState()
+    val bellTimes by service.bellTimes.collectAsState()
     val scriptOk by service.scriptOk.collectAsState()
     val alarmActive by service.alarmActive.collectAsState()
     val connected = conn is ConnectionState.Connected
@@ -109,11 +109,11 @@ fun MainScreen(
             ConnectionCard(conn, watts, onReconnect = { service.reconnect() })
             if (connected && scriptOk == false) ScriptWarning()
             BellCard(bellOn, connected, onToggle = { service.setBell(it) })
-            DndCard(
-                entries = dnd,
+            BellTimesCard(
+                entries = bellTimes,
                 connected = connected,
-                onAdd = { service.addDnd(it) },
-                onRemove = { service.removeDnd(it) },
+                onAdd = { service.addBellTime(it) },
+                onRemove = { service.removeBellTime(it) },
             )
             SharedCard(shared, connected, onSave = { t, d -> service.saveShared(t, d) })
             EventsCard(onHistory)
@@ -222,16 +222,16 @@ private fun BellCard(bellOn: Boolean?, connected: Boolean, onToggle: (Boolean) -
 }
 
 @Composable
-private fun DndCard(
-    entries: List<DndEntry>?,
+private fun BellTimesCard(
+    entries: List<BellEntry>?,
     connected: Boolean,
-    onAdd: (DndWindow) -> Unit,
-    onRemove: (DndEntry) -> Unit,
+    onAdd: (BellWindow) -> Unit,
+    onRemove: (BellEntry) -> Unit,
 ) {
-    // Editor fuer eine NEUE Ruhezeit; uebernommen wird sie erst mit dem Plus.
-    var startMin by remember { mutableIntStateOf(DndWindow.DEFAULT.startMin) }
-    var endMin by remember { mutableIntStateOf(DndWindow.DEFAULT.endMin) }
-    var days by remember { mutableStateOf(DndWindow.DEFAULT.days) }
+    // Editor fuer eine NEUE Klingelzeit; uebernommen wird sie erst mit dem Plus.
+    var startMin by remember { mutableIntStateOf(BellWindow.DEFAULT.startMin) }
+    var endMin by remember { mutableIntStateOf(BellWindow.DEFAULT.endMin) }
+    var days by remember { mutableStateOf(BellWindow.DEFAULT.days) }
     var pickStart by remember { mutableStateOf(false) }
     var pickEnd by remember { mutableStateOf(false) }
     var warning by remember { mutableStateOf<String?>(null) }
@@ -241,29 +241,29 @@ private fun DndCard(
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text("Ruhezeiten", style = MaterialTheme.typography.titleMedium)
+                    Text("Klingelzeiten", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "Klingel wird zeitgesteuert stromlos geschaltet",
+                        "Nur in diesen Zeiten ist die Klingel aktiv",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
                 IconButton(
                     onClick = {
-                        val w = DndWindow(startMin, endMin, days)
+                        val w = BellWindow(startMin, endMin, days)
                         val existing = entries.orEmpty()
                         when {
-                            existing.size >= Dnd.MAX_WINDOWS ->
-                                warning = "Es sind maximal ${Dnd.MAX_WINDOWS} Ruhezeiten möglich " +
+                            existing.size >= BellTimes.MAX_WINDOWS ->
+                                warning = "Es sind maximal ${BellTimes.MAX_WINDOWS} Klingelzeiten möglich " +
                                     "(Schedule-Limit des Shelly)."
-                            existing.any { Dnd.overlaps(it.window, w) } ->
-                                warning = "Die neue Ruhezeit überschneidet oder berührt eine bereits " +
-                                    "eingerichtete Ruhezeit und wurde deshalb nicht übernommen."
+                            existing.any { BellTimes.overlaps(it.window, w) } ->
+                                warning = "Die neue Klingelzeit überschneidet oder berührt eine bereits " +
+                                    "eingerichtete Klingelzeit und wurde deshalb nicht übernommen."
                             else -> onAdd(w)
                         }
                     },
                     enabled = ready && days.isNotEmpty(),
                 ) {
-                    Icon(Icons.Filled.Add, contentDescription = "Ruhezeit hinzufügen")
+                    Icon(Icons.Filled.Add, contentDescription = "Klingelzeit hinzufügen")
                 }
             }
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -290,22 +290,31 @@ private fun DndCard(
             }
             HorizontalDivider()
             when {
-                entries == null -> Text("Ruhezeiten werden geladen …", style = MaterialTheme.typography.bodySmall)
-                entries.isEmpty() -> Text("Keine Ruhezeiten eingerichtet.", style = MaterialTheme.typography.bodySmall)
-                else -> entries.forEach { entry ->
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            Fmt.dndWindow(entry.window) +
-                                if (entry.enabled) "" else " (in der Shelly-App deaktiviert)",
-                            modifier = Modifier.weight(1f),
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                        IconButton(onClick = { onRemove(entry) }, enabled = connected) {
+                entries == null -> Text("Klingelzeiten werden geladen …", style = MaterialTheme.typography.bodySmall)
+                entries.isEmpty() -> Text(
+                    "Keine Klingelzeiten eingerichtet – die Klingel ist immer aktiv.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                else -> Column {
+                    entries.forEach { entry ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
-                                "−",
-                                style = MaterialTheme.typography.titleLarge,
-                                color = MaterialTheme.colorScheme.error,
+                                Fmt.window(entry.window) +
+                                    if (entry.enabled) "" else " (in der Shelly-App deaktiviert)",
+                                modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.bodyMedium,
                             )
+                            IconButton(
+                                onClick = { onRemove(entry) },
+                                enabled = connected,
+                                modifier = Modifier.size(32.dp),
+                            ) {
+                                Text(
+                                    "−",
+                                    style = MaterialTheme.typography.titleLarge,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
                         }
                     }
                 }

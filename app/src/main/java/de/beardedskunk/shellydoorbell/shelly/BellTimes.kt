@@ -3,20 +3,24 @@ package de.beardedskunk.shellydoorbell.shelly
 import java.time.LocalDateTime
 
 /**
- * Eine Ruhezeit ("Klingel-DND"). Jede Ruhezeit lebt als Paar normaler
- * Shelly-Schedules (aus/ein) auf dem Geraet und ist damit auch in der
- * Shelly-App sichtbar/aenderbar. Es koennen mehrere Ruhezeiten parallel
- * existieren (z. B. Werktage und Wochenende getrennt).
+ * Eine Klingelzeit: ein Zeitfenster, in dem die Klingel aktiv sein soll.
+ * Ausserhalb aller Klingelzeiten ist der Trafo stromlos; ohne eingerichtete
+ * Klingelzeiten ist die Klingel immer aktiv.
  *
- * [days] sind die Tage, an denen die Ruhezeit BEGINNT — App-intern
+ * Jede Klingelzeit lebt als Paar normaler Shelly-Schedules (ein/aus) auf dem
+ * Geraet und ist damit auch in der Shelly-App sichtbar/aenderbar. Es koennen
+ * mehrere Klingelzeiten parallel existieren (z. B. Werktage und Wochenende
+ * getrennt).
+ *
+ * [days] sind die Tage, an denen das Fenster BEGINNT — App-intern
  * 0=Montag .. 6=Sonntag (Montag zuerst, anders als die Shelly-Oberflaeche).
  */
-data class DndWindow(
+data class BellWindow(
     val startMin: Int,
     val endMin: Int,
     val days: Set<Int>,
 ) {
-    /** Liegt der Zeitpunkt gerade innerhalb der Ruhezeit? */
+    /** Liegt der Zeitpunkt gerade innerhalb des Fensters? */
     fun isInsideNow(now: LocalDateTime = LocalDateTime.now()): Boolean {
         if (days.isEmpty()) return false
         val nowMin = now.hour * 60 + now.minute
@@ -30,16 +34,16 @@ data class DndWindow(
     }
 
     companion object {
-        /** Vorbelegung des Editors: 22:00–06:00, taeglich. */
-        val DEFAULT = DndWindow(startMin = 22 * 60, endMin = 6 * 60, days = (0..6).toSet())
+        /** Vorbelegung des Editors: 08:00–20:00, taeglich. */
+        val DEFAULT = BellWindow(startMin = 8 * 60, endMin = 20 * 60, days = (0..6).toSet())
     }
 }
 
-/** Eine auf dem Shelly angelegte Ruhezeit samt der IDs ihrer Schedule-Jobs. */
-data class DndEntry(
-    val offId: Int,
+/** Eine auf dem Shelly angelegte Klingelzeit samt der IDs ihrer Schedule-Jobs. */
+data class BellEntry(
     val onId: Int,
-    val window: DndWindow,
+    val offId: Int,
+    val window: BellWindow,
     /** false, wenn die Jobs in der Shelly-App deaktiviert wurden. */
     val enabled: Boolean,
 )
@@ -53,10 +57,10 @@ data class SharedSettings(
 /**
  * Umrechnung zwischen App-Wochentagen (0=Montag) und Cron-Timespecs der
  * Shelly-Schedules ("ss mm hh dom mon dow", dow 0=Sonntag) sowie
- * Ueberschneidungs-Pruefung zwischen Ruhezeiten.
+ * Ueberschneidungs-Pruefung zwischen Klingelzeiten.
  */
-object Dnd {
-    /** Der Shelly erlaubt max. 20 Schedule-Jobs -> 10 Aus/Ein-Paare. */
+object BellTimes {
+    /** Der Shelly erlaubt max. 20 Schedule-Jobs -> 10 Ein/Aus-Paare. */
     const val MAX_WINDOWS = 10
 
     private const val WEEK_MIN = 7 * 1440
@@ -71,45 +75,45 @@ object Dnd {
     private fun timespec(minuteOfDay: Int, cronDays: Collection<Int>): String =
         "0 ${minuteOfDay % 60} ${minuteOfDay / 60} * * ${cronDays.sorted().joinToString(",")}"
 
-    /** Timespec des Aus-Jobs (Ruhezeit-Beginn). */
-    fun offTimespec(w: DndWindow): String = timespec(w.startMin, w.days.map { isoToCron(it) })
+    /** Timespec des Ein-Jobs (Fenster-Beginn: Klingel an). */
+    fun onTimespec(w: BellWindow): String = timespec(w.startMin, w.days.map { isoToCron(it) })
 
     /**
-     * Timespec des Ein-Jobs (Ruhezeit-Ende). Geht das Fenster ueber Mitternacht,
-     * faellt das Ende auf den Folgetag -> Tage um 1 verschieben.
+     * Timespec des Aus-Jobs (Fenster-Ende: Klingel aus). Geht das Fenster ueber
+     * Mitternacht, faellt das Ende auf den Folgetag -> Tage um 1 verschieben.
      */
-    fun onTimespec(w: DndWindow): String {
+    fun offTimespec(w: BellWindow): String {
         val cronDays = w.days.map { isoToCron(it) }
         val shifted = if (w.endMin > w.startMin) cronDays else cronDays.map { (it + 1) % 7 }
         return timespec(w.endMin, shifted)
     }
 
     /**
-     * Liest ein [DndWindow] aus den beiden Schedule-Jobs zurueck.
+     * Liest ein [BellWindow] aus den beiden Schedule-Jobs zurueck.
      * Liefert null, wenn die Timespecs nicht interpretierbar sind.
      */
-    fun parse(offTimespec: String, onTimespec: String): DndWindow? {
-        val off = parseSpec(offTimespec) ?: return null
+    fun parse(onTimespec: String, offTimespec: String): BellWindow? {
         val on = parseSpec(onTimespec) ?: return null
-        return DndWindow(
-            startMin = off.first,
-            endMin = on.first,
-            days = off.second.map { cronToIso(it) }.toSet(),
+        val off = parseSpec(offTimespec) ?: return null
+        return BellWindow(
+            startMin = on.first,
+            endMin = off.first,
+            days = on.second.map { cronToIso(it) }.toSet(),
         )
     }
 
     /**
-     * Ueberschneiden oder beruehren sich zwei Ruhezeiten? Beruehrung (Ende A ==
+     * Ueberschneiden oder beruehren sich zwei Klingelzeiten? Beruehrung (Ende A ==
      * Beginn B) zaehlt mit: Aus- und Ein-Job wuerden zur selben Sekunde feuern,
-     * die Reihenfolge ist undefiniert und die Klingel bliebe evtl. faelschlich an.
+     * die Reihenfolge ist undefiniert und die Klingel bliebe evtl. faelschlich aus.
      */
-    fun overlaps(a: DndWindow, b: DndWindow): Boolean {
+    fun overlaps(a: BellWindow, b: BellWindow): Boolean {
         val ib = intervals(b)
         return intervals(a).any { x -> ib.any { y -> touches(x, y) } }
     }
 
     /** Minuten-Intervalle [Beginn, Ende] auf der Wochen-Zeitachse (Ende ggf. > Woche). */
-    private fun intervals(w: DndWindow): List<Pair<Int, Int>> = w.days.map { d ->
+    private fun intervals(w: BellWindow): List<Pair<Int, Int>> = w.days.map { d ->
         val start = d * 1440 + w.startMin
         val end = if (w.endMin > w.startMin) d * 1440 + w.endMin else d * 1440 + 1440 + w.endMin
         start to end

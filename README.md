@@ -23,11 +23,12 @@ Dauer-Alarm spielen (über die Wecker-Lautstärke, auch über dem Sperrbildschir
   diesen Puffer in ihre lokale Datenbank – so entsteht pro Gerät eine
   lückenlose Langzeit-History (~1 Jahr), solange das Handy gelegentlich
   verbunden ist.
-- **Ruhezeiten** („Klingel-DND“) sind ganz normale Shelly-Schedules – pro
-  Ruhezeit ein Aus/Ein-Paar, das den Trafo stromlos schaltet bzw. wieder
-  einschaltet. Es können mehrere Ruhezeiten parallel existieren (z. B.
-  Werktage und Wochenende getrennt, max. 10). Sie sind auch in der
-  offiziellen Shelly-App sichtbar und änderbar.
+- **Klingelzeiten** sind Erlaubnisfenster: Nur innerhalb ist die Klingel
+  aktiv, außerhalb ist der Trafo stromlos; ohne Klingelzeiten ist sie immer
+  aktiv. Jedes Fenster ist ein Ein/Aus-Paar ganz normaler Shelly-Schedules,
+  mehrere Fenster parallel sind möglich (z. B. Werktage und Wochenende
+  getrennt, max. 10). Sie sind auch in der offiziellen Shelly-App sichtbar
+  und änderbar.
 - **Gemeinsame Einstellungen** (Watt-Schwelle, Sperrzeit, Ruhezeiten) liegen
   auf dem Shelly (KVS bzw. Schedules) und gelten für alle Nutzer – ohne
   Konten, ohne Passwort. Nach jeder Änderung broadcastet das Script
@@ -94,23 +95,23 @@ Beim ersten Start führt die App durch die nötigen Berechtigungen
 | ----------------------- | -------------------------------------------------- |
 | `dbell_cfg_threshold_w` | Watt-Schwelle für „es klingelt“ (Default 2.0)      |
 | `dbell_cfg_debounce_s`  | Sperrzeit nach einem Klingeln in s (Default 30)    |
-| `dbell_dnd_ids`         | Ruhezeiten: JSON-Liste der Schedule-Job-Paare `[[ausId,einId],…]` |
+| `dbell_ring_ids`        | Klingelzeiten: JSON-Liste der Schedule-Job-Paare `[[einId,ausId],…]` |
 | `dbell_log_head`        | Index des aktuellen Log-Chunks                     |
 | `dbell_log_0` … `_9`    | Ringpuffer: JSON-Arrays mit Unix-Timestamps        |
 
-## Verhalten von Klingel-Schalter und Ruhezeiten
+## Verhalten von Klingel-Schalter und Klingelzeiten
 
 - Der **Schalterzustand des Shelly ist die Wahrheit**. Der große Toggle in der
   App (und der Schalter in der Shelly-App) wirken sofort.
-- Ruhezeiten schalten zeitgesteuert aus/ein. Ein manuelles Aus gilt damit
-  höchstens bis zum nächsten Ruhezeit-Ende – die Klingel bleibt nie
-  versehentlich dauerhaft aus.
+- Klingelzeiten schalten zeitgesteuert ein (Fensterbeginn) und aus
+  (Fensterende). Ein manueller Eingriff gilt damit höchstens bis zur
+  nächsten Schaltflanke.
 - Nach einem Stromausfall/Neustart gleicht das Script den Zustand ab:
-  innerhalb irgendeiner Ruhezeit aus, sonst an.
-- Wochentage der Ruhezeit = Tage, an denen sie **beginnt** (Fenster über
+  innerhalb irgendeiner Klingelzeit an, sonst aus (ohne Klingelzeiten: an).
+- Wochentage einer Klingelzeit = Tage, an denen sie **beginnt** (Fenster über
   Mitternacht laufen in den Folgetag). In der App beginnt die Woche mit
   Montag, anders als in der Shelly-Oberfläche.
-- Eine neue Ruhezeit, die eine bestehende **überschneidet oder berührt**,
+- Eine neue Klingelzeit, die eine bestehende **überschneidet oder berührt**,
   lehnt die App mit einer Warnung ab: Bei Berührung würden Aus- und Ein-Job
   zur selben Sekunde feuern, die Reihenfolge wäre undefiniert.
 

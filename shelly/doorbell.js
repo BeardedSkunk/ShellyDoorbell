@@ -6,15 +6,16 @@
 //    verbundenen WebSocket-Clients (die Android-Apps).
 //  - Fuehrt einen Ringpuffer der letzten Klingel-Zeitstempel im KVS (dbell_log_*),
 //    damit Apps nach einem Reconnect verpasste Ereignisse nachladen koennen.
-//  - Gleicht nach dem Boot den Schalterzustand mit den DND-Schedules ab
-//    (Ruhezeiten schalten den Trafo stromlos; die Schedules verwaltet die App,
+//  - Gleicht nach dem Boot den Schalterzustand mit den Klingelzeiten ab
+//    (Fenster, in denen die Klingel aktiv ist; ausserhalb ist der Trafo
+//    stromlos, ohne Klingelzeiten immer an. Die Schedules verwaltet die App,
 //    sie sind aber auch in der normalen Shelly-App sichtbar/aenderbar).
 //
 // KVS-Schema (alles fuer die Apps les-/schreibbar, kein Passwort):
 //   dbell_cfg_threshold_w  Watt-Schwelle fuer "es klingelt"          (Default 2.0)
 //   dbell_cfg_debounce_s   Sperrzeit nach einem Klingeln in Sekunden (Default 30)
-//   dbell_dnd_ids          Ruhezeiten als JSON-Liste von Schedule-Job-Paaren
-//                          "[[ausId,einId],...]" (aus = DND-Beginn, ein = DND-Ende)
+//   dbell_ring_ids         Klingelzeiten als JSON-Liste von Schedule-Job-Paaren
+//                          "[[einId,ausId],...]" (ein = Fenster-Beginn, aus = Ende)
 //   dbell_log_head         Index des aktuellen Log-Chunks (0..9)
 //   dbell_log_0 .. _9      Log-Chunks: JSON-Array von Unix-Timestamps als String
 //
@@ -33,7 +34,7 @@ let LOG_PER_CHUNK = 20; // 20 Timestamps ~ 221 Zeichen JSON, KVS-Limit ist 253
 let cfg = {
   thr: DEF_THRESHOLD_W,
   deb: DEF_DEBOUNCE_S,
-  dnd: [] // Ruhezeiten: Array von Schedule-Job-Paaren [ausId, einId]
+  ring: [] // Klingelzeiten: Array von Schedule-Job-Paaren [einId, ausId]
 };
 
 let lastRingMs = 0;
@@ -94,7 +95,7 @@ function toNum(v, dflt) {
 // ---------- Konfiguration aus dem KVS ----------
 
 function loadCfg(cb) {
-  Shelly.call("KVS.GetMany", { match: "dbell_cfg_*,dbell_dnd_*" }, function (res) {
+  Shelly.call("KVS.GetMany", { match: "dbell_cfg_*,dbell_ring_*" }, function (res) {
     let items = {};
     if (res && res.items) {
       if (res.items.length !== undefined) {
@@ -107,11 +108,11 @@ function loadCfg(cb) {
     }
     cfg.thr = toNum(items.dbell_cfg_threshold_w, DEF_THRESHOLD_W);
     cfg.deb = toNum(items.dbell_cfg_debounce_s, DEF_DEBOUNCE_S);
-    cfg.dnd = [];
-    if (typeof items.dbell_dnd_ids === "string") {
+    cfg.ring = [];
+    if (typeof items.dbell_ring_ids === "string") {
       // Shellys JSON.parse wirft nicht, sondern liefert undefined bei Muell
-      let a = JSON.parse(items.dbell_dnd_ids);
-      if (a && a.length !== undefined) cfg.dnd = a;
+      let a = JSON.parse(items.dbell_ring_ids);
+      if (a && a.length !== undefined) cfg.ring = a;
     }
     // Defaults einmalig ablegen, damit die Apps sie vorfinden — aber nur, wenn
     // die Abfrage wirklich geklappt hat (sonst wuerden echte Werte ueberschrieben).
@@ -205,11 +206,12 @@ Shelly.addStatusHandler(function (st) {
   onRing(p);
 });
 
-// ---------- DND-Abgleich nach dem Boot ----------
+// ---------- Klingelzeiten-Abgleich nach dem Boot ----------
 //
-// Jede Ruhezeit liegt in zwei normalen Shelly-Schedules (aus/ein). Faellt der
-// Strom waehrend einer Schaltflanke aus, stellt dieser Abgleich nach dem Boot
-// den erwarteten Zustand her: innerhalb irgendeiner Ruhezeit aus, sonst an.
+// Jede Klingelzeit liegt in zwei normalen Shelly-Schedules (ein/aus). Faellt
+// der Strom waehrend einer Schaltflanke aus, stellt dieser Abgleich nach dem
+// Boot den erwarteten Zustand her: innerhalb irgendeiner Klingelzeit an,
+// sonst aus; ohne Klingelzeiten immer an.
 
 // Timespec "ss mm hh dom mon dow" -> {min, days[0..6]} (Tage wie cron: 0=Sonntag).
 // Es werden nur numerische Tageslisten/-bereiche unterstuetzt (die App und die
@@ -283,9 +285,9 @@ function setBell(on) {
   Shelly.call("Switch.Set", { id: 0, on: on });
 }
 
-function reconcileDnd() {
-  // Ohne Ruhezeiten gilt: Klingel gehoert an.
-  if (cfg.dnd.length === 0) {
+function reconcileBell() {
+  // Ohne Klingelzeiten gilt: Klingel gehoert an.
+  if (cfg.ring.length === 0) {
     setBell(true);
     return;
   }
@@ -296,21 +298,21 @@ function reconcileDnd() {
       print("doorbell: keine Uhrzeit verfuegbar, lasse Zustand unveraendert");
       return;
     }
-    let inside = false;  // mindestens eine Ruhezeit laeuft gerade
-    let unknown = false; // mindestens eine Ruhezeit war nicht auswertbar
-    for (let i = 0; i < cfg.dnd.length; i++) {
-      let pair = cfg.dnd[i];
+    let inside = false;  // mindestens eine Klingelzeit laeuft gerade
+    let unknown = false; // mindestens eine Klingelzeit war nicht auswertbar
+    for (let i = 0; i < cfg.ring.length; i++) {
+      let pair = cfg.ring[i];
       if (!pair || pair.length !== 2) continue;
-      let off = null;
-      let on = null;
+      let on = null;  // Fenster-Beginn (Klingel an)
+      let off = null; // Fenster-Ende  (Klingel aus)
       for (let j = 0; j < jobs.length; j++) {
-        if (jobs[j].id === pair[0]) off = jobs[j];
-        if (jobs[j].id === pair[1]) on = jobs[j];
+        if (jobs[j].id === pair[0]) on = jobs[j];
+        if (jobs[j].id === pair[1]) off = jobs[j];
       }
-      // Fehlende/deaktivierte Jobs schalten nichts -> zaehlen nicht als Ruhezeit
-      if (!off || !on || !off.enable || !on.enable) continue;
-      let o = parseTimespec(off.timespec);
-      let e = parseTimespec(on.timespec);
+      // Fehlende/deaktivierte Jobs schalten nichts -> zaehlen nicht als Fenster
+      if (!on || !off || !on.enable || !off.enable) continue;
+      let o = parseTimespec(on.timespec);
+      let e = parseTimespec(off.timespec);
       if (!o || !e) {
         unknown = true;
         continue;
@@ -326,16 +328,16 @@ function reconcileDnd() {
       }
       if (ins) inside = true;
     }
-    if (inside) setBell(false);
-    else if (!unknown) setBell(true);
-    else print("doorbell: DND-Zeitplan nicht auswertbar, lasse Zustand unveraendert");
+    if (inside) setBell(true);
+    else if (!unknown) setBell(false);
+    else print("doorbell: Klingelzeiten nicht auswertbar, lasse Zustand unveraendert");
   });
 }
 
 // ---------- Start ----------
 
 loadCfg(function () {
-  reconcileDnd();
+  reconcileBell();
 });
 initLog();
 print("doorbell: Script gestartet (Schwelle ", cfg.thr, "W, Sperrzeit ", cfg.deb, "s )");
