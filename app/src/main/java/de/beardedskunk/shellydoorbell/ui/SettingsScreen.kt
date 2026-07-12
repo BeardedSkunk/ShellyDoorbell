@@ -126,10 +126,13 @@ fun SettingsScreen(service: DoorbellService, resumeTick: Int, onBack: () -> Unit
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Alarm", style = MaterialTheme.typography.titleMedium)
                     val toneName = remember(settings?.alarmUri) {
-                        val uri = settings?.alarmUri?.toUri()
-                            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                        val custom = settings?.alarmUri?.toUri()
+                        val uri = custom ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
                         runCatching { RingtoneManager.getRingtone(context, uri)?.getTitle(context) }
-                            .getOrNull() ?: "Standard-Weckton"
+                            .getOrNull()
+                            // Titel kann ohne Medien-Berechtigung unlesbar sein -> nicht
+                            // faelschlich "Standard" anzeigen, der Ton spielt trotzdem
+                            ?: if (custom != null) "Eigener Ton" else "Standard-Weckton"
                     }
                     Text("Alarmton: $toneName", style = MaterialTheme.typography.bodyMedium)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
