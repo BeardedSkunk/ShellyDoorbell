@@ -52,7 +52,10 @@ object Channels {
 
     fun canBypassDnd(context: Context): Boolean {
         val nm = context.getSystemService(NotificationManager::class.java)
-        return nm.getNotificationChannel(alarmChannelId(context))?.canBypassDnd() == true
+        // Das Kanal-Flag allein reicht nicht: Entzieht der Nutzer den
+        // "Nicht stoeren"-Zugriff wieder, bleibt es am Kanal stehen.
+        return nm.isNotificationPolicyAccessGranted &&
+            nm.getNotificationChannel(alarmChannelId(context))?.canBypassDnd() == true
     }
 
     /**
