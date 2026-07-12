@@ -74,6 +74,7 @@ class DoorbellService : Service() {
     private val wifi = MutableStateFlow<Network?>(null)
     private val uiVisible = MutableStateFlow(false)
     private var alarmUri: String? = null
+    private var localAlarmEnabled = true
 
     private val _watts = MutableStateFlow<Double?>(null)
     val watts: StateFlow<Double?> = _watts
@@ -124,6 +125,7 @@ class DoorbellService : Service() {
             prefs.settings.collect {
                 ip.value = it.ip
                 alarmUri = it.alarmUri
+                localAlarmEnabled = it.alarmEnabled
             }
         }
         scope.launch { client.state.collect { updateServiceNotification(it) } }
@@ -304,7 +306,8 @@ class DoorbellService : Service() {
         val ts = data?.optLong("ts", 0L)?.takeIf { it > MIN_VALID_TS } ?: nowS
         val power = data?.optDouble("power", Double.NaN)?.takeIf { !it.isNaN() && it >= 0 }
         scope.launch { dao.insertAll(listOf(RingEvent(ts, power))) }
-        startAlarm()
+        // Lokal stummgeschaltet: Ereignis landet trotzdem in der History
+        if (localAlarmEnabled) startAlarm()
     }
 
     // ---------- Alarm ----------

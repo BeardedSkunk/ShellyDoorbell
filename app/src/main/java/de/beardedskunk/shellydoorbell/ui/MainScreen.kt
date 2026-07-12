@@ -18,6 +18,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Warning
@@ -51,6 +52,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -59,6 +61,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import de.beardedskunk.shellydoorbell.data.AppDb
+import de.beardedskunk.shellydoorbell.data.Prefs
 import de.beardedskunk.shellydoorbell.service.DoorbellService
 import de.beardedskunk.shellydoorbell.shelly.BellEntry
 import de.beardedskunk.shellydoorbell.shelly.BellTimes
@@ -70,6 +73,7 @@ import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.ZoneId
 import kotlin.math.roundToInt
+import kotlinx.coroutines.launch
 
 @Composable
 fun MainScreen(
@@ -121,6 +125,7 @@ fun MainScreen(
                 onMute = { service.setMute(it) },
                 onClearMute = { service.clearMute() },
             )
+            LocalAlarmCard()
             BellTimesCard(
                 entries = bellTimes,
                 connected = connected,
@@ -271,6 +276,47 @@ private fun BellCard(
             onDismiss = { pickMute = false },
             onConfirm = { min -> pickMute = false; onMute(nextOccurrence(min)) },
         )
+    }
+}
+
+/**
+ * Rein lokaler Schalter: Alarm nur auf DIESEM Handy aus. Shelly, andere
+ * Geraete und die History bleiben unberuehrt.
+ */
+@Composable
+private fun LocalAlarmCard() {
+    val context = LocalContext.current
+    val prefs = remember { Prefs(context) }
+    val scope = rememberCoroutineScope()
+    val settings by prefs.settings.collectAsState(initial = null)
+    val enabled = settings?.alarmEnabled ?: true
+
+    Card(
+        colors = if (!enabled) {
+            CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+        } else {
+            CardDefaults.cardColors()
+        }
+    ) {
+        Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.Phone, contentDescription = null)
+            Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                Text("Alarm auf diesem Handy", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    if (enabled) {
+                        "Dieses Handy schlägt bei Klingeln Alarm"
+                    } else {
+                        "Stumm – andere Geräte klingeln weiter"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Switch(
+                checked = enabled,
+                onCheckedChange = { on -> scope.launch { prefs.setAlarmEnabled(on) } },
+                enabled = settings != null,
+            )
+        }
     }
 }
 
