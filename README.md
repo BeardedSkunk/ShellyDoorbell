@@ -18,11 +18,18 @@ Dauer-Alarm spielen (über die Wecker-Lautstärke, auch über dem Sperrbildschir
 - Das Script `shelly/doorbell.js` läuft auf dem Shelly, erkennt Klingeln über
   die Wirkleistung (Schwelle + Sperrzeit einstellbar) und broadcastet
   `Shelly.emitEvent("doorbell", {ts, power})` an alle verbundenen Apps.
-- Zusätzlich führt das Script einen **Ringpuffer der letzten ~200
-  Klingel-Zeitstempel im KVS** des Shelly. Beim (Re-)Verbinden mergt jede App
-  diesen Puffer in ihre lokale Datenbank – so entsteht pro Gerät eine
-  lückenlose Langzeit-History (~1 Jahr), solange das Handy gelegentlich
-  verbunden ist.
+- **Klingel-Ereignisse statt Einzeltöne:** Das Script zählt jeden Tastendruck
+  (Flanke über die Schwelle) und fasst Drücke, die innerhalb von 3 Minuten
+  aufeinander folgen, zu einem Ereignis zusammen. In der History steht das dann
+  als `3x in 3:20` (Anzahl / Dauer), ein Einzeldruck als `1x in 0:01`. Der
+  Alarm selbst bleibt davon unberührt (er ist über die Sperrzeit gedrosselt).
+- Zusätzlich führt das Script einen **Ringpuffer der letzten Klingel-Ereignisse
+  im KVS** des Shelly (`{t, n, d}` = Start, Anzahl, Dauer). Beim (Re-)Verbinden
+  mergt jede App diesen Puffer in ihre lokale Datenbank – so entsteht pro Gerät
+  eine Langzeit-History, solange das Handy gelegentlich verbunden ist.
+- Das Script sendet alle 30 s ein **Lebenszeichen** (`doorbell_hb` mit
+  Versionsnummer). Das ist der einzige Kanal, über den auch Apps **ohne
+  Passwort** erfahren, dass (und welche Version) das Script läuft.
 - **Klingelzeiten** sind Erlaubnisfenster: Nur innerhalb ist die Klingel
   aktiv, außerhalb ist der Trafo stromlos; ohne Klingelzeiten ist sie immer
   aktiv. Jedes Fenster ist ein Ein/Aus-Paar ganz normaler Shelly-Schedules,
@@ -38,8 +45,8 @@ Dauer-Alarm spielen (über die Wecker-Lautstärke, auch über dem Sperrbildschir
 
 | Pfad                | Inhalt                                                        |
 | ------------------- | ------------------------------------------------------------- |
-| `shelly/doorbell.js`| mJS-Script für den Shelly (Erkennung, Log, Boot-Abgleich)      |
-| `shelly/upload.ps1` | PowerShell-Helfer: lädt das Script per RPC hoch und startet es |
+| `shelly/doorbell.js`| mJS-Script für den Shelly (Erkennung, Log, Boot-Abgleich). Wird als Asset in die App gebündelt; die erste Zeile trägt die Script-Version |
+| `shelly/upload.ps1` | PowerShell-Helfer: lädt das Script per RPC hoch (nur Handbetrieb nötig, die App macht das selbst) |
 | `app/`              | Android-App (Kotlin, Jetpack Compose, minSdk 29)               |
 
 ## Shelly einrichten
@@ -50,14 +57,18 @@ Dauer-Alarm spielen (über die Wecker-Lautstärke, auch über dem Sperrbildschir
 2. **Matter deaktivieren** (Geräte-Web-UI → Settings) – Scripting funktioniert
    auf Gen3-Geräten nur ohne Matter.
 3. Prüfen, dass das Gerät **Zeit per NTP** bekommt (Web-UI zeigt die Uhrzeit).
-4. Script installieren – entweder per PowerShell:
+4. **Das doorbell-Script installiert die App selbst:** Beim Verbinden prüft sie
+   Existenz, Version und Laufzustand des Scripts – fehlt es, ist es veraltet
+   oder gestoppt, wird es automatisch eingespielt bzw. neu gestartet (bei
+   aktivem Passwortschutz erst nach Eintragen des Passworts). Alternativ geht
+   es weiter von Hand, per PowerShell:
 
    ```powershell
    cd shelly
    .\upload.ps1 -Ip 192.168.178.20
    ```
 
-   oder von Hand in der Web-UI (`http://<ip>` → Scripts → Add Script): Name
+   oder in der Web-UI (`http://<ip>` → Scripts → Add Script): Name
    **`doorbell`** (genau so, die App sucht danach), Inhalt von `doorbell.js`
    einfügen, speichern, starten und **„Run on startup“** aktivieren.
 5. Test ohne Klingelknopf: in der Script-Konsole `testRing()` aufrufen – alle
@@ -67,6 +78,38 @@ Die Watt-Schwelle (Default 2 W) muss über der Standby-Leistung des
 Klingeltrafos liegen und unter der Leistung beim Klingeln – in der App unter
 Einstellungen → „Erkennung“ einstellbar, die Live-Watt-Anzeige hilft beim
 Kalibrieren.
+
+### Passwortschutz (optional)
+
+Wird in der Shelly-Web-UI ein **Passwort** gesetzt, verlangt das Gerät ab dann
+für Schalt- und Einstellungsbefehle eine Authentifizierung (Benutzer ist immer
+`admin`). Die Klingel-Events erreichen die Apps **auch ohne Passwort** weiter
+(Broadcasts gehen an alle verbundenen Clients – am Gerät verifiziert), der
+Alarm funktioniert also selbst mit fehlendem/falschem Passwort. Nur Schalten,
+Einstellungen und die Script-Pflege brauchen das Passwort. Deshalb:
+
+- **Lauschmodus** (Einstellungen → Shelly): Wer nur mithören will, setzt den
+  Haken statt eines Passworts. Die App verzichtet dann auf alle Auth-Aufrufe und
+  blendet Schalter, Klingelzeiten und Einstellungen aus – Klingel-Alarm und
+  History laufen weiter. Am Lebenszeichen des Scripts erkennt die App auch ohne
+  Passwort, ob es läuft. (Grenze: die Langzeit-History aus dem KVS lässt sich
+  ohne Passwort nicht nachladen, ein Lauscher sammelt ab dem Verbinden.)
+
+- Das Passwort in der App unter **Einstellungen → Shelly → Passwort** eintragen
+  und „Übernehmen“. Es wird pro Gerät lokal gespeichert (nicht im KVS, das ja
+  gerade geschützt wird).
+- Der Button **„Verbindung prüfen“** testet bei jedem Druck frisch (auch eine
+  Passwortänderung am Shelly selbst wird erkannt): Shelly erreichbar, Passwort
+  gültig, doorbell-Script läuft – und repariert das Script dabei gleich mit.
+- Schlägt ein Befehl mangels Passwort fehl, bietet die App direkt einen Dialog
+  zur Passworteingabe an.
+- Meldet der Shelly „zu viele Anfragen“ (429), ist das sein Brute-Force-Schutz
+  nach wiederholten Fehl-Logins – kurz warten; Verbindungen „verbraucht“ ein
+  Fehlversuch nicht. Die App sendet nach einem erkannten Passwortfehler von
+  sich aus keine weiteren Anmeldeversuche.
+
+Die Verbindung bleibt ein unverschlüsselter WebSocket im Heim-WLAN – das
+Passwort schützt den Zugriff, nicht die Übertragung (Shelly-LAN-Design).
 
 ## App bauen & installieren
 
@@ -98,8 +141,9 @@ Beim ersten Start führt die App durch die nötigen Berechtigungen
 | `dbell_cfg_debounce_s`  | Sperrzeit nach einem Klingeln in s (Default 30)    |
 | `dbell_ring_ids`        | Klingelzeiten: JSON-Liste der Schedule-Job-Paare `[[einId,ausId],…]` |
 | `dbell_mute_until`      | „Ruhe bis“: Unix-Zeit, bis zu der die Klingel stumm ist |
+| `dbell_log_fmt`         | Format-Marke des Ringpuffers (aktuell 2)           |
 | `dbell_log_head`        | Index des aktuellen Log-Chunks                     |
-| `dbell_log_0` … `_9`    | Ringpuffer: JSON-Arrays mit Unix-Timestamps        |
+| `dbell_log_0` … `_9`    | Ringpuffer: JSON-Arrays mit Ereignis-Objekten `{t, n, d}` (Start, Anzahl, Dauer in s) |
 
 ## Verhalten von Klingel-Schalter und Klingelzeiten
 
@@ -128,9 +172,9 @@ Beim ersten Start führt die App durch die nötigen Berechtigungen
 - **Max. 6 gleichzeitige Verbindungen:** Laut Shelly-Doku sind 6 simultane
   RPC-Kanäle möglich; Web-UI und Shelly-App belegen zeitweise ebenfalls
   welche. 1–4 Handys sind unkritisch, bei ~6 Geräten bitte real testen.
-- **KVS-Limits:** max. 50 Keys à 253 Zeichen. Der Ringpuffer nutzt davon 11
-  Keys für ~200 Ereignisse; ältere Ereignisse leben nur noch in den lokalen
-  App-Datenbanken.
+- **KVS-Limits:** max. 50 Keys à 253 Zeichen. Der Ringpuffer nutzt davon 12
+  Keys für ~60 Klingel-Ereignisse; ältere Ereignisse leben nur noch in den
+  lokalen App-Datenbanken.
 - **Sehr kurze Klingeldrücke:** Der Shelly misst die Leistung ~1× pro
   Sekunde; Drücke deutlich unter einer Sekunde können durchrutschen.
 - Der Dauer-Alarm stoppt zur Sicherheit automatisch nach 10 Minuten.

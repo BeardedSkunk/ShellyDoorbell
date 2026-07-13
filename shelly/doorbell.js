@@ -1,11 +1,23 @@
+let VERSION = 3; // MUSS die erste Zeile bleiben und bei jeder Aenderung hochgezaehlt werden:
+                 // die App liest sie per Script.GetCode und spielt bei aelterer/fehlender
+                 // Version automatisch die von ihr gebuendelte doorbell.js ein.
+
 // doorbell.js — Klingelerkennung fuer Shelly Plug M Gen3 (und kompatible Gen2+/Gen3-Geraete).
 //
-// Das Script laeuft dauerhaft auf dem Shelly (Name muss "doorbell" sein, Autostart an):
+// Das Script laeuft dauerhaft auf dem Shelly (Name muss "doorbell" sein, Autostart an;
+// Installation/Update macht die App beim Verbinden selbst, upload.ps1 ist nur Handbetrieb):
 //  - Erkennt Klingeln ueber die Wirkleistung des Klingeltrafos (switch:0 / apower).
 //  - Broadcastet bei Klingeln Shelly.emitEvent("doorbell", {ts, power}) an alle
-//    verbundenen WebSocket-Clients (die Android-Apps).
-//  - Fuehrt einen Ringpuffer der letzten Klingel-Zeitstempel im KVS (dbell_log_*),
-//    damit Apps nach einem Reconnect verpasste Ereignisse nachladen koennen.
+//    verbundenen WebSocket-Clients (die Android-Apps) — debounced (Sperrzeit).
+//  - Zaehlt UNABHAENGIG vom Alarm-Debounce jeden Tastendruck (steigende Flanke
+//    ueber die Schwelle) und fasst Druecke, die innerhalb von 3 min aufeinander
+//    folgen, zu EINEM Klingel-Ereignis zusammen. Beim Abschluss broadcastet es
+//    Shelly.emitEvent("doorbell_log", {t, n, d}) (Start-Zeit, Anzahl, Dauer in s)
+//    und legt denselben Datensatz im KVS-Ringpuffer (dbell_log_*) ab, damit Apps
+//    nach einem Reconnect verpasste Ereignisse nachladen koennen.
+//  - Sendet alle 30 s Shelly.emitEvent("doorbell_hb", {v}) als Lebenszeichen +
+//    Versionsangabe (der einzige auth-freie Kanal, ueber den auch Clients ohne
+//    Passwort erfahren, dass/welches Script laeuft).
 //  - Gleicht nach dem Boot den Schalterzustand mit den Klingelzeiten ab
 //    (Fenster, in denen die Klingel aktiv ist; ausserhalb ist der Trafo
 //    stromlos, ohne Klingelzeiten immer an. Die Schedules verwaltet die App,
@@ -19,8 +31,10 @@
 //   dbell_mute_until       "Ruhe bis": Unix-Zeit (Sekunden), bis zu der die
 //                          Klingel stumm ist; laeuft ueber einen Script-Timer
 //                          ab (kein Schedule, hinterlaesst nichts)
+//   dbell_log_fmt          Format-Marke des Ringpuffers (aktuell 2)
 //   dbell_log_head         Index des aktuellen Log-Chunks (0..9)
-//   dbell_log_0 .. _9      Log-Chunks: JSON-Array von Unix-Timestamps als String
+//   dbell_log_0 .. _9      Log-Chunks: JSON-Array von Ereignis-Objekten
+//                          {t: Start-Unixzeit, n: Anzahl Druecke, d: Dauer in s}
 //
 // Nach Konfig-Aenderungen rufen die Apps per RPC  Script.Eval {code:"cfgChanged()"}
 // auf; das Script laedt die Konfig neu und broadcastet "doorbell_cfg", damit alle
@@ -32,7 +46,10 @@
 let DEF_THRESHOLD_W = 2.0;
 let DEF_DEBOUNCE_S = 30;
 let LOG_CHUNKS = 10;    // dbell_log_0 .. dbell_log_9 (KVS: max. 50 Keys gesamt!)
-let LOG_PER_CHUNK = 20; // 20 Timestamps ~ 221 Zeichen JSON, KVS-Limit ist 253
+let LOG_PER_CHUNK = 6;  // 6 Ereignis-Objekte ~ 210 Zeichen JSON, KVS-Limit ist 253
+let LOG_FMT = 2;        // Ringpuffer-Format (1 = alte reine Timestamp-Liste)
+let HB_INTERVAL_MS = 30000; // Lebenszeichen-Broadcast-Takt
+let GROUP_GAP_MS = 180000;  // 3 min: danach gilt ein Klingel-Ereignis als beendet
 
 let cfg = {
   thr: DEF_THRESHOLD_W,
@@ -175,7 +192,29 @@ function scheduleMuteTimer() {
 // ---------- Klingel-Log (Ringpuffer im KVS) ----------
 
 let logReady = false;   // erst schreiben, wenn der aktuelle Chunk geladen ist
-let logPending = [];    // Klingeln waehrend des Ladens -> nachtragen
+let logPending = [];    // Ereignisse waehrend des Ladens -> nachtragen
+
+// Einmalige Migration: das Log-Format hat mit v3 von reinen Timestamps auf
+// Ereignis-Objekte {t,n,d} gewechselt. Alte, inkompatible Chunks werden dabei
+// bewusst verworfen. Danach initLog() aufrufen.
+function migrateLog(cb) {
+  Shelly.call("KVS.Get", { key: "dbell_log_fmt" }, function (res, ec) {
+    let fmt = (ec === 0 && res) ? toNum(res.value, 1) : 1;
+    if (fmt === LOG_FMT) {
+      if (cb) cb();
+      return;
+    }
+    for (let i = 0; i < LOG_CHUNKS; i++) {
+      Shelly.call("KVS.Delete", { key: "dbell_log_" + JSON.stringify(i) });
+    }
+    Shelly.call("KVS.Set", { key: "dbell_log_head", value: 0 });
+    Shelly.call("KVS.Set", { key: "dbell_log_fmt", value: LOG_FMT }, function () {
+      logHead = 0;
+      logChunk = [];
+      if (cb) cb();
+    });
+  });
+}
 
 function initLog() {
   Shelly.call("KVS.Get", { key: "dbell_log_head" }, function (res, ec) {
@@ -193,21 +232,21 @@ function initLog() {
   });
 }
 
-function appendLog(ts) {
+function appendLog(rec) {
   if (!logReady) {
-    logPending.push(ts);
+    logPending.push(rec);
     return;
   }
-  writeLog(ts);
+  writeLog(rec);
 }
 
-function writeLog(ts) {
+function writeLog(rec) {
   if (logChunk.length >= LOG_PER_CHUNK) {
     logHead = (logHead + 1) % LOG_CHUNKS;
     logChunk = [];
     Shelly.call("KVS.Set", { key: "dbell_log_head", value: logHead });
   }
-  logChunk.push(ts);
+  logChunk.push(rec);
   Shelly.call("KVS.Set", {
     key: "dbell_log_" + JSON.stringify(logHead),
     value: JSON.stringify(logChunk)
@@ -215,32 +254,88 @@ function writeLog(ts) {
 }
 
 // ---------- Klingelerkennung ----------
+//
+// Zwei getrennte Aufgaben auf derselben Leistungsmessung:
+//  1) Alarm: bei einer steigenden Flanke ueber die Schwelle ein "doorbell"-Event
+//     broadcasten, aber hoechstens alle cfg.deb Sekunden (Sperrzeit/Debounce).
+//  2) Log: JEDEN Druck (steigende Flanke) zaehlen und Druecke, die innerhalb von
+//     3 min aufeinander folgen, zu einem Ereignis {t,n,d} zusammenfassen und
+//     erst beim Abschluss ins Log schreiben/broadcasten.
 
-function onRing(power) {
-  let now = Date.now();
-  let ts = Math.floor(now / 1000);
+let lastPower = 0;      // zuletzt gemessene Wirkleistung (fuer die Alarm-Nutzlast)
+let wasAbove = false;   // war die Leistung beim letzten Sample ueber der Schwelle?
+let grpStartS = 0;      // Start (Unix-s) des offenen Klingel-Ereignisses, 0 = keins
+let grpLastActS = 0;    // letzte Flanke (Unix-s) im offenen Ereignis
+let pressCount = 0;     // Anzahl Druecke im offenen Ereignis
+let closeTimer = null;  // schliesst das Ereignis 3 min nach dem letzten Loslassen
+
+function emitAlarm(power) {
+  let ts = Math.floor(Date.now() / 1000);
   print("doorbell: Klingeln erkannt (", power, "W )");
   // ts < ~2001 bedeutet: keine NTP-Zeit; die App ersetzt das durch die Handy-Zeit.
   Shelly.emitEvent("doorbell", { ts: ts, power: power });
-  appendLog(ts);
+}
+
+// Offenes Klingel-Ereignis abschliessen: Datensatz broadcasten + ins Log legen.
+function finalizeGroup() {
+  if (grpStartS === 0) return;
+  let dur = grpLastActS - grpStartS;
+  if (dur < 1) dur = 1; // ein einzelner kurzer Druck ergibt mindestens 0:01
+  let rec = { t: grpStartS, n: pressCount, d: dur };
+  print("doorbell: Ereignis abgeschlossen (", pressCount, "x in ", dur, "s )");
+  Shelly.emitEvent("doorbell_log", rec);
+  appendLog(rec);
+  grpStartS = 0;
+  grpLastActS = 0;
+  pressCount = 0;
+}
+
+function onPower(above, nowMs) {
+  let ts = Math.floor(nowMs / 1000);
+  if (above && !wasAbove) {
+    // steigende Flanke = ein Druck
+    pressCount = pressCount + 1;
+    if (grpStartS === 0) grpStartS = ts;
+    grpLastActS = ts;
+    // Waehrend gedrueckt wird nicht schliessen (deckt auch einen festhaengenden
+    // Taster ab): laufenden Schliess-Timer stoppen.
+    if (closeTimer !== null) {
+      Timer.clear(closeTimer);
+      closeTimer = null;
+    }
+    // Alarm mit Sperrzeit (unabhaengig von der Zaehlung oben)
+    if (nowMs - lastRingMs >= cfg.deb * 1000) {
+      lastRingMs = nowMs;
+      emitAlarm(lastPower);
+    }
+  } else if (!above && wasAbove) {
+    // fallende Flanke = losgelassen: Ereignis erst 3 min spaeter schliessen
+    grpLastActS = ts;
+    if (closeTimer !== null) Timer.clear(closeTimer);
+    closeTimer = Timer.set(GROUP_GAP_MS, false, function () {
+      closeTimer = null;
+      finalizeGroup();
+    });
+  }
+  wasAbove = above;
 }
 
 // Zum Testen ohne Klingelknopf: in der Script-Konsole "testRing()" aufrufen
-// (oder per RPC: Script.Eval {id:<id>, code:"testRing()"}).
+// (oder per RPC: Script.Eval {id:<id>, code:"testRing()"}). Simuliert einen
+// kurzen Druck: sofortiger Alarm + (nach der 3-min-Sammelzeit) ein 1x-Log.
 function testRing() {
-  lastRingMs = Date.now();
-  onRing(0);
+  let now = Date.now();
+  onPower(true, now);
+  onPower(false, now + 1000);
   return true;
 }
 
 Shelly.addStatusHandler(function (st) {
   if (st.component !== "switch:0" || !st.delta) return;
   let p = st.delta.apower;
-  if (typeof p !== "number" || p < cfg.thr) return;
-  let now = Date.now();
-  if (now - lastRingMs < cfg.deb * 1000) return;
-  lastRingMs = now;
-  onRing(p);
+  if (typeof p !== "number") return;
+  lastPower = p;
+  onPower(p >= cfg.thr, Date.now());
 });
 
 // ---------- Klingelzeiten-Abgleich nach dem Boot ----------
@@ -382,5 +477,13 @@ loadCfg(function () {
   scheduleMuteTimer();
   reconcileBell();
 });
-initLog();
-print("doorbell: Script gestartet (Schwelle ", cfg.thr, "W, Sperrzeit ", cfg.deb, "s )");
+migrateLog(initLog);
+
+// Lebenszeichen + Versionsangabe alle 30 s: der einzige auth-freie Kanal, ueber
+// den auch Clients ohne Passwort erfahren, dass/welches Script laeuft.
+Shelly.emitEvent("doorbell_hb", { v: VERSION });
+Timer.set(HB_INTERVAL_MS, true, function () {
+  Shelly.emitEvent("doorbell_hb", { v: VERSION });
+});
+
+print("doorbell: Script v", VERSION, " gestartet (Schwelle ", cfg.thr, "W, Sperrzeit ", cfg.deb, "s )");

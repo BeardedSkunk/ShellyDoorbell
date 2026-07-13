@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -21,8 +22,10 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.materialIcon
 import androidx.compose.material.icons.materialPath
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -33,6 +36,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -47,10 +51,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
 import de.beardedskunk.shellydoorbell.Channels
 import de.beardedskunk.shellydoorbell.data.Prefs
+import de.beardedskunk.shellydoorbell.service.ConnCheck
 import de.beardedskunk.shellydoorbell.service.DoorbellService
 import de.beardedskunk.shellydoorbell.shelly.ConnectionState
 import de.beardedskunk.shellydoorbell.shelly.SharedSettings
@@ -70,9 +77,14 @@ fun SettingsScreen(
     val scope = rememberCoroutineScope()
     val settings by prefs.settings.collectAsState(initial = null)
     var ipField by remember(settings?.ip) { mutableStateOf(settings?.ip ?: "") }
+    var pwField by remember(settings?.password) { mutableStateOf(settings?.password ?: "") }
+    var pwVisible by remember { mutableStateOf(false) }
+    var checking by remember { mutableStateOf(false) }
+    var checkResult by remember { mutableStateOf<ConnCheck?>(null) }
     val shared by service.shared.collectAsState()
     val conn by service.connectionState.collectAsState()
     val connected = conn is ConnectionState.Connected
+    val listenOnly = settings?.listenOnly ?: false
 
     // Berechtigungs-Status; resumeTick sorgt fuer Neubewertung nach Rueckkehr aus den System-Settings
     val powerManager = context.getSystemService(PowerManager::class.java)
@@ -112,11 +124,87 @@ fun SettingsScreen(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
-                    Button(
-                        onClick = { scope.launch { prefs.setIp(ipField) } },
-                        enabled = ipField.isNotBlank() && ipField.trim() != settings?.ip,
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Lauschmodus (ohne Passwort)", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "Nur mithören: Klingel-Alarm läuft ohne Passwort. Schalten, " +
+                                    "Klingelzeiten und Einstellungen sind ausgeblendet.",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        Switch(
+                            checked = listenOnly,
+                            onCheckedChange = { on -> scope.launch { prefs.setListenOnly(on) } },
+                            enabled = settings != null,
+                        )
+                    }
+                    if (!listenOnly) {
+                        OutlinedTextField(
+                            value = pwField,
+                            onValueChange = { pwField = it },
+                            label = { Text("Passwort (nur falls am Shelly gesetzt)") },
+                            singleLine = true,
+                            visualTransformation = if (pwVisible) {
+                                VisualTransformation.None
+                            } else {
+                                PasswordVisualTransformation()
+                            },
+                            trailingIcon = {
+                                TextButton(onClick = { pwVisible = !pwVisible }) {
+                                    Text(if (pwVisible) "Verbergen" else "Zeigen")
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text(
+                            "Benutzer ist beim Shelly immer „admin“. Leer lassen, wenn kein " +
+                                "Passwortschutz aktiv ist.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    val ipChanged = ipField.isNotBlank() && ipField.trim() != settings?.ip
+                    val pwChanged = pwField != (settings?.password ?: "")
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text("Übernehmen")
+                        OutlinedButton(
+                            onClick = {
+                                checking = true
+                                checkResult = null
+                                scope.launch {
+                                    // Erst die eingetippten Zugangsdaten übernehmen (persistent
+                                    // + sofort in die laufende Verbindung), dann prüfen – sonst
+                                    // liefe die Prüfung noch gegen das alte Passwort.
+                                    val ipVal = ipField.trim().ifBlank { settings?.ip ?: "" }
+                                    if (ipChanged) prefs.setIp(ipVal)
+                                    if (pwChanged) prefs.setPassword(pwField)
+                                    service.applyCredentials(ipVal, pwField)
+                                    val result = service.checkConnection()
+                                    // Bei Erfolg die Hauptdaten gleich mit den (nun gültigen)
+                                    // Zugangsdaten nachladen – sequentiell nach der Prüfung.
+                                    if (result.ok) service.reloadSettings()
+                                    checkResult = result
+                                    checking = false
+                                }
+                            },
+                            enabled = !checking && ipField.isNotBlank(),
+                        ) {
+                            Text("Verbindung prüfen")
+                        }
+                        Button(
+                            onClick = {
+                                scope.launch {
+                                    if (ipChanged) prefs.setIp(ipField)
+                                    if (pwChanged) prefs.setPassword(pwField)
+                                }
+                            },
+                            enabled = ipField.isNotBlank() && (ipChanged || pwChanged),
+                        ) {
+                            Text("Übernehmen")
+                        }
                     }
                 }
             }
@@ -163,7 +251,10 @@ fun SettingsScreen(
                 }
             }
 
-            SharedCard(shared, connected, onSave = { t, d -> service.saveShared(t, d) })
+            // "Erkennung" schreibt in den Shelly-KVS -> im Lauschmodus ausblenden.
+            if (!listenOnly) {
+                SharedCard(shared, connected, onSave = { t, d -> service.saveShared(t, d) })
+            }
 
             Card {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -238,6 +329,14 @@ fun SettingsScreen(
                 }
             }
         }
+
+        if (checking || checkResult != null) {
+            ConnectionCheckDialog(
+                checking = checking,
+                result = checkResult,
+                onDismiss = { if (!checking) checkResult = null },
+            )
+        }
     }
 }
 
@@ -275,6 +374,53 @@ private fun SharedCard(shared: SharedSettings?, connected: Boolean, onSave: (Dou
                 enabled = connected && shared != null,
             )
         }
+    }
+}
+
+@Composable
+private fun ConnectionCheckDialog(checking: Boolean, result: ConnCheck?, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            TextButton(onClick = onDismiss, enabled = !checking) { Text("OK") }
+        },
+        title = { Text("Verbindung prüfen") },
+        text = {
+            if (checking || result == null) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    CircularProgressIndicator(Modifier.size(20.dp))
+                    Text("Prüfe Verbindung …")
+                }
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    // Eine Gesamtaussage: erreichbar + Passwort ok + Script läuft.
+                    // Fehlendes/veraltetes/gestopptes Script repariert die Prüfung selbst.
+                    CheckRow(ok = result.ok, label = "Shelly-Verbindung & doorbell-Script")
+                    if (result.detail != null) {
+                        Text(result.detail, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+        },
+    )
+}
+
+@Composable
+private fun CheckRow(ok: Boolean, label: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Icon(
+            imageVector = if (ok) Icons.Filled.Check else Icons.Filled.Warning,
+            contentDescription = null,
+            tint = if (ok) Color(0xFF43A047) else MaterialTheme.colorScheme.error,
+        )
+        Text(
+            label,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(start = 12.dp),
+        )
     }
 }
 

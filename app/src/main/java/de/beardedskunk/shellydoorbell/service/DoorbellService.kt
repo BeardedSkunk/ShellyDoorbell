@@ -54,6 +54,13 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
+ * Ergebnis der aktiven Verbindungsprüfung (siehe [DoorbellService.checkConnection]):
+ * eine Gesamtaussage — Shelly erreichbar, Passwort ok UND doorbell-Script läuft.
+ * [detail] erklärt im Fehlerfall, woran es hängt.
+ */
+data class ConnCheck(val ok: Boolean, val detail: String?)
+
+/**
  * Der "Lausch-Service": haelt als Foreground-Service (Typ specialUse) dauerhaft
  * die WebSocket-Verbindung zum Shelly, loest bei "doorbell"-Events den Alarm aus
  * und stellt der UI alle Zustaende als Flows bereit.
@@ -73,6 +80,7 @@ class DoorbellService : Service() {
     private lateinit var client: ShellyClient
 
     private val ip = MutableStateFlow("")
+    private val password = MutableStateFlow("")
     private val wifi = MutableStateFlow<Network?>(null)
     private val uiVisible = MutableStateFlow(false)
     private var alarmUri: String? = null
@@ -99,8 +107,19 @@ class DoorbellService : Service() {
     private val _scriptOk = MutableStateFlow<Boolean?>(null)
     val scriptOk: StateFlow<Boolean?> = _scriptOk
 
+    /** null = unbekannt; sonst die vom Script per Heartbeat gemeldete Version. */
+    private val _scriptVersion = MutableStateFlow<Int?>(null)
+    val scriptVersion: StateFlow<Int?> = _scriptVersion
+
+    /** true = Lausch-Betrieb (kein Passwort, keine schreibenden Aufrufe). */
+    private val listenOnly = MutableStateFlow(false)
+
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val messages: SharedFlow<String> = _messages
+
+    /** Feuert, wenn ein Kommando am fehlenden/falschen Shelly-Passwort scheitert. */
+    private val _authError = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val authError: SharedFlow<Unit> = _authError
 
     val connectionState: StateFlow<ConnectionState> get() = client.state
     val alarmActive: StateFlow<Boolean> get() = alarm.active
@@ -110,6 +129,19 @@ class DoorbellService : Service() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val refreshMutex = Mutex()
 
+    /** Verhindert, dass onConnected und „Verbindung pruefen" das Script parallel einspielen. */
+    private val scriptMutex = Mutex()
+
+    /** Zeitpunkt (elapsedRealtime) des letzten Script-Heartbeats, 0 = keiner. */
+    @Volatile
+    private var lastHeartbeatMs = 0L
+
+    /** Schuetzt den Aufbau der vorlaeufigen Klingel-Gruppe (recordProvisional). */
+    private val logMutex = Mutex()
+    private var provStart = 0L   // Start des offenen vorlaeufigen Ereignisses, 0 = keins
+    private var provCount = 0
+    private var provLastTs = 0L
+
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onCreate() {
@@ -117,14 +149,16 @@ class DoorbellService : Service() {
         prefs = Prefs(this)
         dao = AppDb.get(this).ringDao()
         alarm = AlarmController(this, scope)
-        client = ShellyClient(scope, ip, wifi)
+        client = ShellyClient(scope, ip, wifi, password)
 
         // Ohne lokalen Alarm laeuft der Dienst nur fuer die sichtbare UI mit —
         // dann ohne Dauer-Notification (und er beendet sich, wenn die UI zugeht).
         val initial = runBlocking { prefs.settings.first() }
         ip.value = initial.ip
+        password.value = initial.password
         alarmUri = initial.alarmUri
         localAlarmEnabled = initial.alarmEnabled
+        listenOnly.value = initial.listenOnly
         if (localAlarmEnabled) startForegroundCompat()
         requestWifi()
         client.start()
@@ -132,16 +166,48 @@ class DoorbellService : Service() {
         scope.launch {
             prefs.settings.collect {
                 ip.value = it.ip
+                password.value = it.password
                 alarmUri = it.alarmUri
+                val listenChanged = listenOnly.value != it.listenOnly
+                listenOnly.value = it.listenOnly
                 setLocalAlarmEnabled(it.alarmEnabled)
+                // Beim Umschalten des Lauschmodus die Verbindung neu bewerten:
+                // eingeschaltet -> keine Auth-Aufrufe mehr; ausgeschaltet ->
+                // Einstellungen/Script wieder abgleichen.
+                if (listenChanged && client.state.value is ConnectionState.Connected) {
+                    onConnected()
+                }
             }
         }
         scope.launch { client.state.collect { updateServiceNotification(it) } }
         scope.launch { client.connectedEvents.collect { onConnected() } }
         scope.launch { client.notifications.collect { handleNotification(it) } }
         scope.launch {
-            // Live-Watt nur pollen, solange die App sichtbar ist
-            combine(uiVisible, client.state) { visible, st -> visible && st is ConnectionState.Connected }
+            // Verbindungsverlust setzt das Heartbeat-Fenster zurueck, damit ein
+            // frischer Connect erst wieder auf ein Lebenszeichen wartet.
+            client.state.collect { st -> if (st !is ConnectionState.Connected) lastHeartbeatMs = 0L }
+        }
+        scope.launch {
+            // Bleibt das 30-s-Lebenszeichen des Scripts aus, obwohl die Verbindung
+            // steht, gilt das Script als nicht laufend.
+            while (true) {
+                delay(30_000)
+                val last = lastHeartbeatMs
+                if (last != 0L &&
+                    client.state.value is ConnectionState.Connected &&
+                    SystemClock.elapsedRealtime() - last > STALE_MS
+                ) {
+                    _scriptOk.value = false
+                }
+            }
+        }
+        scope.launch {
+            // Live-Watt nur pollen, solange die App sichtbar ist — und nicht im
+            // Lauschmodus (Switch.GetStatus wuerde ohne Passwort 401 spammen;
+            // Watt/Schalterzustand kommen dort ohnehin per NotifyStatus).
+            combine(uiVisible, client.state, listenOnly) { visible, st, listen ->
+                visible && !listen && st is ConnectionState.Connected
+            }
                 .distinctUntilChanged()
                 .collectLatest { pollingActive ->
                     if (!pollingActive) return@collectLatest
@@ -220,24 +286,161 @@ class DoorbellService : Service() {
     // ---------- Verbindungsaufbau / Settings-Abgleich ----------
 
     private suspend fun onConnected() {
-        runCatching { findScript() }
+        // Lauschmodus: keine authentifizierten Aufrufe (wuerden 401 liefern).
+        // Klingel-Events, Live-Status und der Script-Heartbeat kommen als
+        // Broadcast ganz ohne Passwort an.
+        if (listenOnly.value) return
+        // Erster authentifizierter Zugriff. Scheitert er am Passwort, NICHT mit
+        // refreshSettings weitermachen – das wären nur weitere 401 in Folge.
+        val scriptResult = runCatching { ensureScript() }
+        scriptResult.exceptionOrNull()?.let { e ->
+            if (e is ShellyRpcException && e.isAuth) {
+                // Ohne lokal eingetragenes Passwort ist das ein reines Lausch-
+                // Geraet: Klingel-Events kommen auch ohne Auth an, also nicht
+                // bei jedem Verbinden den Passwort-Dialog aufdraengen. Loest
+                // der Nutzer selbst ein Kommando aus, fragt emitFailure weiter.
+                if (password.value.isBlank()) {
+                    _messages.tryEmit(
+                        "Shelly ist passwortgeschützt. Der Klingel-Alarm läuft auch ohne " +
+                            "Passwort – für Schalten/Einstellungen das Passwort eintragen oder " +
+                            "in den Einstellungen den Lauschmodus aktivieren."
+                    )
+                } else {
+                    _authError.tryEmit(Unit)
+                }
+                return
+            }
+            // Verbindung weg: still bleiben, der Reconnect versucht es eh erneut
+            if (e is ShellyRpcException && e.isTransport) return
+            _messages.tryEmit("doorbell-Script konnte nicht eingerichtet werden: ${e.message}")
+        }
         runCatching { refreshSettings() }
-            .onFailure { _messages.tryEmit("Einstellungen konnten nicht geladen werden: ${it.message}") }
+            .onFailure { emitFailure(it, "Einstellungen konnten nicht geladen werden") }
     }
 
-    private suspend fun findScript() {
-        scriptId = null
-        val scripts = client.call("Script.List").optJSONArray("scripts")
-        if (scripts != null) {
-            for (i in 0 until scripts.length()) {
-                val s = scripts.optJSONObject(i) ?: continue
-                if (s.optString("name") == "doorbell") {
-                    if (s.optBoolean("running")) scriptId = s.optInt("id")
-                    break
+    /**
+     * Kommandofehler melden: Ein Auth-Fehler (fehlendes/falsches Passwort) loest
+     * den Passwort-Dialog aus, alles andere landet als Snackbar-Meldung.
+     */
+    private fun emitFailure(e: Throwable, fallback: String) {
+        if (e is ShellyRpcException && e.isAuth) {
+            _authError.tryEmit(Unit)
+        } else {
+            _messages.tryEmit("$fallback: ${e.message}")
+        }
+    }
+
+    // ---------- doorbell-Script: pruefen, installieren, aktualisieren ----------
+
+    /** Inhalt der gebuendelten shelly/doorbell.js (per Gradle als Asset kopiert). */
+    private val bundledScript: String by lazy {
+        assets.open("doorbell.js").readBytes().decodeToString()
+    }
+
+    /** Version der gebuendelten doorbell.js ("let VERSION = n" in der ersten Zeile). */
+    private val bundledVersion: Int by lazy { parseScriptVersion(bundledScript) ?: 0 }
+
+    private fun parseScriptVersion(code: String?): Int? =
+        code?.take(VERSION_PROBE_LEN)?.let { Regex("""VERSION\s*=\s*(\d+)""").find(it) }
+            ?.groupValues?.get(1)?.toIntOrNull()
+
+    /**
+     * Haelt das doorbell-Script auf dem Shelly ohne Nutzer-Interaktion in Schuss:
+     * fehlt es -> installieren; aeltere/unbekannte Version -> aktualisieren;
+     * gestoppt/abgestuerzt -> einfach neu starten. Laeuft bei jedem (Re-)Connect
+     * und bei „Verbindung pruefen".
+     */
+    private suspend fun ensureScript() {
+        scriptMutex.withLock {
+            scriptId = null
+            var found: JSONObject? = null
+            val scripts = client.call("Script.List").optJSONArray("scripts")
+            if (scripts != null) {
+                for (i in 0 until scripts.length()) {
+                    val s = scripts.optJSONObject(i) ?: continue
+                    if (s.optString("name") == "doorbell") {
+                        found = s
+                        break
+                    }
                 }
             }
+            if (found == null) {
+                provisionScript(existingId = null)
+                return
+            }
+            val id = found.optInt("id")
+            val deployed = parseScriptVersion(
+                client.call(
+                    "Script.GetCode",
+                    JSONObject().put("id", id).put("offset", 0).put("len", VERSION_PROBE_LEN)
+                ).optString("data")
+            )
+            when {
+                deployed == null || deployed < bundledVersion -> provisionScript(existingId = id)
+                deployed > bundledVersion -> {
+                    // Nicht anfassen: Downgrade koennte Features eines neueren Schemas zerlegen
+                    _messages.tryEmit("doorbell-Script v$deployed ist neuer als diese App – bitte die App aktualisieren")
+                    startScript(found)
+                }
+                else -> startScript(found)
+            }
         }
-        _scriptOk.value = scriptId != null
+    }
+
+    /** Script (falls gestoppt/abgestuerzt) kommentarlos wieder starten und als aktiv uebernehmen. */
+    private suspend fun startScript(entry: JSONObject) {
+        val id = entry.optInt("id")
+        if (!entry.optBoolean("running")) {
+            // Autostart gleich mit sichern, falls ihn jemand abgeschaltet hat
+            runCatching {
+                client.call(
+                    "Script.SetConfig",
+                    JSONObject().put("id", id).put("config", JSONObject().put("enable", true))
+                )
+            }
+            try {
+                client.call("Script.Start", JSONObject().put("id", id))
+            } catch (e: ShellyRpcException) {
+                // Geraet lehnt den Start ab -> Code vermutlich kaputt, frisch einspielen.
+                // Transport-/Auth-Fehler dagegen weiterreichen (da hilft kein Upload).
+                if (e.isTransport || e.isAuth) throw e
+                provisionScript(existingId = id)
+                return
+            }
+        }
+        scriptId = id
+        _scriptOk.value = true
+    }
+
+    /** Die gebuendelte doorbell.js einspielen — Port der shelly/upload.ps1-Sequenz,
+     *  aber ueber die bestehende (authentifizierte) WebSocket-Verbindung. */
+    private suspend fun provisionScript(existingId: Int?) {
+        val id = if (existingId == null) {
+            client.call("Script.Create", JSONObject().put("name", "doorbell")).optInt("id", -1)
+                .also { if (it < 0) throw ShellyRpcException(-4, "Script.Create lieferte keine id") }
+        } else {
+            // Laeuft es noch mit altem Code, erst stoppen (Fehler = war schon gestoppt)
+            runCatching { client.call("Script.Stop", JSONObject().put("id", existingId)) }
+            existingId
+        }
+        val code = bundledScript
+        var pos = 0
+        while (pos < code.length) {
+            val chunk = code.substring(pos, minOf(pos + SCRIPT_CHUNK, code.length))
+            client.call(
+                "Script.PutCode",
+                JSONObject().put("id", id).put("code", chunk).put("append", pos > 0)
+            )
+            pos += chunk.length
+        }
+        client.call("Script.SetConfig", JSONObject().put("id", id).put("config", JSONObject().put("enable", true)))
+        client.call("Script.Start", JSONObject().put("id", id))
+        scriptId = id
+        _scriptOk.value = true
+        _messages.tryEmit(
+            if (existingId == null) "doorbell-Script v$bundledVersion wurde auf dem Shelly installiert"
+            else "doorbell-Script wurde auf v$bundledVersion aktualisiert"
+        )
     }
 
     private suspend fun refreshSettings() {
@@ -314,7 +517,10 @@ class DoorbellService : Service() {
                     val ev = events.optJSONObject(i) ?: continue
                     when (ev.optString("event")) {
                         "doorbell" -> onDoorbell(ev.optJSONObject("data"))
-                        "doorbell_cfg" -> scope.launch { runCatching { refreshSettings() } }
+                        "doorbell_cfg" ->
+                            if (!listenOnly.value) scope.launch { runCatching { refreshSettings() } }
+                        "doorbell_hb" -> onHeartbeat(ev.optJSONObject("data"))
+                        "doorbell_log" -> scope.launch { onRingLog(ev.optJSONObject("data")) }
                     }
                 }
             }
@@ -330,10 +536,53 @@ class DoorbellService : Service() {
         val nowS = System.currentTimeMillis() / 1000
         // Ohne NTP-Zeit schickt das Script einen Mini-Timestamp -> Handy-Zeit nehmen
         val ts = data?.optLong("ts", 0L)?.takeIf { it > MIN_VALID_TS } ?: nowS
-        val power = data?.optDouble("power", Double.NaN)?.takeIf { !it.isNaN() && it >= 0 }
-        scope.launch { dao.insertAll(listOf(RingEvent(ts, power))) }
+        scope.launch { recordProvisional(ts) }
         // Lokal stummgeschaltet: Ereignis landet trotzdem in der History
         if (localAlarmEnabled) startAlarm()
+    }
+
+    private fun onHeartbeat(data: JSONObject?) {
+        lastHeartbeatMs = SystemClock.elapsedRealtime()
+        _scriptOk.value = true
+        data?.optInt("v", -1)?.takeIf { it > 0 }?.let { _scriptVersion.value = it }
+    }
+
+    /**
+     * Aus den (per Sperrzeit gedrosselten) Alarm-Events eine vorlaeufige
+     * History-Zeile bauen: Druecke innerhalb von [GROUP_GAP_S] zaehlen. Der
+     * spaeter eintreffende, exakte Datensatz des Scripts ([onRingLog]) ersetzt
+     * diesen Vorlaeufer. Die lokale Zaehlung unterschaetzt naturgemaess (nur ein
+     * Event je Sperrzeit), zeigt aber sofort etwas an.
+     */
+    private suspend fun recordProvisional(ts: Long) {
+        logMutex.withLock {
+            if (provStart != 0L && ts - provLastTs <= GROUP_GAP_S) {
+                provCount++
+                provLastTs = ts
+            } else {
+                provStart = ts
+                provCount = 1
+                provLastTs = ts
+            }
+            val dur = (provLastTs - provStart).toInt().coerceAtLeast(1)
+            dao.upsert(RingEvent(ts = provStart, count = provCount, durationS = dur, authoritative = false))
+        }
+    }
+
+    /** Exakter Ereignis-Datensatz vom Script: ersetzt einen etwaigen Vorlaeufer. */
+    private suspend fun onRingLog(data: JSONObject?) {
+        val t = data?.optLong("t", 0L)?.takeIf { it > MIN_VALID_TS } ?: return
+        val n = data.optInt("n", 1).coerceAtLeast(1)
+        val d = data.optInt("d", 1).coerceAtLeast(1)
+        logMutex.withLock {
+            dao.clearProvisional(t - LOG_TOL_S, t + d + LOG_TOL_S)
+            dao.upsert(RingEvent(ts = t, count = n, durationS = d, authoritative = true))
+            if (provStart != 0L && provStart in (t - LOG_TOL_S)..(t + d + LOG_TOL_S)) {
+                provStart = 0L
+                provCount = 0
+                provLastTs = 0L
+            }
+        }
     }
 
     // ---------- Alarm ----------
@@ -391,12 +640,103 @@ class DoorbellService : Service() {
 
     fun reconnect() = client.reconnectNow()
 
+    /**
+     * Übernimmt IP/Passwort sofort in die laufende Verbindung, ohne auf den
+     * DataStore-Umweg zu warten. Ohne das würde eine direkt danach ausgelöste
+     * Prüfung noch mit den alten Zugangsdaten laufen (erst zweiter Versuch grün).
+     */
+    fun applyCredentials(ip: String, password: String) {
+        this.password.value = password
+        this.ip.value = ip
+        client.credentialsChanged()
+    }
+
+    /** Passwort aus dem Fehlerdialog übernehmen (IP bleibt) und Daten neu abgleichen. */
+    fun applyPassword(password: String) {
+        this.password.value = password
+        client.credentialsChanged()
+        // Die Verbindung steht bei Auth-Fehlern weiter -> direkt neu abgleichen,
+        // sonst blieben Klingelzeiten/Einstellungen bis zum nächsten Reconnect leer.
+        if (client.state.value is ConnectionState.Connected) {
+            scope.launch { onConnected() }
+        }
+    }
+
+    /** Hauptdaten (Script-Status, Einstellungen) neu laden – nach erfolgreicher Prüfung. */
+    suspend fun reloadSettings() = onConnected()
+
+    /**
+     * Aktive Verbindungsprüfung für den „Verbindung prüfen“-Button. Testet immer
+     * frisch (retryAuth: auch eine Passwortänderung am Shelly selbst wird so
+     * erkannt) und liefert eine Gesamtaussage: Shelly erreichbar + Passwort ok +
+     * doorbell-Script läuft. Fehlt oder hakt das Script, repariert [ensureScript]
+     * es dabei gleich selbst.
+     */
+    suspend fun checkConnection(): ConnCheck {
+        if (listenOnly.value) return checkListenOnly()
+        client.retryAuth()
+        val api = runCatching { client.call("Switch.GetStatus", JSONObject().put("id", 0)) }
+        api.exceptionOrNull()?.let { e ->
+            val detail = when {
+                e is ShellyRpcException && e.isAuth && password.value.isBlank() ->
+                    "Shelly ist passwortgeschützt, hier ist keins eingetragen – reiner Lausch-Betrieb: " +
+                        "der Klingel-Alarm funktioniert, Schalten/Einstellungen nicht."
+                e is ShellyRpcException && e.isAuth ->
+                    "Passwort ist falsch (Benutzer ist „admin“). Der Klingel-Alarm " +
+                        "funktioniert trotzdem – nur Schalten und Einstellungen brauchen das Passwort."
+                e is ShellyRpcException && e.code == 429 ->
+                    "Shelly meldet „zu viele Anfragen“ – kurz warten und erneut prüfen."
+                e is ShellyRpcException && e.isTransport -> "Shelly nicht erreichbar – IP und WLAN prüfen."
+                else -> e.message
+            }
+            return ConnCheck(ok = false, detail = detail)
+        }
+        runCatching { ensureScript() }.exceptionOrNull()?.let { e ->
+            return ConnCheck(
+                ok = false,
+                detail = "doorbell-Script läuft nicht und konnte nicht eingerichtet werden: ${e.message}",
+            )
+        }
+        // Version mit ausgeben: das Selbst-Update beim Verbinden laeuft sonst
+        // unsichtbar ab, wenn die App-Oberflaeche dabei nicht offen ist.
+        return ConnCheck(ok = true, detail = "doorbell-Script v$bundledVersion ist installiert und läuft.")
+    }
+
+    /**
+     * Prüfung im Lauschmodus: ohne Auth. Bestätigt nur, dass die Verbindung
+     * steht und das doorbell-Script sein Lebenszeichen sendet (der einzige
+     * Nachweis ohne Passwort, dass es läuft).
+     */
+    private suspend fun checkListenOnly(): ConnCheck {
+        if (client.state.value !is ConnectionState.Connected) {
+            return ConnCheck(ok = false, detail = "Nicht verbunden – IP und WLAN prüfen.")
+        }
+        // Auf das (alle 30 s gesendete) Lebenszeichen warten.
+        val deadline = SystemClock.elapsedRealtime() + HEARTBEAT_WAIT_MS
+        while (lastHeartbeatMs == 0L && SystemClock.elapsedRealtime() < deadline) {
+            delay(500)
+        }
+        if (lastHeartbeatMs == 0L) {
+            return ConnCheck(
+                ok = false,
+                detail = "Verbunden, aber kein Lebenszeichen vom doorbell-Script – " +
+                    "läuft es auf dem Shelly?",
+            )
+        }
+        val v = _scriptVersion.value
+        return ConnCheck(
+            ok = true,
+            detail = "Lausch-Betrieb: Klingel-Alarm läuft" +
+                (v?.let { ", doorbell-Script v$it aktiv." } ?: ", doorbell-Script aktiv."),
+        )
+    }
+
     fun setBell(on: Boolean) {
         scope.launch {
             runCatching {
                 client.call("Switch.Set", JSONObject().put("id", 0).put("on", on))
                 pollStatus()
-            }.onFailure { _messages.tryEmit("Schalten fehlgeschlagen: ${it.message}") }
+            }.onFailure { emitFailure(it, "Schalten fehlgeschlagen") }
         }
     }
 
@@ -407,7 +747,7 @@ class DoorbellService : Service() {
                 kvsSet("dbell_cfg_debounce_s", debounceS)
                 _shared.value = SharedSettings(thresholdW, debounceS)
                 notifyScriptCfgChanged()
-            }.onFailure { _messages.tryEmit("Speichern fehlgeschlagen: ${it.message}") }
+            }.onFailure { emitFailure(it, "Speichern fehlgeschlagen") }
         }
     }
 
@@ -427,7 +767,7 @@ class DoorbellService : Service() {
                 alignBell()
                 notifyScriptCfgChanged()
             }.onFailure {
-                _messages.tryEmit("Klingelzeit anlegen fehlgeschlagen: ${it.message}")
+                emitFailure(it, "Klingelzeit anlegen fehlgeschlagen")
                 runCatching { refreshSettings() }
             }
         }
@@ -444,7 +784,7 @@ class DoorbellService : Service() {
                 alignBell()
                 notifyScriptCfgChanged()
             }.onFailure {
-                _messages.tryEmit("Klingelzeit löschen fehlgeschlagen: ${it.message}")
+                emitFailure(it, "Klingelzeit löschen fehlgeschlagen")
                 runCatching { refreshSettings() }
             }
         }
@@ -461,7 +801,7 @@ class DoorbellService : Service() {
                 alignBell()
                 notifyScriptCfgChanged()
             }.onFailure {
-                _messages.tryEmit("Ruhe setzen fehlgeschlagen: ${it.message}")
+                emitFailure(it, "Ruhe setzen fehlgeschlagen")
                 runCatching { refreshSettings() }
             }
         }
@@ -475,7 +815,7 @@ class DoorbellService : Service() {
                 alignBell()
                 notifyScriptCfgChanged()
             }.onFailure {
-                _messages.tryEmit("Ruhe beenden fehlgeschlagen: ${it.message}")
+                emitFailure(it, "Ruhe beenden fehlgeschlagen")
                 runCatching { refreshSettings() }
             }
         }
@@ -582,11 +922,21 @@ class DoorbellService : Service() {
     private suspend fun mergeKvsLog(kv: Map<String, Any?>) {
         val events = mutableListOf<RingEvent>()
         for ((key, value) in kv) {
-            if (!key.startsWith("dbell_log_") || key == "dbell_log_head") continue
+            if (!key.startsWith("dbell_log_") || key == "dbell_log_head" || key == "dbell_log_fmt") continue
             val arr = (value as? String)?.let { runCatching { JSONArray(it) }.getOrNull() } ?: continue
             for (i in 0 until arr.length()) {
-                val ts = arr.optLong(i)
-                if (ts > MIN_VALID_TS) events.add(RingEvent(ts))
+                // Neues Format: Ereignis-Objekte {t,n,d}; Nicht-Objekte ignorieren.
+                val o = arr.optJSONObject(i) ?: continue
+                val t = o.optLong("t", 0L)
+                if (t <= MIN_VALID_TS) continue
+                events.add(
+                    RingEvent(
+                        ts = t,
+                        count = o.optInt("n", 1).coerceAtLeast(1),
+                        durationS = o.optInt("d", 1).coerceAtLeast(1),
+                        authoritative = true,
+                    )
+                )
             }
         }
         if (events.isNotEmpty()) dao.insertAll(events)
@@ -652,8 +1002,26 @@ class DoorbellService : Service() {
         private const val MIN_VALID_TS = 1_000_000_000L
         private const val PRUNE_AFTER_S = 400L * 24 * 3600
 
+        /** 3 min: Druecke innerhalb dieses Fensters gehoeren zu einem Ereignis. */
+        private const val GROUP_GAP_S = 180L
+
+        /** Toleranz beim Zuordnen eines Script-Datensatzes zu einem Vorlaeufer. */
+        private const val LOG_TOL_S = 90L
+
+        /** Ohne Heartbeat laenger als das gilt das Script als nicht laufend. */
+        private const val STALE_MS = 95_000L
+
+        /** So lange wartet die Lauschmodus-Pruefung auf das erste Lebenszeichen. */
+        private const val HEARTBEAT_WAIT_MS = 35_000L
+
         const val DEFAULT_THRESHOLD_W = 2.0
         const val DEFAULT_DEBOUNCE_S = 30
+
+        /** So viele erste Zeichen des Script-Codes reichen fuer die VERSION-Zeile. */
+        private const val VERSION_PROBE_LEN = 200
+
+        /** Blockgroesse fuer Script.PutCode (wie shelly/upload.ps1). */
+        private const val SCRIPT_CHUNK = 1024
 
         fun start(context: Context) {
             val intent = Intent(context, DoorbellService::class.java)

@@ -30,6 +30,14 @@ object Fmt {
     fun watts(w: Double?): String =
         if (w == null) "– W" else String.format(Locale.GERMANY, "%.1f W", w)
 
+    /** Dauer in Sekunden -> "M:SS" (z. B. 1 -> "0:01", 200 -> "3:20"). */
+    fun duration(seconds: Int): String =
+        String.format(Locale.GERMAN, "%d:%02d", seconds / 60, seconds % 60)
+
+    /** Klingel-Ereignis kompakt: "1x in 0:01", "3x in 3:20". */
+    fun ringSummary(count: Int, durationS: Int): String =
+        "${count}x in ${duration(durationS)}"
+
     /** Minuten seit Mitternacht -> "HH:MM". */
     fun minutes(min: Int): String = String.format(Locale.GERMAN, "%02d:%02d", min / 60, min % 60)
 

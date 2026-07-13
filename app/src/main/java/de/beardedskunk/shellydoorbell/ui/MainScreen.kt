@@ -34,6 +34,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -57,6 +58,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import de.beardedskunk.shellydoorbell.data.AppDb
 import de.beardedskunk.shellydoorbell.data.Prefs
@@ -77,9 +80,16 @@ fun MainScreen(
     onHistory: () -> Unit,
     onSettings: () -> Unit,
 ) {
+    val context = LocalContext.current
+    val prefs = remember { Prefs(context) }
+    val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
+    var showAuthDialog by remember { mutableStateOf(false) }
     LaunchedEffect(service) { service.messages.collect { snackbar.showSnackbar(it) } }
+    LaunchedEffect(service) { service.authError.collect { showAuthDialog = true } }
 
+    val settings by prefs.settings.collectAsState(initial = null)
+    val listenOnly = settings?.listenOnly ?: false
     val conn by service.connectionState.collectAsState()
     val watts by service.watts.collectAsState()
     val bellOn by service.bellOn.collectAsState()
@@ -116,20 +126,95 @@ fun MainScreen(
                 bellOn = bellOn,
                 muteUntil = muteUntil,
                 connected = connected,
+                listenOnly = listenOnly,
                 onToggle = { service.setBell(it) },
                 onMute = { service.setMute(it) },
                 onClearMute = { service.clearMute() },
             )
             LocalAlarmCard()
-            BellTimesCard(
-                entries = bellTimes,
-                connected = connected,
-                onAdd = { service.addBellTime(it) },
-                onRemove = { service.removeBellTime(it) },
-            )
+            // Klingelzeiten schreiben auf den Shelly -> im Lauschmodus ausblenden.
+            if (!listenOnly) {
+                BellTimesCard(
+                    entries = bellTimes,
+                    connected = connected,
+                    onAdd = { service.addBellTime(it) },
+                    onRemove = { service.removeBellTime(it) },
+                )
+            }
             EventsCard(onHistory)
         }
     }
+
+    if (showAuthDialog) {
+        AuthErrorDialog(
+            onDismiss = { showAuthDialog = false },
+            onSave = { pw ->
+                scope.launch { prefs.setPassword(pw) }
+                // Sofort in die laufende Verbindung übernehmen und neu abgleichen
+                // (nicht auf den DataStore-Umweg warten).
+                service.applyPassword(pw)
+                showAuthDialog = false
+            },
+            onOpenSettings = {
+                showAuthDialog = false
+                onSettings()
+            },
+        )
+    }
+}
+
+/**
+ * Erscheint, wenn der Shelly zwar erreichbar ist, aber Befehle mangels
+ * (richtigem) Passwort mit 401 abweist. Erlaubt die Passworteingabe direkt,
+ * alternativ Sprung in die Einstellungen.
+ */
+@Composable
+private fun AuthErrorDialog(
+    onDismiss: () -> Unit,
+    onSave: (String) -> Unit,
+    onOpenSettings: () -> Unit,
+) {
+    var pw by remember { mutableStateOf("") }
+    var visible by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Passwort erforderlich") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    "Der Shelly ist im Netz erreichbar, verlangt aber ein Passwort für Schalt- " +
+                        "und Einstellungsbefehle. Bitte das in der Shelly-Web-UI gesetzte Passwort " +
+                        "eingeben (Benutzer ist immer „admin“).",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                OutlinedTextField(
+                    value = pw,
+                    onValueChange = { pw = it },
+                    label = { Text("Passwort") },
+                    singleLine = true,
+                    visualTransformation = if (visible) {
+                        VisualTransformation.None
+                    } else {
+                        PasswordVisualTransformation()
+                    },
+                    trailingIcon = {
+                        TextButton(onClick = { visible = !visible }) {
+                            Text(if (visible) "Verbergen" else "Zeigen")
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(pw) }, enabled = pw.isNotBlank()) {
+                Text("Speichern & erneut verbinden")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onOpenSettings) { Text("Einstellungen") }
+        },
+    )
 }
 
 @Composable
@@ -191,7 +276,8 @@ private fun ScriptWarning() {
             Icon(Icons.Filled.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.onErrorContainer)
             Text(
                 "Auf dem Shelly läuft kein Script namens „doorbell“ – Klingel-Alarme kommen so nicht an. " +
-                    "Bitte shelly/doorbell.js installieren (siehe README).",
+                    "Die App richtet es normalerweise selbst ein; unter Einstellungen → " +
+                    "„Verbindung prüfen“ lässt sich das erneut anstoßen.",
                 modifier = Modifier.padding(start = 12.dp),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onErrorContainer,
@@ -205,6 +291,7 @@ private fun BellCard(
     bellOn: Boolean?,
     muteUntil: Long?,
     connected: Boolean,
+    listenOnly: Boolean,
     onToggle: (Boolean) -> Unit,
     onMute: (Long) -> Unit,
     onClearMute: () -> Unit,
@@ -232,29 +319,35 @@ private fun BellCard(
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
-                Switch(
-                    checked = bellOn == true,
-                    onCheckedChange = onToggle,
-                    enabled = connected && bellOn != null,
-                )
-            }
-            if (muteUntil != null) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Text(
-                        "Ruhe bis ${Fmt.muteUntil(muteUntil)}",
-                        modifier = Modifier.weight(1f),
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Bold,
+                // Der Toggle schreibt auf den Shelly -> im Lauschmodus weglassen.
+                if (!listenOnly) {
+                    Switch(
+                        checked = bellOn == true,
+                        onCheckedChange = onToggle,
+                        enabled = connected && bellOn != null,
                     )
-                    OutlinedButton(onClick = { pickMute = true }, enabled = connected) { Text("Ändern") }
-                    OutlinedButton(onClick = onClearMute, enabled = connected) { Text("Beenden") }
                 }
-            } else {
-                OutlinedButton(onClick = { pickMute = true }, enabled = connected) {
-                    Text("Ruhe bis …")
+            }
+            // "Ruhe bis" schreibt ebenfalls auf den Shelly -> im Lauschmodus weg.
+            if (!listenOnly) {
+                if (muteUntil != null) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            "Ruhe bis ${Fmt.muteUntil(muteUntil)}",
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        OutlinedButton(onClick = { pickMute = true }, enabled = connected) { Text("Ändern") }
+                        OutlinedButton(onClick = onClearMute, enabled = connected) { Text("Beenden") }
+                    }
+                } else {
+                    OutlinedButton(onClick = { pickMute = true }, enabled = connected) {
+                        Text("Ruhe bis …")
+                    }
                 }
             }
         }
@@ -496,9 +589,10 @@ private fun EventsCard(onHistory: () -> Unit) {
                             style = MaterialTheme.typography.bodyMedium,
                             modifier = Modifier.weight(1f),
                         )
-                        event.power?.let {
-                            Text(Fmt.watts(it), style = MaterialTheme.typography.bodySmall)
-                        }
+                        Text(
+                            Fmt.ringSummary(event.count, event.durationS),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
                     }
                 }
             }

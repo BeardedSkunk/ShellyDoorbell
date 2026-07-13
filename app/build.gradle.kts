@@ -38,6 +38,32 @@ android {
     }
 }
 
+// shelly/doorbell.js wird als Asset gebuendelt: die App vergleicht die Version
+// auf dem Geraet und spielt das Script bei Bedarf selbst ein. Der Umweg ueber
+// einen Task haelt shelly/ als einzige Quelle (kein Duplikat im Repo).
+abstract class CopyDoorbellScriptTask : DefaultTask() {
+    @get:InputFile
+    abstract val source: RegularFileProperty
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @TaskAction
+    fun copy() {
+        source.get().asFile.copyTo(File(outputDir.get().asFile, "doorbell.js"), overwrite = true)
+    }
+}
+
+val copyDoorbellScript = tasks.register<CopyDoorbellScriptTask>("copyDoorbellScript") {
+    source.set(rootProject.layout.projectDirectory.file("shelly/doorbell.js"))
+}
+
+androidComponents {
+    onVariants { variant ->
+        variant.sources.assets?.addGeneratedSourceDirectory(copyDoorbellScript, CopyDoorbellScriptTask::outputDir)
+    }
+}
+
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17

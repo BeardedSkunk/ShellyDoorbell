@@ -66,7 +66,7 @@ fun HistoryScreen(onBack: () -> Unit) {
                 items(events, key = { it.ts }) { event ->
                     ListItem(
                         headlineContent = { Text("${Fmt.time(event.ts)} Uhr") },
-                        trailingContent = { event.power?.let { Text(Fmt.watts(it)) } },
+                        trailingContent = { Text(Fmt.ringSummary(event.count, event.durationS)) },
                     )
                 }
             }

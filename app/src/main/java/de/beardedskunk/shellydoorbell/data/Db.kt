@@ -13,19 +13,32 @@ import androidx.room.RoomDatabase
 import kotlinx.coroutines.flow.Flow
 
 /**
- * Ein Klingel-Ereignis. Der Unix-Timestamp (Sekunden) ist zugleich der Schluessel,
- * dadurch dedupliziert der Merge aus dem Shelly-KVS-Ringpuffer automatisch.
+ * Ein Klingel-Ereignis: fasst alle Druecke eines "Besuchs" zusammen (siehe
+ * doorbell.js, 3-min-Fenster). [ts] ist der Gruppen-Start (Unix-Sekunden) und
+ * zugleich der Schluessel — dadurch dedupliziert der Merge aus dem Shelly-KVS
+ * automatisch. [authoritative] = false markiert einen nur lokal (aus den
+ * empfangenen Alarm-Events) gezaehlten Vorlaeufer, den der spaetere, exakte
+ * Datensatz des Scripts ersetzt.
  */
 @Entity(tableName = "ring_events")
 data class RingEvent(
     @PrimaryKey val ts: Long,
-    val power: Double? = null,
+    val count: Int = 1,
+    val durationS: Int = 1,
+    val authoritative: Boolean = false,
 )
 
 @Dao
 interface RingDao {
-    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(event: RingEvent)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAll(events: List<RingEvent>)
+
+    /** Vorlaeufige (lokal gezaehlte) Eintraege im Zeitfenster entfernen. */
+    @Query("DELETE FROM ring_events WHERE authoritative = 0 AND ts BETWEEN :from AND :to")
+    suspend fun clearProvisional(from: Long, to: Long)
 
     @Query("SELECT * FROM ring_events ORDER BY ts DESC")
     fun all(): Flow<List<RingEvent>>
@@ -37,7 +50,7 @@ interface RingDao {
     suspend fun prune(cutoff: Long)
 }
 
-@Database(entities = [RingEvent::class], version = 1, exportSchema = false)
+@Database(entities = [RingEvent::class], version = 2, exportSchema = false)
 abstract class AppDb : RoomDatabase() {
     abstract fun ringDao(): RingDao
 
@@ -47,6 +60,10 @@ abstract class AppDb : RoomDatabase() {
 
         fun get(context: Context): AppDb = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(context.applicationContext, AppDb::class.java, "doorbell.db")
+                // Das Schema hat sich mit v3 des Scripts geaendert (Ereignisse mit
+                // Anzahl/Dauer statt Einzel-Timestamps); die alte History wird
+                // bewusst verworfen statt migriert.
+                .fallbackToDestructiveMigration(true)
                 .build()
                 .also { instance = it }
         }
