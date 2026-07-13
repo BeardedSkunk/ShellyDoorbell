@@ -1,8 +1,11 @@
 package de.beardedskunk.shellydoorbell.shelly
 
 import android.net.Network
+import android.os.SystemClock
+import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -29,8 +32,18 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.min
 import kotlin.random.Random
 
+private const val TAG = "ShellyClient"
+
 /** Max. Sendungen pro Call: 1 regulaer + 2 Auth-Wiederholungen mit frischer Challenge. */
 private const val MAX_AUTH_SENDS = 3
+
+/**
+ * Grund-Cooldown nach einem 429 ("too many requests"): so lange sendet der Client
+ * gar nichts mehr, damit der Shelly seine Brute-Force-/Rate-Sperre ablaufen lassen
+ * kann. Verdoppelt sich bei wiederholtem 429 bis [RATE_LIMIT_MAX_MS].
+ */
+private const val RATE_LIMIT_BASE_MS = 60_000L
+private const val RATE_LIMIT_MAX_MS = 300_000L
 
 sealed class ConnectionState {
     /** Kein WLAN verfuegbar (oder keine IP konfiguriert). */
@@ -111,6 +124,46 @@ class ShellyClient(
      *  worden sein, ohne dass sich in der App etwas tut. */
     fun retryAuth() = resetAuth()
 
+    /** elapsedRealtime-Deadline, bis zu der wegen 429 nichts gesendet wird (0 = frei). */
+    @Volatile
+    private var rateLimitedUntilMs = 0L
+
+    /** Aktueller Cooldown; eskaliert bei wiederholtem 429, faellt bei Erfolg zurueck. */
+    @Volatile
+    private var rateLimitBackoffMs = RATE_LIMIT_BASE_MS
+
+    private val _rateLimited = MutableStateFlow(false)
+
+    /** true, solange eine 429-Sperre laeuft — Poll/Reconnect pausieren dann. */
+    val rateLimited: StateFlow<Boolean> = _rateLimited
+
+    /** Verbleibende 429-Sperrzeit in ms (0 = nicht gesperrt). */
+    fun rateLimitedForMs(): Long = (rateLimitedUntilMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+
+    /** Ein 429 kam rein: Sperre setzen/verlaengern und nach Ablauf selbst wieder freigeben. */
+    private fun enterRateLimit(cause: String) {
+        val cooldown = rateLimitBackoffMs
+        rateLimitedUntilMs = SystemClock.elapsedRealtime() + cooldown
+        _rateLimited.value = true
+        Log.w(TAG, "429 vom Shelly bei '$cause' -> pausiere ${cooldown / 1000}s, damit die Sperre ablaufen kann")
+        rateLimitBackoffMs = min(rateLimitBackoffMs * 2, RATE_LIMIT_MAX_MS)
+        scope.launch {
+            delay(cooldown)
+            // Nur freigeben, wenn kein spaeteres 429 die Deadline weiter geschoben hat.
+            if (rateLimitedForMs() == 0L && _rateLimited.value) {
+                _rateLimited.value = false
+                Log.i(TAG, "429-Cooldown abgelaufen – sende wieder")
+            }
+        }
+    }
+
+    /** Erfolgreicher Call: Sperre/Eskalation zuruecknehmen. */
+    private fun onCallSucceeded() {
+        if (rateLimitedUntilMs != 0L) rateLimitedUntilMs = 0L
+        if (_rateLimited.value) _rateLimited.value = false
+        rateLimitBackoffMs = RATE_LIMIT_BASE_MS
+    }
+
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.NoWifi)
     val state: StateFlow<ConnectionState> = _state
 
@@ -144,7 +197,15 @@ class ShellyClient(
                     try {
                         var backoff = 1_000L
                         while (currentCoroutineContext().isActive) {
+                            // Laeuft eine 429-Sperre, gar nicht erst einen Socket
+                            // oeffnen – jeder Versuch wuerde die Sperre verlaengern.
+                            val cooldown = rateLimitedForMs()
+                            if (cooldown > 0) {
+                                Log.w(TAG, "Reconnect pausiert: 429-Sperre noch ${cooldown / 1000}s")
+                                delay(cooldown)
+                            }
                             _state.value = ConnectionState.Connecting
+                            Log.d(TAG, "Verbinde mit ws://$ip/rpc")
                             val ok = runSession(http, ip)
                             _state.value = ConnectionState.Connecting
                             if (ok) backoff = 1_000L
@@ -227,9 +288,13 @@ class ShellyClient(
                     helloOk = true
                     val name = (info.opt("name") as? String)?.takeIf { it.isNotBlank() }
                         ?: info.optString("id", "Shelly")
+                    Log.i(TAG, "Verbunden mit '$name'")
                     _state.value = ConnectionState.Connected(name)
                     _connectedEvents.emit(Unit)
                     closed.await()
+                    Log.d(TAG, "Verbindung zu '$name' beendet")
+                } else {
+                    Log.w(TAG, "Hello (Shelly.GetDeviceInfo) fehlgeschlagen – Session verworfen")
                 }
             }
         } finally {
@@ -259,6 +324,11 @@ class ShellyClient(
         timeoutMs: Long = 8_000,
         requiresAuth: Boolean = true,
     ): JSONObject {
+        // 429-Sperre aktiv: gar nicht senden, sonst laeuft die Shelly-Sperre nie ab.
+        val cooldown = rateLimitedForMs()
+        if (cooldown > 0) {
+            throw ShellyRpcException(429, "Zu viele Anfragen – Shelly gesperrt, noch ${cooldown / 1000}s")
+        }
         // Passwort bereits als falsch/fehlend erkannt: gar nicht erst senden. So
         // haemmern wir den Shelly nicht mit 401-Roundtrips (sein Brute-Force-
         // Schutz antwortet darauf sonst mit "429 too many requests"). Wieder
@@ -267,8 +337,15 @@ class ShellyClient(
         var attempt = 1
         while (true) {
             try {
-                return sendFrame(method, params, timeoutMs)
+                val result = sendFrame(method, params, timeoutMs)
+                onCallSucceeded()
+                return result
             } catch (e: ShellyRpcException) {
+                // 429: der Shelly hat dichtgemacht -> Sperre setzen und aufhoeren.
+                if (e.code == 429) {
+                    enterRateLimit(method)
+                    throw e
+                }
                 if (e.code != 401) throw e
                 lastAuthMessage = e.message ?: lastAuthMessage
                 val challenge = ShellyAuth.Challenge.parse(e.message)
@@ -276,6 +353,7 @@ class ShellyClient(
                     if (authFailed) throw ShellyRpcException(401, lastAuthMessage)
                     if (challenge == null || passwordFlow.value.isBlank() || attempt >= MAX_AUTH_SENDS) {
                         authFailed = true
+                        Log.w(TAG, "Auth endgueltig gescheitert bei '$method' (Versuch $attempt) – kein weiteres Senden bis Reset")
                         throw e
                     }
                     adoptChallenge(challenge)
@@ -297,8 +375,10 @@ class ShellyClient(
         if (cachedChallenge?.nonce != challenge.nonce) {
             cachedChallenge = challenge
             ncCounter.set(expected)
+            Log.d(TAG, "Neue Nonce uebernommen (nc weiter ab ${expected + 1})")
         } else if (ncCounter.get() < expected) {
             ncCounter.set(expected)
+            Log.d(TAG, "nc auf $expected vorgespult (Replay-Korrektur vom Shelly)")
         }
     }
 

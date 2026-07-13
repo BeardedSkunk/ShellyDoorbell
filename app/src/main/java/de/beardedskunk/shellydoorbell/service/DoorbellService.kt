@@ -16,6 +16,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import de.beardedskunk.shellydoorbell.AlarmActivity
@@ -154,6 +155,7 @@ class DoorbellService : Service() {
         // Ohne lokalen Alarm laeuft der Dienst nur fuer die sichtbare UI mit —
         // dann ohne Dauer-Notification (und er beendet sich, wenn die UI zugeht).
         val initial = runBlocking { prefs.settings.first() }
+        Log.i(TAG, "onCreate: ip=${initial.ip}, lauschmodus=${initial.listenOnly}, lokalerAlarm=${initial.alarmEnabled}")
         ip.value = initial.ip
         password.value = initial.password
         alarmUri = initial.alarmUri
@@ -179,7 +181,12 @@ class DoorbellService : Service() {
                 }
             }
         }
-        scope.launch { client.state.collect { updateServiceNotification(it) } }
+        scope.launch {
+            client.state.collect {
+                Log.d(TAG, "Verbindungszustand: ${it::class.simpleName}")
+                updateServiceNotification(it)
+            }
+        }
         scope.launch { client.connectedEvents.collect { onConnected() } }
         scope.launch { client.notifications.collect { handleNotification(it) } }
         scope.launch {
@@ -204,7 +211,9 @@ class DoorbellService : Service() {
         scope.launch {
             // Live-Watt nur pollen, solange die App sichtbar ist — und nicht im
             // Lauschmodus (Switch.GetStatus wuerde ohne Passwort 401 spammen;
-            // Watt/Schalterzustand kommen dort ohnehin per NotifyStatus).
+            // Watt/Schalterzustand kommen dort ohnehin per NotifyStatus). Live-
+            // Aenderungen (Klingeln, Schalten) pusht der Shelly per NotifyStatus,
+            // deshalb reicht ein gemaechlicher Poll fuer die reine Anzeige.
             combine(uiVisible, client.state, listenOnly) { visible, st, listen ->
                 visible && !listen && st is ConnectionState.Connected
             }
@@ -212,14 +221,38 @@ class DoorbellService : Service() {
                 .collectLatest { pollingActive ->
                     if (!pollingActive) return@collectLatest
                     while (true) {
-                        runCatching { pollStatus() }
+                        // Waehrend einer 429-Sperre NICHT pollen – sonst haelt der
+                        // Poll die Shelly-Sperre am Leben und sie laeuft nie ab.
+                        val cooldown = client.rateLimitedForMs()
+                        if (cooldown > 0) {
+                            delay(cooldown.coerceAtMost(5_000))
+                            continue
+                        }
+                        runCatching { pollStatus() }.onFailure {
+                            if (it is ShellyRpcException && it.code == 429) {
+                                Log.w(TAG, "pollStatus: 429 – Poll pausiert bis Sperre ablaeuft")
+                            }
+                        }
                         // abgelaufene "Ruhe bis" aus der Anzeige nehmen (das
                         // Script auf dem Shelly schaltet den Trafo selbst zurueck)
                         _muteUntil.value = _muteUntil.value
                             ?.takeIf { it > System.currentTimeMillis() / 1000 }
-                        delay(2_000)
+                        delay(POLL_INTERVAL_MS)
                     }
                 }
+        }
+        scope.launch {
+            // Nach Ablauf einer 429-Sperre einmal frisch laden: onConnected kann
+            // waehrend der Sperre gescheitert sein, dann blieben Klingelzeiten und
+            // Script-Status leer, obwohl die Verbindung steht.
+            client.rateLimited.collect { limited ->
+                if (!limited && !listenOnly.value &&
+                    client.state.value is ConnectionState.Connected
+                ) {
+                    Log.i(TAG, "429-Sperre vorbei – Einstellungen erneut laden")
+                    runCatching { onConnected() }
+                }
+            }
         }
         scope.launch { alarm.active.collect { if (!it) cancelRingNotification() } }
         scope.launch {
@@ -289,7 +322,18 @@ class DoorbellService : Service() {
         // Lauschmodus: keine authentifizierten Aufrufe (wuerden 401 liefern).
         // Klingel-Events, Live-Status und der Script-Heartbeat kommen als
         // Broadcast ganz ohne Passwort an.
-        if (listenOnly.value) return
+        if (listenOnly.value) {
+            Log.d(TAG, "onConnected: Lauschmodus – keine Auth-Aufrufe")
+            return
+        }
+        // Laeuft gerade eine 429-Sperre, jetzt nichts senden – der rateLimited-
+        // Watcher ruft onConnected nach Ablauf der Sperre erneut auf.
+        val cooldown = client.rateLimitedForMs()
+        if (cooldown > 0) {
+            Log.w(TAG, "onConnected uebersprungen: 429-Sperre noch ${cooldown / 1000}s")
+            return
+        }
+        Log.d(TAG, "onConnected: Script pruefen + Einstellungen laden")
         // Erster authentifizierter Zugriff. Scheitert er am Passwort, NICHT mit
         // refreshSettings weitermachen – das wären nur weitere 401 in Folge.
         val scriptResult = runCatching { ensureScript() }
@@ -365,6 +409,7 @@ class DoorbellService : Service() {
                 }
             }
             if (found == null) {
+                Log.i(TAG, "ensureScript: kein doorbell-Script gefunden – installiere v$bundledVersion")
                 provisionScript(existingId = null)
                 return
             }
@@ -375,6 +420,7 @@ class DoorbellService : Service() {
                     JSONObject().put("id", id).put("offset", 0).put("len", VERSION_PROBE_LEN)
                 ).optString("data")
             )
+            Log.d(TAG, "ensureScript: doorbell (id=$id) v=$deployed, gebuendelt v$bundledVersion")
             when {
                 deployed == null || deployed < bundledVersion -> provisionScript(existingId = id)
                 deployed > bundledVersion -> {
@@ -424,6 +470,8 @@ class DoorbellService : Service() {
             existingId
         }
         val code = bundledScript
+        val chunks = (code.length + SCRIPT_CHUNK - 1) / SCRIPT_CHUNK
+        Log.i(TAG, "provisionScript: lade v$bundledVersion hoch (id=$id, ${code.length} Zeichen, $chunks Bloecke)")
         var pos = 0
         while (pos < code.length) {
             val chunk = code.substring(pos, minOf(pos + SCRIPT_CHUNK, code.length))
@@ -455,6 +503,7 @@ class DoorbellService : Service() {
                 ?.takeIf { it > System.currentTimeMillis() / 1000 }
             runCatching { pollStatus() }
             mergeKvsLog(kv)
+            Log.d(TAG, "refreshSettings ok: ${_bellTimes.value?.size ?: 0} Klingelzeiten, Schwelle ${_shared.value?.thresholdW}W")
         }
     }
 
@@ -536,6 +585,7 @@ class DoorbellService : Service() {
         val nowS = System.currentTimeMillis() / 1000
         // Ohne NTP-Zeit schickt das Script einen Mini-Timestamp -> Handy-Zeit nehmen
         val ts = data?.optLong("ts", 0L)?.takeIf { it > MIN_VALID_TS } ?: nowS
+        Log.i(TAG, "Klingel-Event (ts=$ts, lokalerAlarm=$localAlarmEnabled)")
         scope.launch { recordProvisional(ts) }
         // Lokal stummgeschaltet: Ereignis landet trotzdem in der History
         if (localAlarmEnabled) startAlarm()
@@ -544,7 +594,9 @@ class DoorbellService : Service() {
     private fun onHeartbeat(data: JSONObject?) {
         lastHeartbeatMs = SystemClock.elapsedRealtime()
         _scriptOk.value = true
-        data?.optInt("v", -1)?.takeIf { it > 0 }?.let { _scriptVersion.value = it }
+        val v = data?.optInt("v", -1)?.takeIf { it > 0 }
+        if (v != null) _scriptVersion.value = v
+        Log.d(TAG, "Heartbeat vom Script (v${v ?: "?"})")
     }
 
     /**
@@ -674,6 +726,18 @@ class DoorbellService : Service() {
      */
     suspend fun checkConnection(): ConnCheck {
         if (listenOnly.value) return checkListenOnly()
+        // Steckt der Shelly in seiner 429-Sperre, NICHT erneut anfragen – jede
+        // weitere Anfrage verlaengert die Sperre nur. Die App wiederholt selbst.
+        val cooldown = client.rateLimitedForMs()
+        if (cooldown > 0) {
+            val s = cooldown / 1000 + 1
+            Log.w(TAG, "checkConnection: 429-Sperre aktiv, noch ${s}s")
+            return ConnCheck(
+                ok = false,
+                detail = "Shelly hat wegen zu vieler Anfragen kurz dichtgemacht. " +
+                    "Die App verbindet sich in ~${s}s von selbst wieder – bitte jetzt nicht erneut prüfen.",
+            )
+        }
         client.retryAuth()
         val api = runCatching { client.call("Switch.GetStatus", JSONObject().put("id", 0)) }
         api.exceptionOrNull()?.let { e ->
@@ -993,10 +1057,16 @@ class DoorbellService : Service() {
     }
 
     companion object {
+        private const val TAG = "DoorbellSvc"
+
         const val ACTION_STOP_ALARM = "de.beardedskunk.shellydoorbell.STOP_ALARM"
 
         private const val NOTIF_ID_SERVICE = 1
         private const val NOTIF_ID_RING = 2
+
+        /** Poll-Abstand fuer die reine Watt-Anzeige (Live-Aenderungen pusht der
+         *  Shelly ohnehin per NotifyStatus – gemaechlich genuegt, spart Anfragen). */
+        private const val POLL_INTERVAL_MS = 5_000L
 
         /** Aeltere Timestamps gelten als "keine echte Uhrzeit" (Shelly ohne NTP). */
         private const val MIN_VALID_TS = 1_000_000_000L
