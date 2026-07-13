@@ -65,7 +65,8 @@ Dauer-Alarm spielen (über die Wecker-Lautstärke, auch über dem Sperrbildschir
 
 Die Watt-Schwelle (Default 2 W) muss über der Standby-Leistung des
 Klingeltrafos liegen und unter der Leistung beim Klingeln – in der App unter
-„Erkennung“ einstellbar, die Live-Watt-Anzeige hilft beim Kalibrieren.
+Einstellungen → „Erkennung“ einstellbar, die Live-Watt-Anzeige hilft beim
+Kalibrieren.
 
 ## App bauen & installieren
 

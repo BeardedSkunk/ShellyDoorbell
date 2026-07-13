@@ -35,7 +35,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
@@ -48,7 +47,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -67,12 +65,10 @@ import de.beardedskunk.shellydoorbell.shelly.BellEntry
 import de.beardedskunk.shellydoorbell.shelly.BellTimes
 import de.beardedskunk.shellydoorbell.shelly.BellWindow
 import de.beardedskunk.shellydoorbell.shelly.ConnectionState
-import de.beardedskunk.shellydoorbell.shelly.SharedSettings
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.ZoneId
-import kotlin.math.roundToInt
 import kotlinx.coroutines.launch
 
 @Composable
@@ -87,7 +83,6 @@ fun MainScreen(
     val conn by service.connectionState.collectAsState()
     val watts by service.watts.collectAsState()
     val bellOn by service.bellOn.collectAsState()
-    val shared by service.shared.collectAsState()
     val bellTimes by service.bellTimes.collectAsState()
     val muteUntil by service.muteUntil.collectAsState()
     val scriptOk by service.scriptOk.collectAsState()
@@ -132,7 +127,6 @@ fun MainScreen(
                 onAdd = { service.addBellTime(it) },
                 onRemove = { service.removeBellTime(it) },
             )
-            SharedCard(shared, connected, onSave = { t, d -> service.saveShared(t, d) })
             EventsCard(onHistory)
         }
     }
@@ -306,7 +300,7 @@ private fun LocalAlarmCard() {
                     if (enabled) {
                         "Dieses Handy schlägt bei Klingeln Alarm"
                     } else {
-                        "Stumm – andere Geräte klingeln weiter"
+                        "Stumm – Lausch-Dienst pausiert, andere Geräte klingeln weiter"
                     },
                     style = MaterialTheme.typography.bodySmall,
                 )
@@ -470,43 +464,6 @@ private fun TimePickerDialog(initialMin: Int, onDismiss: () -> Unit, onConfirm: 
         },
         text = { TimePicker(state = state) },
     )
-}
-
-@Composable
-private fun SharedCard(shared: SharedSettings?, connected: Boolean, onSave: (Double, Int) -> Unit) {
-    var threshold by remember(shared) { mutableFloatStateOf((shared?.thresholdW ?: DoorbellService.DEFAULT_THRESHOLD_W).toFloat()) }
-    var debounce by remember(shared) { mutableFloatStateOf((shared?.debounceS ?: DoorbellService.DEFAULT_DEBOUNCE_S).toFloat()) }
-    fun save() = onSave((threshold * 2).roundToInt() / 2.0, debounce.roundToInt())
-
-    Card {
-        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text("Erkennung (gilt für alle)", style = MaterialTheme.typography.titleMedium)
-            Text(
-                "Klingel-Schwelle: ${Fmt.watts((threshold * 2).roundToInt() / 2.0)}",
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            Slider(
-                value = threshold,
-                onValueChange = { threshold = it },
-                onValueChangeFinished = ::save,
-                valueRange = 0.5f..15f,
-                steps = 28,
-                enabled = connected && shared != null,
-            )
-            Text(
-                "Sperrzeit nach Klingeln: ${debounce.roundToInt()} s",
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            Slider(
-                value = debounce,
-                onValueChange = { debounce = it },
-                onValueChangeFinished = ::save,
-                valueRange = 5f..120f,
-                steps = 22,
-                enabled = connected && shared != null,
-            )
-        }
-    }
 }
 
 @Composable
