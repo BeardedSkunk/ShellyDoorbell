@@ -45,7 +45,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
@@ -117,7 +119,13 @@ class DoorbellService : Service() {
         alarm = AlarmController(this, scope)
         client = ShellyClient(scope, ip, wifi)
 
-        startForegroundCompat()
+        // Ohne lokalen Alarm laeuft der Dienst nur fuer die sichtbare UI mit —
+        // dann ohne Dauer-Notification (und er beendet sich, wenn die UI zugeht).
+        val initial = runBlocking { prefs.settings.first() }
+        ip.value = initial.ip
+        alarmUri = initial.alarmUri
+        localAlarmEnabled = initial.alarmEnabled
+        if (localAlarmEnabled) startForegroundCompat()
         requestWifi()
         client.start()
 
@@ -125,7 +133,7 @@ class DoorbellService : Service() {
             prefs.settings.collect {
                 ip.value = it.ip
                 alarmUri = it.alarmUri
-                localAlarmEnabled = it.alarmEnabled
+                setLocalAlarmEnabled(it.alarmEnabled)
             }
         }
         scope.launch { client.state.collect { updateServiceNotification(it) } }
@@ -156,7 +164,23 @@ class DoorbellService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP_ALARM) stopAlarm()
-        return START_STICKY
+        // Nur der Dauer-Lauscher soll nach einem System-Kill wiederbelebt werden
+        return if (localAlarmEnabled) START_STICKY else START_NOT_STICKY
+    }
+
+    private fun setLocalAlarmEnabled(enabled: Boolean) {
+        if (enabled == localAlarmEnabled) return
+        localAlarmEnabled = enabled
+        if (enabled) {
+            // Sicherstellen, dass der Dienst "gestartet" ist (nicht nur gebunden),
+            // sonst endet er beim naechsten Unbind trotz Foreground
+            ContextCompat.startForegroundService(this, Intent(this, DoorbellService::class.java))
+            startForegroundCompat()
+            updateServiceNotification(client.state.value)
+        } else {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            if (!uiVisible.value) stopSelf()
+        }
     }
 
     override fun onDestroy() {
@@ -359,6 +383,8 @@ class DoorbellService : Service() {
 
     fun setUiVisible(visible: Boolean) {
         uiVisible.value = visible
+        // Ohne lokalen Alarm lief der Dienst nur fuer die UI mit
+        if (!visible && !localAlarmEnabled) stopSelf()
     }
 
     fun reconnect() = client.reconnectNow()
@@ -599,6 +625,9 @@ class DoorbellService : Service() {
     }
 
     private fun updateServiceNotification(state: ConnectionState) {
+        // Nicht im Vordergrund (Alarm lokal aus) -> notify() wuerde die gerade
+        // entfernte Dauer-Notification wieder anheften
+        if (!localAlarmEnabled) return
         val text = when (state) {
             is ConnectionState.Connected -> getString(R.string.notif_listening)
             ConnectionState.Connecting -> getString(R.string.notif_connecting)
@@ -623,7 +652,14 @@ class DoorbellService : Service() {
         const val DEFAULT_DEBOUNCE_S = 30
 
         fun start(context: Context) {
-            ContextCompat.startForegroundService(context, Intent(context, DoorbellService::class.java))
+            val intent = Intent(context, DoorbellService::class.java)
+            val alarmEnabled = runBlocking { Prefs(context).settings.first().alarmEnabled }
+            if (alarmEnabled) {
+                ContextCompat.startForegroundService(context, intent)
+            } else {
+                // Nur-UI-Betrieb: normaler Service ohne Dauer-Notification
+                runCatching { context.startService(intent) }
+            }
         }
     }
 }
