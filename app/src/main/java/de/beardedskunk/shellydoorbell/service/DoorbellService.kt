@@ -173,10 +173,12 @@ class DoorbellService : Service() {
         localAlarmEnabled = enabled
         if (enabled) {
             // Sicherstellen, dass der Dienst "gestartet" ist (nicht nur gebunden),
-            // sonst endet er beim naechsten Unbind trotz Foreground
+            // sonst endet er beim naechsten Unbind trotz Foreground.
+            // Die Foreground-Notification direkt mit dem aktuellen Verbindungs-
+            // status posten – sonst bliebe sie auf "verbinde" haengen, wenn der
+            // Zustand danach nicht mehr wechselt (Verbindung stand schon).
             ContextCompat.startForegroundService(this, Intent(this, DoorbellService::class.java))
-            startForegroundCompat()
-            updateServiceNotification(client.state.value)
+            startForegroundCompat(serviceText(client.state.value))
         } else {
             stopForeground(STOP_FOREGROUND_REMOVE)
             if (!uiVisible.value) stopSelf()
@@ -601,8 +603,8 @@ class DoorbellService : Service() {
 
     // ---------- Foreground-Notification ----------
 
-    private fun startForegroundCompat() {
-        val notification = buildServiceNotification(getString(R.string.notif_connecting))
+    private fun startForegroundCompat(text: String = getString(R.string.notif_connecting)) {
+        val notification = buildServiceNotification(text)
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIF_ID_SERVICE, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
@@ -624,17 +626,19 @@ class DoorbellService : Service() {
             .build()
     }
 
+    private fun serviceText(state: ConnectionState): String = when (state) {
+        is ConnectionState.Connected -> getString(R.string.notif_listening)
+        ConnectionState.Connecting -> getString(R.string.notif_connecting)
+        ConnectionState.NoWifi -> getString(R.string.notif_no_wifi)
+    }
+
     private fun updateServiceNotification(state: ConnectionState) {
         // Nicht im Vordergrund (Alarm lokal aus) -> notify() wuerde die gerade
         // entfernte Dauer-Notification wieder anheften
         if (!localAlarmEnabled) return
-        val text = when (state) {
-            is ConnectionState.Connected -> getString(R.string.notif_listening)
-            ConnectionState.Connecting -> getString(R.string.notif_connecting)
-            ConnectionState.NoWifi -> getString(R.string.notif_no_wifi)
-        }
         runCatching {
-            getSystemService(NotificationManager::class.java).notify(NOTIF_ID_SERVICE, buildServiceNotification(text))
+            getSystemService(NotificationManager::class.java)
+                .notify(NOTIF_ID_SERVICE, buildServiceNotification(serviceText(state)))
         }
     }
 
