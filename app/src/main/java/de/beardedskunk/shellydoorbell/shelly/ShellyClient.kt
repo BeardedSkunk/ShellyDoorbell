@@ -89,6 +89,11 @@ class ShellyClient(
      *  onConnected + Live-Polling) nicht den nc-Zaehler gegeneinander verwuerfeln. */
     private val authMutex = Mutex()
 
+    /** Serialisiert ALLE RPC-Aufrufe: der Shelly bekommt immer nur einen Request
+     *  gleichzeitig. Das schwache Geraet quittiert Parallelitaet sonst mit 429,
+     *  und sein Script bricht bei zu vielen gleichzeitigen Calls ab. */
+    private val callMutex = Mutex()
+
     /** Haelt nc-Vergabe und Sendereihenfolge zusammen: der Shelly verlangt pro
      *  Nonce aufsteigende nc-Werte. Ohne dieses Lock koennten parallele Calls
      *  ihre Frames vertauscht auf den Draht bringen (nc=2 vor nc=1) — das Geraet
@@ -323,6 +328,14 @@ class ShellyClient(
         params: JSONObject? = null,
         timeoutMs: Long = 8_000,
         requiresAuth: Boolean = true,
+    ): JSONObject = callMutex.withLock { doCall(method, params, timeoutMs, requiresAuth) }
+
+    /** Der eigentliche Aufruf – laeuft immer unter [callMutex], also strikt seriell. */
+    private suspend fun doCall(
+        method: String,
+        params: JSONObject?,
+        timeoutMs: Long,
+        requiresAuth: Boolean,
     ): JSONObject {
         // 429-Sperre aktiv: gar nicht senden, sonst laeuft die Shelly-Sperre nie ab.
         val cooldown = rateLimitedForMs()

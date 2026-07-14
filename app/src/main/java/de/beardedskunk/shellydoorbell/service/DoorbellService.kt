@@ -183,7 +183,12 @@ class DoorbellService : Service() {
         }
         scope.launch {
             client.state.collect {
-                Log.d(TAG, "Verbindungszustand: ${it::class.simpleName}")
+                val label = when (it) {
+                    is ConnectionState.Connected -> "verbunden (${it.deviceName})"
+                    ConnectionState.Connecting -> "verbinde"
+                    ConnectionState.NoWifi -> "kein WLAN"
+                }
+                Log.d(TAG, "Verbindungszustand: $label")
                 updateServiceNotification(it)
             }
         }
@@ -436,6 +441,7 @@ class DoorbellService : Service() {
     /** Script (falls gestoppt/abgestuerzt) kommentarlos wieder starten und als aktiv uebernehmen. */
     private suspend fun startScript(entry: JSONObject) {
         val id = entry.optInt("id")
+        Log.d(TAG, "startScript: id=$id, running=${entry.optBoolean("running")}")
         if (!entry.optBoolean("running")) {
             // Autostart gleich mit sichern, falls ihn jemand abgeschaltet hat
             runCatching {

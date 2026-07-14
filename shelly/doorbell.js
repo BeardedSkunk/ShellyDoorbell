@@ -1,4 +1,4 @@
-let VERSION = 3; // MUSS die erste Zeile bleiben und bei jeder Aenderung hochgezaehlt werden:
+let VERSION = 4; // MUSS die erste Zeile bleiben und bei jeder Aenderung hochgezaehlt werden:
                  // die App liest sie per Script.GetCode und spielt bei aelterer/fehlender
                  // Version automatisch die von ihr gebuendelte doorbell.js ein.
 
@@ -204,15 +204,29 @@ function migrateLog(cb) {
       if (cb) cb();
       return;
     }
-    for (let i = 0; i < LOG_CHUNKS; i++) {
-      Shelly.call("KVS.Delete", { key: "dbell_log_" + JSON.stringify(i) });
+    // Alte, inkompatible Chunks EINZELN NACHEINANDER loeschen. Die Engine
+    // erlaubt nur wenige gleichzeitige Shelly.call — die alte Schleife feuerte
+    // alle 10 Deletes auf einmal und starb mit "Too many calls in progress",
+    // und zwar bevor die Format-Marke gesetzt war -> Migration lief bei jedem
+    // Start erneut und crashte das Script immer wieder. Jetzt streng seriell:
+    // erst wenn alle Deletes durch sind, Kopf + Format-Marke setzen.
+    function delNext(i) {
+      if (i >= LOG_CHUNKS) {
+        Shelly.call("KVS.Set", { key: "dbell_log_head", value: 0 }, function () {
+          Shelly.call("KVS.Set", { key: "dbell_log_fmt", value: LOG_FMT }, function () {
+            logHead = 0;
+            logChunk = [];
+            if (cb) cb();
+          });
+        });
+        return;
+      }
+      // ec ignorieren: ein nicht existierender Chunk ist auch "geloescht".
+      Shelly.call("KVS.Delete", { key: "dbell_log_" + JSON.stringify(i) }, function () {
+        delNext(i + 1);
+      });
     }
-    Shelly.call("KVS.Set", { key: "dbell_log_head", value: 0 });
-    Shelly.call("KVS.Set", { key: "dbell_log_fmt", value: LOG_FMT }, function () {
-      logHead = 0;
-      logChunk = [];
-      if (cb) cb();
-    });
+    delNext(0);
   });
 }
 
