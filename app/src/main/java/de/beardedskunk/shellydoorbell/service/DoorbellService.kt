@@ -315,7 +315,19 @@ class DoorbellService : Service() {
             runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
         }
         alarm.stop()
+        // Anstaendig vom Shelly abmelden (Verbindungs-Slot sofort frei), dann alle
+        // Coroutinen beenden.
+        runCatching { client.close() }
         scope.cancel()
+        // Alarm-Aus gilt nur fuer die laufende Sitzung: wurde der Dienst im
+        // Alarm-Aus-Zustand beendet (Nutzer hat den Alarm ausgeschaltet und die App
+        // verlassen), fuer den naechsten Start wieder scharf schalten. NACH
+        // scope.cancel(), damit der (nun tote) Settings-Collector nicht mehr auf die
+        // Aenderung reagiert und den Dienst faelschlich wieder in den Vordergrund holt.
+        if (!localAlarmEnabled) {
+            Log.i(TAG, "Herunterfahren mit Alarm-Aus – fuer naechsten Start wieder aktivieren")
+            runCatching { runBlocking { prefs.setAlarmEnabled(true) } }
+        }
         super.onDestroy()
     }
 

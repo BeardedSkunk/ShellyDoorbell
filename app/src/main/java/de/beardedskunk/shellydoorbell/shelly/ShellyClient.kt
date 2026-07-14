@@ -329,6 +329,13 @@ class ShellyClient(
         backoffSkip?.complete(Unit)
     }
 
+    /** Verbindung sofort sauber schliessen (z. B. beim Herunterfahren des Dienstes),
+     *  damit der Shelly den Verbindungs-Slot umgehend freigibt statt auf sein
+     *  eigenes Timeout zu warten. */
+    fun close() {
+        runCatching { currentWs?.close(1000, "bye") }
+    }
+
     private fun buildClient(net: Network): OkHttpClient = OkHttpClient.Builder()
         .socketFactory(net.socketFactory)
         .dns(object : okhttp3.Dns {
