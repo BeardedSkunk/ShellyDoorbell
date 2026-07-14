@@ -1,4 +1,4 @@
-let VERSION = 4; // MUSS die erste Zeile bleiben und bei jeder Aenderung hochgezaehlt werden:
+let VERSION = 5; // MUSS die erste Zeile bleiben und bei jeder Aenderung hochgezaehlt werden:
                  // die App liest sie per Script.GetCode und spielt bei aelterer/fehlender
                  // Version automatisch die von ihr gebuendelte doorbell.js ein.
 
@@ -31,7 +31,6 @@ let VERSION = 4; // MUSS die erste Zeile bleiben und bei jeder Aenderung hochgez
 //   dbell_mute_until       "Ruhe bis": Unix-Zeit (Sekunden), bis zu der die
 //                          Klingel stumm ist; laeuft ueber einen Script-Timer
 //                          ab (kein Schedule, hinterlaesst nichts)
-//   dbell_log_fmt          Format-Marke des Ringpuffers (aktuell 2)
 //   dbell_log_head         Index des aktuellen Log-Chunks (0..9)
 //   dbell_log_0 .. _9      Log-Chunks: JSON-Array von Ereignis-Objekten
 //                          {t: Start-Unixzeit, n: Anzahl Druecke, d: Dauer in s}
@@ -47,7 +46,6 @@ let DEF_THRESHOLD_W = 2.0;
 let DEF_DEBOUNCE_S = 30;
 let LOG_CHUNKS = 10;    // dbell_log_0 .. dbell_log_9 (KVS: max. 50 Keys gesamt!)
 let LOG_PER_CHUNK = 6;  // 6 Ereignis-Objekte ~ 210 Zeichen JSON, KVS-Limit ist 253
-let LOG_FMT = 2;        // Ringpuffer-Format (1 = alte reine Timestamp-Liste)
 let HB_INTERVAL_MS = 30000; // Lebenszeichen-Broadcast-Takt
 let GROUP_GAP_MS = 180000;  // 3 min: danach gilt ein Klingel-Ereignis als beendet
 
@@ -193,42 +191,6 @@ function scheduleMuteTimer() {
 
 let logReady = false;   // erst schreiben, wenn der aktuelle Chunk geladen ist
 let logPending = [];    // Ereignisse waehrend des Ladens -> nachtragen
-
-// Einmalige Migration: das Log-Format hat mit v3 von reinen Timestamps auf
-// Ereignis-Objekte {t,n,d} gewechselt. Alte, inkompatible Chunks werden dabei
-// bewusst verworfen. Danach initLog() aufrufen.
-function migrateLog(cb) {
-  Shelly.call("KVS.Get", { key: "dbell_log_fmt" }, function (res, ec) {
-    let fmt = (ec === 0 && res) ? toNum(res.value, 1) : 1;
-    if (fmt === LOG_FMT) {
-      if (cb) cb();
-      return;
-    }
-    // Alte, inkompatible Chunks EINZELN NACHEINANDER loeschen. Die Engine
-    // erlaubt nur wenige gleichzeitige Shelly.call — die alte Schleife feuerte
-    // alle 10 Deletes auf einmal und starb mit "Too many calls in progress",
-    // und zwar bevor die Format-Marke gesetzt war -> Migration lief bei jedem
-    // Start erneut und crashte das Script immer wieder. Jetzt streng seriell:
-    // erst wenn alle Deletes durch sind, Kopf + Format-Marke setzen.
-    function delNext(i) {
-      if (i >= LOG_CHUNKS) {
-        Shelly.call("KVS.Set", { key: "dbell_log_head", value: 0 }, function () {
-          Shelly.call("KVS.Set", { key: "dbell_log_fmt", value: LOG_FMT }, function () {
-            logHead = 0;
-            logChunk = [];
-            if (cb) cb();
-          });
-        });
-        return;
-      }
-      // ec ignorieren: ein nicht existierender Chunk ist auch "geloescht".
-      Shelly.call("KVS.Delete", { key: "dbell_log_" + JSON.stringify(i) }, function () {
-        delNext(i + 1);
-      });
-    }
-    delNext(0);
-  });
-}
 
 function initLog() {
   Shelly.call("KVS.Get", { key: "dbell_log_head" }, function (res, ec) {
@@ -491,7 +453,7 @@ loadCfg(function () {
   scheduleMuteTimer();
   reconcileBell();
 });
-migrateLog(initLog);
+initLog();
 
 // Lebenszeichen + Versionsangabe alle 30 s: der einzige auth-freie Kanal, ueber
 // den auch Clients ohne Passwort erfahren, dass/welches Script laeuft.

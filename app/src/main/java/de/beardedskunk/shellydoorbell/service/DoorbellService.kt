@@ -992,7 +992,7 @@ class DoorbellService : Service() {
     private suspend fun mergeKvsLog(kv: Map<String, Any?>) {
         val events = mutableListOf<RingEvent>()
         for ((key, value) in kv) {
-            if (!key.startsWith("dbell_log_") || key == "dbell_log_head" || key == "dbell_log_fmt") continue
+            if (!key.startsWith("dbell_log_") || key == "dbell_log_head") continue
             val arr = (value as? String)?.let { runCatching { JSONArray(it) }.getOrNull() } ?: continue
             for (i in 0 until arr.length()) {
                 // Neues Format: Ereignis-Objekte {t,n,d}; Nicht-Objekte ignorieren.
