@@ -58,6 +58,11 @@ class MainActivity : ComponentActivity() {
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
+    // WLAN-Namen (SSID) lesen, um Heim- von Fremdnetzen zu unterscheiden. Abgelehnt
+    // ist ok: die App faellt dann auf die reine Subnetz-Erkennung zurueck.
+    private val wifiPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+
     // Auf Activity-Ebene, nicht im SettingsScreen: waehrend der System-Picker
     // offen ist, wird der Service entbunden, die UI faellt auf den Lade-Spinner
     // zurueck und ein im Composable registrierter Launcher wuerde mitsamt dem
@@ -80,6 +85,15 @@ class MainActivity : ComponentActivity() {
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        // SSID-Zugriff: ab Android 13 „Geräte in der Nähe" (ohne Standort), darunter Standort.
+        val wifiPerm = if (Build.VERSION.SDK_INT >= 33) {
+            Manifest.permission.NEARBY_WIFI_DEVICES
+        } else {
+            Manifest.permission.ACCESS_FINE_LOCATION
+        }
+        if (checkSelfPermission(wifiPerm) != PackageManager.PERMISSION_GRANTED) {
+            wifiPermission.launch(wifiPerm)
         }
         setContent {
             AppTheme {

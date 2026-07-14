@@ -86,7 +86,6 @@ fun MainScreen(
     val snackbar = remember { SnackbarHostState() }
     var showAuthDialog by remember { mutableStateOf(false) }
     LaunchedEffect(service) { service.messages.collect { snackbar.showSnackbar(it) } }
-    LaunchedEffect(service) { service.authError.collect { showAuthDialog = true } }
 
     val settings by prefs.settings.collectAsState(initial = null)
     val listenOnly = settings?.listenOnly ?: false
@@ -248,6 +247,7 @@ private fun ConnectionCard(conn: ConnectionState, watts: Double?, onReconnect: (
                 is ConnectionState.Connected -> Triple(Color(0xFF43A047), "Verbunden", conn.deviceName)
                 ConnectionState.Connecting -> Triple(Color(0xFFFB8C00), "Verbinde …", "Shelly wird gesucht")
                 ConnectionState.NoWifi -> Triple(Color(0xFFE53935), "Kein WLAN", "Warte auf Heimnetz")
+                is ConnectionState.OtherNetwork -> Triple(Color(0xFF9E9E9E), "Anderes Netz", conn.detail)
             }
             Box(Modifier.size(14.dp).background(color, CircleShape))
             Column(Modifier.weight(1f).padding(start = 12.dp)) {

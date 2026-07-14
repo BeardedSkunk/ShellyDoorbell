@@ -175,17 +175,21 @@ fun SettingsScreen(
                                 checking = true
                                 checkResult = null
                                 scope.launch {
-                                    // Erst die eingetippten Zugangsdaten übernehmen (persistent
-                                    // + sofort in die laufende Verbindung), dann prüfen – sonst
-                                    // liefe die Prüfung noch gegen das alte Passwort.
-                                    val ipVal = ipField.trim().ifBlank { settings?.ip ?: "" }
-                                    if (ipChanged) prefs.setIp(ipVal)
-                                    if (pwChanged) prefs.setPassword(pwField)
-                                    service.applyCredentials(ipVal, pwField)
-                                    val result = service.checkConnection()
-                                    // Bei Erfolg die Hauptdaten gleich mit den (nun gültigen)
-                                    // Zugangsdaten nachladen – sequentiell nach der Prüfung.
-                                    if (result.ok) service.reloadSettings()
+                                    // Nur wenn IP/Passwort wirklich geändert wurden, die neuen
+                                    // Zugangsdaten übernehmen (das setzt die Auth zurück) und
+                                    // aktiv prüfen. Ist alles unverändert und läuft, meldet
+                                    // checkConnection sofort „ok" ohne eine einzige Anfrage.
+                                    val changed = ipChanged || pwChanged
+                                    if (changed) {
+                                        val ipVal = ipField.trim().ifBlank { settings?.ip ?: "" }
+                                        if (ipChanged) prefs.setIp(ipVal)
+                                        if (pwChanged) prefs.setPassword(pwField)
+                                        service.applyCredentials(ipVal, pwField)
+                                    }
+                                    val result = service.checkConnection(force = changed)
+                                    // Nur bei geänderten Zugangsdaten die Hauptdaten neu laden;
+                                    // sonst gibt es nichts nachzuladen.
+                                    if (result.ok && changed) service.reloadSettings()
                                     checkResult = result
                                     checking = false
                                 }

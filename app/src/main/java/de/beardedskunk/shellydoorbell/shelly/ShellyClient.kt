@@ -28,6 +28,7 @@ import okhttp3.WebSocketListener
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.min
 import kotlin.random.Random
@@ -42,14 +43,42 @@ private const val MAX_AUTH_SENDS = 3
  * gar nichts mehr, damit der Shelly seine Brute-Force-/Rate-Sperre ablaufen lassen
  * kann. Verdoppelt sich bei wiederholtem 429 bis [RATE_LIMIT_MAX_MS].
  */
-private const val RATE_LIMIT_BASE_MS = 60_000L
-private const val RATE_LIMIT_MAX_MS = 300_000L
+private const val RATE_LIMIT_BASE_MS = 30_000L
+private const val RATE_LIMIT_MAX_MS = 120_000L
+
+/** Nach einem endgueltig gescheiterten Auth-Handshake automatisch neu versuchen
+ *  (das Passwort ist meist korrekt, der 401 war transient – z. B. waehrend einer
+ *  429-/Busy-Phase des Shelly). Eskaliert, damit ein WIRKLICH falsches Passwort
+ *  nicht dauerfeuert. */
+private const val AUTH_RETRY_BASE_MS = 30_000L
+private const val AUTH_RETRY_MAX_MS = 300_000L
+
+/** Mindestabstand zwischen zwei RPC-Sendungen. Zusammen mit der Serialisierung
+ *  (callMutex) sieht der schwache Shelly nie einen Anfragen-Schwall, der seinen
+ *  Ratenschutz (429) ausloest. */
+private const val MIN_CALL_GAP_MS = 250L
+
+/** Erster Reconnect-Abstand; verdoppelt sich bis zum Deckel der Tor-Entscheidung. */
+private const val INITIAL_BACKOFF_MS = 5_000L
 
 sealed class ConnectionState {
     /** Kein WLAN verfuegbar (oder keine IP konfiguriert). */
     data object NoWifi : ConnectionState()
     data object Connecting : ConnectionState()
     data class Connected(val deviceName: String) : ConnectionState()
+
+    /** WLAN da, aber bewusst KEIN Verbindungsversuch (falsches Subnetz / Fremdnetz
+     *  / Greylist-Wartezeit). [detail] erklaert es fuer die Notification. */
+    data class OtherNetwork(val detail: String) : ConnectionState()
+}
+
+/**
+ * Entscheidung des Netzwerk-Tors ([ShellyClient] fragt es vor jedem Versuch):
+ * verbinden (mit Backoff-Deckel) oder pausieren (Zustand + Wiedervorlage).
+ */
+sealed class GateDecision {
+    data class Attempt(val maxBackoffMs: Long) : GateDecision()
+    data class Block(val holdState: ConnectionState, val recheckMs: Long) : GateDecision()
 }
 
 class ShellyRpcException(val code: Int, message: String) : Exception(message) {
@@ -73,6 +102,10 @@ class ShellyClient(
     private val ipFlow: StateFlow<String>,
     private val networkFlow: StateFlow<Network?>,
     private val passwordFlow: StateFlow<String>,
+    /** Netzwerk-Tor: entscheidet vor jedem Versuch, ob/ wie verbunden wird.
+     *  Default = immer verbinden (Deckel 30 s), falls kein Tor gesetzt ist. */
+    private val gate: suspend (ip: String, forced: Boolean) -> GateDecision =
+        { _, _ -> GateDecision.Attempt(30_000L) },
 ) {
     private val src = "dbellapp-" + Random.nextInt(0x100000).toString(16)
     private val nextId = AtomicInteger(1)
@@ -93,6 +126,10 @@ class ShellyClient(
      *  gleichzeitig. Das schwache Geraet quittiert Parallelitaet sonst mit 429,
      *  und sein Script bricht bei zu vielen gleichzeitigen Calls ab. */
     private val callMutex = Mutex()
+
+    /** Zeitpunkt der letzten Sendung (fuer den Mindestabstand [MIN_CALL_GAP_MS]). */
+    @Volatile
+    private var lastSendAtMs = 0L
 
     /** Haelt nc-Vergabe und Sendereihenfolge zusammen: der Shelly verlangt pro
      *  Nonce aufsteigende nc-Werte. Ohne dieses Lock koennten parallele Calls
@@ -137,6 +174,15 @@ class ShellyClient(
     @Volatile
     private var rateLimitBackoffMs = RATE_LIMIT_BASE_MS
 
+    /** Aktuelle Auth-Retry-Wartezeit; eskaliert bei wiederholtem Fehlschlag,
+     *  faellt bei Erfolg zurueck. Verhindert Dauerfeuer bei falschem Passwort. */
+    @Volatile
+    private var authBackoffMs = AUTH_RETRY_BASE_MS
+
+    /** Verhindert mehrfach parallel geplante Auth-Retries. */
+    @Volatile
+    private var authRetryScheduled = false
+
     private val _rateLimited = MutableStateFlow(false)
 
     /** true, solange eine 429-Sperre laeuft — Poll/Reconnect pausieren dann. */
@@ -167,6 +213,26 @@ class ShellyClient(
         if (rateLimitedUntilMs != 0L) rateLimitedUntilMs = 0L
         if (_rateLimited.value) _rateLimited.value = false
         rateLimitBackoffMs = RATE_LIMIT_BASE_MS
+        authBackoffMs = AUTH_RETRY_BASE_MS
+    }
+
+    /** Nach endgueltig gescheitertem Auth-Handshake automatisch (mit Backoff) erneut
+     *  versuchen: [resetAuth] + Signal an den Service, die Daten neu zu laden. So
+     *  muss der Nutzer kein (meist korrektes) Passwort erneut eingeben. */
+    private fun scheduleAuthRetry() {
+        if (authRetryScheduled) return
+        authRetryScheduled = true
+        val delayMs = authBackoffMs
+        authBackoffMs = min(authBackoffMs * 2, AUTH_RETRY_MAX_MS)
+        scope.launch {
+            delay(delayMs)
+            authRetryScheduled = false
+            if (authFailed) {
+                resetAuth()
+                Log.i(TAG, "Auth-Reset nach ${delayMs / 1000}s – neuer Anlauf")
+                _needsReload.tryEmit(Unit)
+            }
+        }
     }
 
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.NoWifi)
@@ -180,11 +246,26 @@ class ShellyClient(
     private val _connectedEvents = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
     val connectedEvents: SharedFlow<Unit> = _connectedEvents
 
+    /** Feuert, wenn nach einer Auth-Sperre automatisch ein neuer Versuch faellig ist
+     *  (der Service laedt dann die Daten erneut, ohne dass der Nutzer etwas tun muss). */
+    private val _needsReload = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val needsReload: SharedFlow<Unit> = _needsReload
+
     @Volatile
     private var currentWs: WebSocket? = null
 
     @Volatile
     private var backoffSkip: CompletableDeferred<Unit>? = null
+
+    /** Vom „Verbindung pruefen"/Reconnect gesetzt: naechster Versuch ignoriert das
+     *  Netzwerk-Tor (einmalig) und wird sofort ausgeloest. */
+    private val pendingForce = AtomicBoolean(false)
+
+    /** Sofortiger Verbindungsversuch, der das Netzwerk-Tor ueberspringt. */
+    fun forceAttempt() {
+        pendingForce.set(true)
+        reconnectNow()
+    }
 
     fun start() {
         // Passwortwechsel: gecachte Challenge verwerfen, damit der naechste Call
@@ -200,7 +281,7 @@ class ShellyClient(
                     }
                     val http = buildClient(net)
                     try {
-                        var backoff = 1_000L
+                        var backoff = INITIAL_BACKOFF_MS
                         while (currentCoroutineContext().isActive) {
                             // Laeuft eine 429-Sperre, gar nicht erst einen Socket
                             // oeffnen – jeder Versuch wuerde die Sperre verlaengern.
@@ -208,17 +289,32 @@ class ShellyClient(
                             if (cooldown > 0) {
                                 Log.w(TAG, "Reconnect pausiert: 429-Sperre noch ${cooldown / 1000}s")
                                 delay(cooldown)
+                                continue
                             }
-                            _state.value = ConnectionState.Connecting
-                            Log.d(TAG, "Verbinde mit ws://$ip/rpc")
-                            val ok = runSession(http, ip)
-                            _state.value = ConnectionState.Connecting
-                            if (ok) backoff = 1_000L
-                            // Warten bis zum naechsten Versuch; reconnectNow() bricht ab
-                            val skip = CompletableDeferred<Unit>()
-                            backoffSkip = skip
-                            withTimeoutOrNull(backoff) { skip.await() }
-                            backoff = min(backoff * 2, 30_000L)
+                            val forced = pendingForce.getAndSet(false)
+                            when (val decision = gate(ip, forced)) {
+                                is GateDecision.Block -> {
+                                    // Bewusst nicht verbinden (falsches Netz / Greylist).
+                                    _state.value = decision.holdState
+                                    Log.d(TAG, "Kein Verbindungsversuch: ${decision.holdState}")
+                                    val skip = CompletableDeferred<Unit>()
+                                    backoffSkip = skip
+                                    withTimeoutOrNull(decision.recheckMs) { skip.await() }
+                                    backoff = INITIAL_BACKOFF_MS
+                                }
+                                is GateDecision.Attempt -> {
+                                    _state.value = ConnectionState.Connecting
+                                    Log.d(TAG, "Verbinde mit ws://$ip/rpc")
+                                    val ok = runSession(http, ip)
+                                    _state.value = ConnectionState.Connecting
+                                    backoff = if (ok) INITIAL_BACKOFF_MS
+                                    else min(backoff * 2, decision.maxBackoffMs)
+                                    // Warten bis zum naechsten Versuch; reconnectNow() bricht ab
+                                    val skip = CompletableDeferred<Unit>()
+                                    backoffSkip = skip
+                                    withTimeoutOrNull(backoff) { skip.await() }
+                                }
+                            }
                         }
                     } finally {
                         http.dispatcher.executorService.shutdown()
@@ -366,7 +462,8 @@ class ShellyClient(
                     if (authFailed) throw ShellyRpcException(401, lastAuthMessage)
                     if (challenge == null || passwordFlow.value.isBlank() || attempt >= MAX_AUTH_SENDS) {
                         authFailed = true
-                        Log.w(TAG, "Auth endgueltig gescheitert bei '$method' (Versuch $attempt) – kein weiteres Senden bis Reset")
+                        Log.w(TAG, "Auth endgueltig gescheitert bei '$method' (Versuch $attempt) – Auto-Neuversuch in ${authBackoffMs / 1000}s")
+                        scheduleAuthRetry()
                         throw e
                     }
                     adoptChallenge(challenge)
@@ -396,6 +493,11 @@ class ShellyClient(
     }
 
     private suspend fun sendFrame(method: String, params: JSONObject?, timeoutMs: Long): JSONObject {
+        // Sanftmut fuer das schwache Geraet: zwischen zwei Sendungen einen
+        // Mindestabstand lassen (laeuft ohnehin seriell unter callMutex).
+        val since = SystemClock.elapsedRealtime() - lastSendAtMs
+        if (since in 0 until MIN_CALL_GAP_MS) delay(MIN_CALL_GAP_MS - since)
+        lastSendAtMs = SystemClock.elapsedRealtime()
         val ws = currentWs ?: throw ShellyRpcException(-1, "Nicht verbunden")
         val id = nextId.getAndIncrement()
         val deferred = CompletableDeferred<JSONObject>()

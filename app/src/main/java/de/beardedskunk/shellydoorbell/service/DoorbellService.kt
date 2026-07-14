@@ -8,10 +8,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.Uri
+import android.net.wifi.WifiInfo
+import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -53,6 +56,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.Inet4Address
 
 /**
  * Ergebnis der aktiven Verbindungsprüfung (siehe [DoorbellService.checkConnection]):
@@ -79,6 +83,7 @@ class DoorbellService : Service() {
     private lateinit var dao: RingDao
     private lateinit var alarm: AlarmController
     private lateinit var client: ShellyClient
+    private lateinit var wifiGate: WifiGate
 
     private val ip = MutableStateFlow("")
     private val password = MutableStateFlow("")
@@ -118,10 +123,6 @@ class DoorbellService : Service() {
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val messages: SharedFlow<String> = _messages
 
-    /** Feuert, wenn ein Kommando am fehlenden/falschen Shelly-Passwort scheitert. */
-    private val _authError = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
-    val authError: SharedFlow<Unit> = _authError
-
     val connectionState: StateFlow<ConnectionState> get() = client.state
     val alarmActive: StateFlow<Boolean> get() = alarm.active
 
@@ -150,7 +151,10 @@ class DoorbellService : Service() {
         prefs = Prefs(this)
         dao = AppDb.get(this).ringDao()
         alarm = AlarmController(this, scope)
-        client = ShellyClient(scope, ip, wifi, password)
+        wifiGate = WifiGate(prefs, scope)
+        runBlocking { wifiGate.load() }
+        // Netzwerk-Tor: entscheidet vor jedem Verbindungsversuch (Subnetz / SSID-Listen).
+        client = ShellyClient(scope, ip, wifi, password) { ipStr, forced -> wifiGate.decide(ipStr, forced) }
 
         // Ohne lokalen Alarm laeuft der Dienst nur fuer die sichtbare UI mit —
         // dann ohne Dauer-Notification (und er beendet sich, wenn die UI zugeht).
@@ -187,12 +191,19 @@ class DoorbellService : Service() {
                     is ConnectionState.Connected -> "verbunden (${it.deviceName})"
                     ConnectionState.Connecting -> "verbinde"
                     ConnectionState.NoWifi -> "kein WLAN"
+                    is ConnectionState.OtherNetwork -> "anderes Netz (${it.detail})"
                 }
                 Log.d(TAG, "Verbindungszustand: $label")
                 updateServiceNotification(it)
             }
         }
-        scope.launch { client.connectedEvents.collect { onConnected() } }
+        scope.launch {
+            client.connectedEvents.collect {
+                // Erreichbar in diesem WLAN -> SSID whitelisten, dann Daten laden.
+                wifiGate.onConnected()
+                onConnected()
+            }
+        }
         scope.launch { client.notifications.collect { handleNotification(it) } }
         scope.launch {
             // Verbindungsverlust setzt das Heartbeat-Fenster zurueck, damit ein
@@ -259,6 +270,16 @@ class DoorbellService : Service() {
                 }
             }
         }
+        scope.launch {
+            // Auth hat sich nach einem Fehlschlag automatisch zurueckgesetzt
+            // (statt Passwort-Popup) -> Daten erneut laden.
+            client.needsReload.collect {
+                if (!listenOnly.value && client.state.value is ConnectionState.Connected) {
+                    Log.i(TAG, "Auth-Auto-Reset – Einstellungen erneut laden")
+                    runCatching { onConnected() }
+                }
+            }
+        }
         scope.launch { alarm.active.collect { if (!it) cancelRingNotification() } }
         scope.launch {
             // lokale History auf ~1 Jahr begrenzen
@@ -306,9 +327,26 @@ class DoorbellService : Service() {
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .build()
         val callback = object : ConnectivityManager.NetworkCallback() {
+            // Letzter bekannter Stand des aktuellen WLANs -> ans WifiGate.
+            private var ssid: String? = null
+            private var ipv4: ByteArray? = null
+            private var prefix = 0
+
             override fun onAvailable(network: Network) {
                 wifi.value = network
                 client.reconnectNow()
+            }
+
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                ssid = readSsid(caps)
+                wifiGate.onNetwork(ssid, ipv4, prefix)
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                val la = lp.linkAddresses.firstOrNull { it.address is Inet4Address }
+                ipv4 = (la?.address as? Inet4Address)?.address
+                prefix = la?.prefixLength ?: 0
+                wifiGate.onNetwork(ssid, ipv4, prefix)
             }
 
             override fun onLost(network: Network) {
@@ -319,6 +357,15 @@ class DoorbellService : Service() {
         // requestNetwork (statt registerNetworkCallback) haelt das WLAN aktiv,
         // auch wenn das System sonst auf Mobilfunk wechseln wuerde.
         cm.requestNetwork(request, callback)
+    }
+
+    /** SSID aus den Netzwerk-Capabilities; null ohne Berechtigung/Info. Der Name
+     *  kommt in Anfuehrungszeichen bzw. als "<unknown ssid>". */
+    private fun readSsid(caps: NetworkCapabilities): String? {
+        val info = caps.transportInfo as? WifiInfo ?: return null
+        val raw = info.ssid ?: return null
+        if (raw == WifiManager.UNKNOWN_SSID) return null
+        return raw.trim('"').takeIf { it.isNotBlank() }
     }
 
     // ---------- Verbindungsaufbau / Settings-Abgleich ----------
@@ -355,12 +402,18 @@ class DoorbellService : Service() {
                             "in den Einstellungen den Lauschmodus aktivieren."
                     )
                 } else {
-                    _authError.tryEmit(Unit)
+                    // Kein Popup mehr: ein Auth-Fehler beim Verbinden ist meist transient
+                    // (Busy-/429-Phase). ShellyClient setzt die Auth automatisch zurueck
+                    // und meldet sich per needsReload wieder – dann laden wir erneut.
+                    Log.w(TAG, "Auth beim Verbinden gescheitert – automatischer Neuversuch folgt")
                 }
                 return
             }
-            // Verbindung weg: still bleiben, der Reconnect versucht es eh erneut
-            if (e is ShellyRpcException && e.isTransport) return
+            // Verbindung weg ODER 429-Sperre: still abbrechen. Bei 429 wuerde ein
+            // weiteres refreshSettings nur fast-failen (zweite Fehler-Snackbar);
+            // der Cooldown-Watcher ruft onConnected nach Ablauf ohnehin erneut auf
+            // – so bleibt jeder Erholungs-Versuch effektiv EINE Probe.
+            if (e is ShellyRpcException && (e.isTransport || e.code == 429)) return
             _messages.tryEmit("doorbell-Script konnte nicht eingerichtet werden: ${e.message}")
         }
         runCatching { refreshSettings() }
@@ -373,7 +426,8 @@ class DoorbellService : Service() {
      */
     private fun emitFailure(e: Throwable, fallback: String) {
         if (e is ShellyRpcException && e.isAuth) {
-            _authError.tryEmit(Unit)
+            // Kein Popup: dezenter Hinweis, der auf die Einstellungen verweist.
+            _messages.tryEmit("$fallback: Passwort stimmt nicht? In den Einstellungen prüfen.")
         } else {
             _messages.tryEmit("$fallback: ${e.message}")
         }
@@ -696,7 +750,9 @@ class DoorbellService : Service() {
         if (!visible && !localAlarmEnabled) stopSelf()
     }
 
-    fun reconnect() = client.reconnectNow()
+    // Manueller „Neu verbinden"-Knopf: soll auch aus einem pausierten Zustand
+    // (Fremdnetz/Greylist) heraus einen echten Versuch erzwingen.
+    fun reconnect() = client.forceAttempt()
 
     /**
      * Übernimmt IP/Passwort sofort in die laufende Verbindung, ohne auf den
@@ -730,7 +786,7 @@ class DoorbellService : Service() {
      * doorbell-Script läuft. Fehlt oder hakt das Script, repariert [ensureScript]
      * es dabei gleich selbst.
      */
-    suspend fun checkConnection(): ConnCheck {
+    suspend fun checkConnection(force: Boolean = false): ConnCheck {
         if (listenOnly.value) return checkListenOnly()
         // Steckt der Shelly in seiner 429-Sperre, NICHT erneut anfragen – jede
         // weitere Anfrage verlaengert die Sperre nur. Die App wiederholt selbst.
@@ -743,6 +799,36 @@ class DoorbellService : Service() {
                 detail = "Shelly hat wegen zu vieler Anfragen kurz dichtgemacht. " +
                     "Die App verbindet sich in ~${s}s von selbst wieder – bitte jetzt nicht erneut prüfen.",
             )
+        }
+        // Laeuft schon alles (verbunden, Script funkt, Einstellungen geladen) und
+        // wurden keine neuen Zugangsdaten eingegeben? Dann NICHTS senden – nur
+        // den bekannten, passiv gepflegten Zustand melden. Der schwache Shelly
+        // wird sonst bei jedem Druck mit einem Anfragen-Schwall belastet.
+        if (!force &&
+            client.state.value is ConnectionState.Connected &&
+            _scriptOk.value == true &&
+            _shared.value != null
+        ) {
+            val v = _scriptVersion.value ?: bundledVersion
+            return ConnCheck(
+                ok = true,
+                detail = "Verbunden, doorbell-Script v$v läuft, Einstellungen geladen – alles ok.",
+            )
+        }
+        // Nicht verbunden? Verbindungsaufbau anstoßen und kurz darauf warten,
+        // statt sofort mit einem Transportfehler zu scheitern. forceAttempt
+        // überspringt dabei das Netzwerk-Tor (der Nutzer will jetzt prüfen).
+        if (client.state.value !is ConnectionState.Connected) {
+            client.forceAttempt()
+            val deadline = SystemClock.elapsedRealtime() + CONNECT_WAIT_MS
+            while (client.state.value !is ConnectionState.Connected &&
+                SystemClock.elapsedRealtime() < deadline
+            ) {
+                delay(300)
+            }
+            if (client.state.value !is ConnectionState.Connected) {
+                return ConnCheck(ok = false, detail = "Nicht verbunden – WLAN und IP prüfen.")
+            }
         }
         client.retryAuth()
         val api = runCatching { client.call("Switch.GetStatus", JSONObject().put("id", 0)) }
@@ -1050,6 +1136,7 @@ class DoorbellService : Service() {
         is ConnectionState.Connected -> getString(R.string.notif_listening)
         ConnectionState.Connecting -> getString(R.string.notif_connecting)
         ConnectionState.NoWifi -> getString(R.string.notif_no_wifi)
+        is ConnectionState.OtherNetwork -> state.detail
     }
 
     private fun updateServiceNotification(state: ConnectionState) {
@@ -1089,6 +1176,9 @@ class DoorbellService : Service() {
 
         /** So lange wartet die Lauschmodus-Pruefung auf das erste Lebenszeichen. */
         private const val HEARTBEAT_WAIT_MS = 35_000L
+
+        /** So lange wartet „Verbindung pruefen" bei getrennter Verbindung auf den Connect. */
+        private const val CONNECT_WAIT_MS = 10_000L
 
         const val DEFAULT_THRESHOLD_W = 2.0
         const val DEFAULT_DEBOUNCE_S = 30

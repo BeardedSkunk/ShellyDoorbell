@@ -4,9 +4,12 @@ import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import org.json.JSONObject
 
 /** Lokale, geraetebezogene Einstellungen (nicht mit anderen Nutzern geteilt). */
 data class LocalSettings(
@@ -35,6 +38,13 @@ class Prefs(private val context: Context) {
         val AUTOSTART = booleanPreferencesKey("autostart")
         val ALARM_ENABLED = booleanPreferencesKey("alarm_enabled")
         val LISTEN_ONLY = booleanPreferencesKey("listen_only")
+
+        // Interne, in der UI unsichtbare WLAN-Listen (siehe WifiGate):
+        // Whitelist = SSIDs, in denen der Shelly nachweislich erreichbar war.
+        val WIFI_WHITELIST = stringSetPreferencesKey("wifi_whitelist")
+        // Greylist = SSIDs, in denen der Shelly bisher NICHT gefunden wurde,
+        // als JSON { "ssid": letzterVersuchEpochMs, ... }.
+        val WIFI_GREYLIST = stringPreferencesKey("wifi_greylist")
     }
 
     val settings: Flow<LocalSettings> = context.dataStore.data.map { p ->
@@ -72,6 +82,29 @@ class Prefs(private val context: Context) {
 
     suspend fun setListenOnly(enabled: Boolean) {
         context.dataStore.edit { it[Keys.LISTEN_ONLY] = enabled }
+    }
+
+    // ---------- interne WLAN-Listen (WifiGate) ----------
+
+    suspend fun getWhitelist(): Set<String> =
+        context.dataStore.data.first()[Keys.WIFI_WHITELIST] ?: emptySet()
+
+    suspend fun setWhitelist(ssids: Set<String>) {
+        context.dataStore.edit { it[Keys.WIFI_WHITELIST] = ssids }
+    }
+
+    suspend fun getGreylist(): Map<String, Long> {
+        val raw = context.dataStore.data.first()[Keys.WIFI_GREYLIST] ?: return emptyMap()
+        val json = runCatching { JSONObject(raw) }.getOrNull() ?: return emptyMap()
+        val out = mutableMapOf<String, Long>()
+        for (key in json.keys()) out[key] = json.optLong(key, 0L)
+        return out
+    }
+
+    suspend fun setGreylist(entries: Map<String, Long>) {
+        val json = JSONObject()
+        for ((k, v) in entries) json.put(k, v)
+        context.dataStore.edit { it[Keys.WIFI_GREYLIST] = json.toString() }
     }
 
     companion object {
