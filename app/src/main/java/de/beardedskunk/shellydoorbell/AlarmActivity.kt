@@ -64,8 +64,12 @@ class AlarmActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setShowWhenLocked(true)
         setTurnScreenOn(true)
+        val hasDoor = DoorIntents.doorIntent(this) != null
         setContent {
-            AlarmScreen(onStop = { stopAlarmAndFinish() })
+            AlarmScreen(
+                onStop = { stopAlarmAndFinish() },
+                onDoor = if (hasDoor) ({ openDoorAndFinish() }) else null,
+            )
         }
     }
 
@@ -88,10 +92,16 @@ class AlarmActivity : ComponentActivity() {
             )
         finish()
     }
+
+    /** "Tuer ansehen": Alarm stoppen und die Tuersprecher-App oeffnen. */
+    private fun openDoorAndFinish() {
+        DoorIntents.doorIntent(this)?.let { runCatching { startActivity(it) } }
+        stopAlarmAndFinish()
+    }
 }
 
 @Composable
-private fun AlarmScreen(onStop: () -> Unit) {
+private fun AlarmScreen(onStop: () -> Unit, onDoor: (() -> Unit)? = null) {
     MaterialTheme {
         Column(
             modifier = Modifier
@@ -121,14 +131,31 @@ private fun AlarmScreen(onStop: () -> Unit) {
                 color = Color.White,
             )
             Spacer(Modifier.height(48.dp))
+            if (onDoor != null) {
+                // Tuersprecher-App installiert: ein Tap zeigt die Tuerkamera
+                // (und stoppt den Alarm gleich mit)
+                Button(
+                    onClick = onDoor,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(72.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.White,
+                        contentColor = Color(0xFFB71C1C),
+                    ),
+                ) {
+                    Text("🚪 TÜR ANSEHEN", style = MaterialTheme.typography.titleLarge)
+                }
+                Spacer(Modifier.height(16.dp))
+            }
             Button(
                 onClick = onStop,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(72.dp),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = Color.White,
-                    contentColor = Color(0xFFB71C1C),
+                    containerColor = if (onDoor != null) Color(0x33FFFFFF) else Color.White,
+                    contentColor = if (onDoor != null) Color.White else Color(0xFFB71C1C),
                 ),
             ) {
                 Text("ALARM STOPPEN", style = MaterialTheme.typography.titleLarge)

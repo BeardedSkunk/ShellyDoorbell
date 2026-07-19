@@ -23,6 +23,14 @@
         android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation" />
 
+    <!-- Sichtbarkeit der Türsprecher-App (Android 11+): nur so lässt sich
+         erkennen, ob deren "Tür öffnen"-Einsprung installiert ist. -->
+    <queries>
+        <intent>
+            <action android:name="de.videoapp.action.OPEN_DOOR" />
+        </intent>
+    </queries>
+
     <application
         android:name=".App"
         android:label="@string/app_name"
@@ -50,6 +58,14 @@
             android:turnScreenOn="true"
             android:excludeFromRecents="true"
             android:launchMode="singleInstance" />
+
+        <!-- Trampolin fuer die Notification-Action "Tuer ansehen": Alarm stoppen,
+             dann Tuersprecher-App oeffnen -->
+        <activity
+            android:name=".OpenDoorActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.NoDisplay" />
 
         <service
             android:name=".service.DoorbellService"

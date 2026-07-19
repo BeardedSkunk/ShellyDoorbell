@@ -24,7 +24,9 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import de.beardedskunk.shellydoorbell.AlarmActivity
 import de.beardedskunk.shellydoorbell.Channels
+import de.beardedskunk.shellydoorbell.DoorIntents
 import de.beardedskunk.shellydoorbell.MainActivity
+import de.beardedskunk.shellydoorbell.OpenDoorActivity
 import de.beardedskunk.shellydoorbell.R
 import de.beardedskunk.shellydoorbell.data.AppDb
 import de.beardedskunk.shellydoorbell.data.Prefs
@@ -737,7 +739,7 @@ class DoorbellService : Service() {
             Intent(this, DoorbellService::class.java).setAction(ACTION_STOP_ALARM),
             PendingIntent.FLAG_IMMUTABLE
         )
-        val notification = NotificationCompat.Builder(this, Channels.alarmChannelId(this))
+        val builder = NotificationCompat.Builder(this, Channels.alarmChannelId(this))
             .setSmallIcon(R.drawable.ic_stat_bell)
             .setContentTitle(getString(R.string.notif_ring_title))
             .setContentText(getString(R.string.notif_ring_text))
@@ -746,8 +748,17 @@ class DoorbellService : Service() {
             .setFullScreenIntent(fullScreenPi, true)
             .setOngoing(true)
             .addAction(0, getString(R.string.notif_ring_stop), stopPi)
-            .build()
-        runCatching { getSystemService(NotificationManager::class.java).notify(NOTIF_ID_RING, notification) }
+        // Ist die Tuersprecher-App installiert: direkt zur Tuerkamera springen
+        // (stoppt den Alarm gleich mit). Ohne die App fehlt der Button einfach.
+        if (DoorIntents.doorIntent(this) != null) {
+            val doorPi = PendingIntent.getActivity(
+                this, 3,
+                Intent(this, OpenDoorActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                PendingIntent.FLAG_IMMUTABLE
+            )
+            builder.addAction(0, getString(R.string.notif_ring_door), doorPi)
+        }
+        runCatching { getSystemService(NotificationManager::class.java).notify(NOTIF_ID_RING, builder.build()) }
     }
 
     private fun cancelRingNotification() {

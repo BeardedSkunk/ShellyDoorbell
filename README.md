@@ -133,6 +133,16 @@ Beim ersten Start führt die App durch die nötigen Berechtigungen
   Nicht-stören-Modus erscheint. (Der Alarmton selbst läuft ohnehin über den
   Wecker-Kanal, den „Nicht stören“ standardmäßig durchlässt.)
 
+## Türsprecher-Anbindung (optional)
+
+Ist die Türsprecher-App (`de.videoapp`) installiert, zeigen Klingel-Notification
+und Vollbild-Alarm zusätzlich **„🚪 Tür ansehen“**: stoppt den Alarm und öffnet
+direkt die dort als Türkamera hinterlegte Station/Szene (in der
+Türsprecher-Übersicht per langem Druck festlegen), auch über dem
+Sperrbildschirm. Technisch: Intent-Action `de.videoapp.action.OPEN_DOOR` plus
+`<queries>`-Eintrag; ohne die App fehlt der Button einfach, sonst ändert sich
+nichts.
+
 ## Gemeinsame Einstellungen (KVS-Schema)
 
 | Key                     | Bedeutung                                          |

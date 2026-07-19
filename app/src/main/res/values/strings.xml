@@ -12,4 +12,5 @@
     <string name="notif_ring_title">Es klingelt!</string>
     <string name="notif_ring_text">Jemand ist an der Tür.</string>
     <string name="notif_ring_stop">Stopp</string>
+    <string name="notif_ring_door">🚪 Tür ansehen</string>
 </resources>
