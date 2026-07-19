@@ -190,9 +190,29 @@ Anmeldung (bis „refreshSettings ok") in **~2,0 / 2,0 / 2,5 s**, **kein 429**,
 **keine Auth-Sperre** – vorher ~33 s je Zyklus. Ein Zyklus brauchte 3 frische
 Challenges und wäre mit `MAX_AUTH_SENDS = 3` in die 30-s-Sperre gelaufen.
 
-Offene Idee (falls es je wieder klemmt): für die **unmittelbare** Auth-Antwort auf
-einen 401 das `MIN_CALL_GAP` überspringen, damit die Antwort ankommt, bevor die
-Nonce rotiert – dann würde meist **eine** Challenge genügen (weniger Churn).
+**Zweiter Optimierungs-Schritt (gleicher Tag):** Der Anmelde-Schwanz besteht aus
+~6 seriellen RPCs (Script.List, Script.GetCode, KVS, Schedule.List, Switch.GetStatus),
+je mit `MIN_CALL_GAP`. Den globalen Abstand zu verkleinern brachte **Rückschritt**:
+der Auth-Handshake (der gelegentlich 2–4 frische Challenges braucht) wurde damit
+*unzuverlässiger* – enger getaktet „griff" keine Challenge mehr → Auth-Sperre. Also
+**zweigeteilter Abstand** (`authEstablished`-Flag):
+
+- Solange die Nonce **noch nicht bestätigt** ist (Handshake): `MIN_CALL_GAP = 250 ms`
+  – konservativ, damit jede Challenge Zeit hat zu greifen.
+- Sobald **ein** authentifizierter Call durchkam: `POST_AUTH_GAP = 120 ms` für alle
+  weiteren Calls mit derselben Nonce (nc++). Das ist laut Szenario A (30 Calls,
+  gleiche Nonce, ~34 ms Abstand → 0×429) völlig unkritisch. Bei neuer Nonce/Reconnect
+  fällt das Flag zurück.
+
+Am Gerät geladen (bis „refreshSettings ok") in **~1,4–1,8 s** statt ~2,0–2,5 s, ohne
+den Handshake zu riskieren.
+
+**Grenze (Hardware):** Weil die Nonce an die WS-Verbindung gebunden ist, erzwingt
+**jeder** Neustart eine frische Challenge. **Sehr** schnelle Neustarts in Folge
+(im Test ~9–24 s Abstand, dutzendfach) sättigen den 32er-Puffer → wieder 429,
+egal wie die Abstände getunt sind. Ein frisches (rebootetes) Gerät schafft normale
+Aus/Ein-Zyklen problemlos in ~1,5–2 s; nur Dauerbeschuss (Test) kippt es. Reale
+Bedienung (paar Neustarts, nicht dutzende pro Minute) bleibt im schnellen Bereich.
 
 ## Quellen
 

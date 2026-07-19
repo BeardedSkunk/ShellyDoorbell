@@ -1213,8 +1213,7 @@ class DoorbellService : Service() {
         private const val POLL_INTERVAL_MS = 5_000L
 
         /** Verschnaufpause nach dem Verbinden, bevor der erste authentifizierte
-         *  Call rausgeht – gibt dem schwachen Shelly nach dem Socket-Aufbau Luft.
-         *  Kurz gehalten: dank persistierter Nonce entfaellt der Auth-Roundtrip. */
+         *  Call rausgeht – gibt dem schwachen Shelly nach dem Socket-Aufbau Luft. */
         private const val CONNECT_SETTLE_MS = 300L
 
         /** Aeltere Timestamps gelten als "keine echte Uhrzeit" (Shelly ohne NTP). */

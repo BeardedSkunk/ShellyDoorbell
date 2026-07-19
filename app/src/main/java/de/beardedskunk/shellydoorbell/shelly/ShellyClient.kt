@@ -58,10 +58,19 @@ private const val RATE_LIMIT_MAX_MS = 120_000L
 private const val AUTH_RETRY_BASE_MS = 30_000L
 private const val AUTH_RETRY_MAX_MS = 300_000L
 
-/** Mindestabstand zwischen zwei RPC-Sendungen. Zusammen mit der Serialisierung
- *  (callMutex) sieht der schwache Shelly nie einen Anfragen-Schwall, der seinen
- *  Ratenschutz (429) ausloest. */
+/** Mindestabstand zwischen zwei RPC-Sendungen, solange die Nonce NOCH NICHT
+ *  bestaetigt ist (Auth-Handshake). Der schwache Shelly gibt beim Aushandeln
+ *  gelegentlich mehrere frische Challenges hintereinander aus; ein grosszuegiger
+ *  Abstand gibt jeder Challenge Zeit zu "greifen" (kleiner gemacht -> es scheiterten
+ *  mehr Handshakes, am Geraet gemessen). Deshalb hier bewusst konservativ. */
 private const val MIN_CALL_GAP_MS = 250L
+
+/** Mindestabstand, sobald die Nonce EINMAL erfolgreich authentifiziert hat: dann
+ *  werden alle weiteren Calls mit derselben Nonce (nc++) verschickt – das ist laut
+ *  Geraet praktisch unbegrenzt (kein neuer Puffer-Slot, kein 429). Der Startup-Schwanz
+ *  (Script.GetCode, KVS, Schedule.List, Switch.GetStatus) darf so deutlich enger
+ *  laufen und die Anmeldung wird spuerbar schneller, ohne den Handshake zu riskieren. */
+private const val POST_AUTH_GAP_MS = 120L
 
 /** Erster Reconnect-Abstand; verdoppelt sich bis zum Deckel der Tor-Entscheidung. */
 private const val INITIAL_BACKOFF_MS = 5_000L
@@ -123,6 +132,11 @@ class ShellyClient(
     /** Nonce-Zaehler: pro authentifiziertem Request hochgezaehlt (siehe [ShellyAuth]). */
     private val ncCounter = AtomicInteger(0)
 
+    /** true = die aktuelle Nonce hat mindestens einmal erfolgreich authentifiziert.
+     *  Dann darf der engere [POST_AUTH_GAP_MS] gelten. Faellt bei neuer Nonce/Reset. */
+    @Volatile
+    private var authEstablished = false
+
     /** Serialisiert das Lernen der Challenge, damit parallele erste Calls (z. B.
      *  onConnected + Live-Polling) nicht den nc-Zaehler gegeneinander verwuerfeln. */
     private val authMutex = Mutex()
@@ -168,6 +182,7 @@ class ShellyClient(
         cachedChallenge = null
         ncCounter.set(0)
         authFailed = false
+        authEstablished = false
     }
 
     /** Von aussen aufrufen, wenn IP/Passwort gewechselt wurden (sofortiger Reset). */
@@ -368,11 +383,14 @@ class ShellyClient(
         // anzufordern belegt einen Slot, und unter Reconnect-Churn fuellen verwaiste
         // "pending" Challenges den Puffer -> anhaltende 429-Sperre (siehe
         // docs/shelly-429-nonce-puffer.md). Deshalb behalten wir die gecachte Nonce
-        // ueber Reconnects hinweg und schicken den ersten Call der neuen Session
-        // praeemptiv authentifiziert (nc++). Erst wenn die Nonce wirklich abgelaufen
-        // ist, antwortet der Shelly mit 401 – dann (und nur dann) holt doCall genau
-        // eine frische Challenge. Ein Passwortwechsel setzt die Auth separat ueber
-        // credentialsChanged() zurueck.
+        // ueber Reconnects hinweg. (Diese FW bindet die Nonce zwar an die WS-Verbindung
+        // und weist sie nach dem Reconnect mit 401 ab -> doCall holt dann genau eine
+        // frische Challenge; das Behalten schadet aber nicht und spart im Zweifel einen
+        // Roundtrip. Ein Passwortwechsel setzt die Auth separat ueber
+        // credentialsChanged() zurueck.)
+        // Frische Verbindung -> die alte Nonce gilt hier als unbestaetigt, also erst
+        // wieder der vorsichtige Handshake-Abstand, bis ein Call durchkommt.
+        authEstablished = false
         val opened = CompletableDeferred<Boolean>()
         val closed = CompletableDeferred<Unit>()
         val ws = http.newWebSocket(
@@ -475,6 +493,9 @@ class ShellyClient(
             try {
                 val result = sendFrame(method, params, timeoutMs, requiresAuth)
                 onCallSucceeded()
+                // Ein authentifizierter Call ist durchgekommen -> die Nonce "greift".
+                // Ab jetzt duerfen weitere Calls mit dem engeren Abstand laufen.
+                if (requiresAuth && passwordFlow.value.isNotBlank()) authEstablished = true
                 return result
             } catch (e: ShellyRpcException) {
                 // 429: der Shelly hat dichtgemacht -> Sperre setzen und aufhoeren.
@@ -512,6 +533,9 @@ class ShellyClient(
         if (cachedChallenge?.nonce != challenge.nonce) {
             cachedChallenge = challenge
             ncCounter.set(expected)
+            // Frische, noch nicht bestaetigte Nonce -> wieder der vorsichtige Abstand,
+            // bis ein Call damit durchkommt.
+            authEstablished = false
             Log.d(TAG, "Neue Nonce uebernommen (nc weiter ab ${expected + 1})")
         } else if (ncCounter.get() < expected) {
             ncCounter.set(expected)
@@ -526,9 +550,11 @@ class ShellyClient(
         requiresAuth: Boolean,
     ): JSONObject {
         // Sanftmut fuer das schwache Geraet: zwischen zwei Sendungen einen
-        // Mindestabstand lassen (laeuft ohnehin seriell unter callMutex).
+        // Mindestabstand lassen (laeuft ohnehin seriell unter callMutex). Waehrend
+        // des Auth-Handshakes grosszuegig, danach (bewaehrte Nonce) enger.
+        val gap = if (authEstablished) POST_AUTH_GAP_MS else MIN_CALL_GAP_MS
         val since = SystemClock.elapsedRealtime() - lastSendAtMs
-        if (since in 0 until MIN_CALL_GAP_MS) delay(MIN_CALL_GAP_MS - since)
+        if (since in 0 until gap) delay(gap - since)
         lastSendAtMs = SystemClock.elapsedRealtime()
         val ws = currentWs ?: throw ShellyRpcException(-1, "Nicht verbunden")
         val id = nextId.getAndIncrement()
