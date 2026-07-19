@@ -122,6 +122,16 @@ class DoorbellService : Service() {
     /** true = Lausch-Betrieb (kein Passwort, keine schreibenden Aufrufe). */
     private val listenOnly = MutableStateFlow(false)
 
+    /**
+     * true, sobald [onConnected] fuer die aktuelle Verbindung einmal komplett
+     * durchgelaufen ist (Auth etabliert, Einstellungen geladen). Erst dann darf
+     * der Live-Watt-Poll seine eigenen Switch.GetStatus feuern – sonst rennt er
+     * beim Connect gegen onConnected und beide schicken parallel die erste
+     * authentifizierte Anfrage an den schwachen Shelly (429-Ursache). Faellt bei
+     * Verbindungsverlust zurueck auf false.
+     */
+    private val initialLoadDone = MutableStateFlow(false)
+
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val messages: SharedFlow<String> = _messages
 
@@ -209,8 +219,15 @@ class DoorbellService : Service() {
         scope.launch { client.notifications.collect { handleNotification(it) } }
         scope.launch {
             // Verbindungsverlust setzt das Heartbeat-Fenster zurueck, damit ein
-            // frischer Connect erst wieder auf ein Lebenszeichen wartet.
-            client.state.collect { st -> if (st !is ConnectionState.Connected) lastHeartbeatMs = 0L }
+            // frischer Connect erst wieder auf ein Lebenszeichen wartet. Ausserdem
+            // das Initial-Load-Flag, damit der Poll nach einem Reconnect erst
+            // wieder nach onConnected loslaeuft.
+            client.state.collect { st ->
+                if (st !is ConnectionState.Connected) {
+                    lastHeartbeatMs = 0L
+                    initialLoadDone.value = false
+                }
+            }
         }
         scope.launch {
             // Bleibt das 30-s-Lebenszeichen des Scripts aus, obwohl die Verbindung
@@ -232,8 +249,10 @@ class DoorbellService : Service() {
             // Watt/Schalterzustand kommen dort ohnehin per NotifyStatus). Live-
             // Aenderungen (Klingeln, Schalten) pusht der Shelly per NotifyStatus,
             // deshalb reicht ein gemaechlicher Poll fuer die reine Anzeige.
-            combine(uiVisible, client.state, listenOnly) { visible, st, listen ->
-                visible && !listen && st is ConnectionState.Connected
+            combine(uiVisible, client.state, listenOnly, initialLoadDone) { visible, st, listen, loaded ->
+                // loaded: erst pollen, wenn onConnected durch ist (Auth steht,
+                // Nonce gecacht) – sonst Erst-Auth-Rennen mit onConnected.
+                visible && !listen && loaded && st is ConnectionState.Connected
             }
                 .distinctUntilChanged()
                 .collectLatest { pollingActive ->
@@ -399,6 +418,12 @@ class DoorbellService : Service() {
             Log.w(TAG, "onConnected uebersprungen: 429-Sperre noch ${cooldown / 1000}s")
             return
         }
+        // Kurz durchatmen lassen: der Hello (Shelly.GetDeviceInfo) lief eben erst.
+        // Ein kleiner Moment Abstand vor dem ersten authentifizierten Call gibt dem
+        // schwachen Geraet nach dem Socket-Aufbau Luft. Seit die Nonce ueber
+        // Neustarts hinweg wiederverwendet wird (kein 401-Roundtrip mehr), genuegt
+        // eine kurze Pause – die frueheren 1000 ms waren gegen den Auth-Handshake.
+        delay(CONNECT_SETTLE_MS)
         Log.d(TAG, "onConnected: Script pruefen + Einstellungen laden")
         // Erster authentifizierter Zugriff. Scheitert er am Passwort, NICHT mit
         // refreshSettings weitermachen – das wären nur weitere 401 in Folge.
@@ -432,6 +457,9 @@ class DoorbellService : Service() {
         }
         runCatching { refreshSettings() }
             .onFailure { emitFailure(it, "Einstellungen konnten nicht geladen werden") }
+        // Auth steht und die Nonce ist gecacht -> der Live-Watt-Poll darf jetzt
+        // ohne Erst-Auth-Rennen seine eigenen Switch.GetStatus schicken.
+        initialLoadDone.value = true
     }
 
     /**
@@ -1183,6 +1211,11 @@ class DoorbellService : Service() {
         /** Poll-Abstand fuer die reine Watt-Anzeige (Live-Aenderungen pusht der
          *  Shelly ohnehin per NotifyStatus – gemaechlich genuegt, spart Anfragen). */
         private const val POLL_INTERVAL_MS = 5_000L
+
+        /** Verschnaufpause nach dem Verbinden, bevor der erste authentifizierte
+         *  Call rausgeht – gibt dem schwachen Shelly nach dem Socket-Aufbau Luft.
+         *  Kurz gehalten: dank persistierter Nonce entfaellt der Auth-Roundtrip. */
+        private const val CONNECT_SETTLE_MS = 300L
 
         /** Aeltere Timestamps gelten als "keine echte Uhrzeit" (Shelly ohne NTP). */
         private const val MIN_VALID_TS = 1_000_000_000L

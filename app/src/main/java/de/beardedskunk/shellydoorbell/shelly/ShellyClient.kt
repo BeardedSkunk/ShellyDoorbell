@@ -35,8 +35,13 @@ import kotlin.random.Random
 
 private const val TAG = "ShellyClient"
 
-/** Max. Sendungen pro Call: 1 regulaer + 2 Auth-Wiederholungen mit frischer Challenge. */
-private const val MAX_AUTH_SENDS = 3
+/** Max. Sendungen pro Call: 1 Probe + bis zu 3 Auth-Wiederholungen mit je frischer
+ *  Challenge. Dieser Shelly bindet Nonces an die WS-Verbindung (nach einem Reconnect
+ *  ist die alte Nonce ungueltig) und gibt beim Auth-Handshake gelegentlich zwei
+ *  frische Challenges hintereinander aus, bevor eine "greift". Drei Wiederholungen
+ *  geben dem Handshake genug Luft, damit ein transienter 401 nicht faelschlich als
+ *  falsches Passwort gilt und die 30-s-Auth-Sperre ausloest. */
+private const val MAX_AUTH_SENDS = 4
 
 /**
  * Grund-Cooldown nach einem 429 ("too many requests"): so lange sendet der Client
@@ -141,8 +146,9 @@ class ShellyClient(
      * true = das aktuelle Passwort wurde vom Geraet bereits als falsch/fehlend
      * abgewiesen. Dann NICHT weiter authentifiziert senden – sonst haemmern wir
      * den Shelly mit 401-Roundtrips, was er mit "429 too many requests" quittiert
-     * und wofuer er Verbindungs-Slots verbraucht. Wird erst bei einem
-     * Passwortwechsel ([resetAuth]) wieder freigegeben.
+     * und wofuer er Nonce-Slots verbraucht. Wieder freigegeben durch den
+     * (rueckgesetzten) Auth-Wiederanlauf [scheduleAuthRetry] oder einen
+     * Passwortwechsel ([resetAuth]).
      */
     @Volatile
     private var authFailed = false
@@ -151,7 +157,13 @@ class ShellyClient(
     @Volatile
     private var lastAuthMessage: String = "Authentifizierung erforderlich"
 
-    /** Auth-Zustand komplett verwerfen und einen frischen Versuch erlauben. */
+    /**
+     * Auth-Zustand KOMPLETT verwerfen: gecachte Nonce weg, nc auf 0, Sperre auf.
+     * Nur bei einem Credential-Wechsel aufrufen – NICHT bei jedem Reconnect, sonst
+     * wird pro Verbindung eine neue Nonce angefordert und der 32er-Puffer des Shelly
+     * laeuft unter Churn voll (429). Der laufende Betrieb behaelt die Nonce und
+     * zaehlt nur [ncCounter] hoch (siehe [runSession]).
+     */
     private fun resetAuth() {
         cachedChallenge = null
         ncCounter.set(0)
@@ -228,8 +240,12 @@ class ShellyClient(
             delay(delayMs)
             authRetryScheduled = false
             if (authFailed) {
-                resetAuth()
-                Log.i(TAG, "Auth-Reset nach ${delayMs / 1000}s – neuer Anlauf")
+                // Nur die Sperre loesen, die gecachte Nonce BEHALTEN – ein neuer
+                // Anlauf soll keine neue Challenge anfordern (sonst fuettern wir den
+                // 32er-Nonce-Puffer). Ist die Nonce wirklich abgelaufen, klaert das
+                // der naechste Call ueber den regulaeren 401-Pfad (eine Challenge).
+                authFailed = false
+                Log.i(TAG, "Auth-Sperre nach ${delayMs / 1000}s geloest – neuer Anlauf, Nonce behalten")
                 _needsReload.tryEmit(Unit)
             }
         }
@@ -347,12 +363,16 @@ class ShellyClient(
 
     /** Baut eine Verbindung auf und blockiert, bis sie wieder zerfaellt. */
     private suspend fun runSession(http: OkHttpClient, ip: String): Boolean {
-        // Frische Verbindung: Auth komplett neu aushandeln, auch der authFailed-
-        // Merker faellt. Pro physischem Reconnect kostet das hoechstens einen
-        // kurzen 401-Roundtrip, erkennt dafuer aber von selbst, wenn das Passwort
-        // am Shelly geaendert oder abgeschaltet wurde. Den Dauerbeschuss (Ursache
-        // fuer 429) verhindert weiterhin der Fast-Fail in call().
-        resetAuth()
+        // WICHTIG: Auth NICHT bei jedem Reconnect zuruecksetzen. Der Shelly haelt
+        // ausgegebene Nonces in einem Ringpuffer mit nur 32 Slots; eine neue Nonce
+        // anzufordern belegt einen Slot, und unter Reconnect-Churn fuellen verwaiste
+        // "pending" Challenges den Puffer -> anhaltende 429-Sperre (siehe
+        // docs/shelly-429-nonce-puffer.md). Deshalb behalten wir die gecachte Nonce
+        // ueber Reconnects hinweg und schicken den ersten Call der neuen Session
+        // praeemptiv authentifiziert (nc++). Erst wenn die Nonce wirklich abgelaufen
+        // ist, antwortet der Shelly mit 401 – dann (und nur dann) holt doCall genau
+        // eine frische Challenge. Ein Passwortwechsel setzt die Auth separat ueber
+        // credentialsChanged() zurueck.
         val opened = CompletableDeferred<Boolean>()
         val closed = CompletableDeferred<Unit>()
         val ws = http.newWebSocket(
@@ -453,7 +473,7 @@ class ShellyClient(
         var attempt = 1
         while (true) {
             try {
-                val result = sendFrame(method, params, timeoutMs)
+                val result = sendFrame(method, params, timeoutMs, requiresAuth)
                 onCallSucceeded()
                 return result
             } catch (e: ShellyRpcException) {
@@ -499,7 +519,12 @@ class ShellyClient(
         }
     }
 
-    private suspend fun sendFrame(method: String, params: JSONObject?, timeoutMs: Long): JSONObject {
+    private suspend fun sendFrame(
+        method: String,
+        params: JSONObject?,
+        timeoutMs: Long,
+        requiresAuth: Boolean,
+    ): JSONObject {
         // Sanftmut fuer das schwache Geraet: zwischen zwei Sendungen einen
         // Mindestabstand lassen (laeuft ohnehin seriell unter callMutex).
         val since = SystemClock.elapsedRealtime() - lastSendAtMs
@@ -521,7 +546,12 @@ class ShellyClient(
             // blockiert nicht, das Lock ist also billig.
             val sent = synchronized(sendLock) {
                 val challenge = cachedChallenge
-                if (challenge != null && password.isNotBlank()) {
+                // Auth NUR an Calls anhaengen, die sie brauchen. Der auth-freie
+                // Hello (Shelly.GetDeviceInfo) muss auth-frei bleiben: seit die
+                // Nonce ueber Reconnects erhalten bleibt, wuerde er sonst eine evtl.
+                // veraltete Nonce tragen und nach einem Shelly-Neustart scheitern –
+                // und die Reconnect-Schleife haenge fest.
+                if (requiresAuth && challenge != null && password.isNotBlank()) {
                     val nc = ncCounter.incrementAndGet()
                     val cnonce = Random.nextInt().toLong() and 0xFFFFFFFFL
                     frame.put("auth", ShellyAuth.authObject(challenge, nc, cnonce, password))
