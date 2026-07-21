@@ -214,6 +214,52 @@ egal wie die Abstände getunt sind. Ein frisches (rebootetes) Gerät schafft nor
 Aus/Ein-Zyklen problemlos in ~1,5–2 s; nur Dauerbeschuss (Test) kippt es. Reale
 Bedienung (paar Neustarts, nicht dutzende pro Minute) bleibt im schnellen Bereich.
 
+## Nachtrag 2 (2026-07-21): die eigentliche Ursache ist geräteseitig (Pixel 8)
+
+Nach viel Messen mit **verifiziertem Reboot** (siehe unten) und Draht-Mitschnitt auf
+einem **gerooteten** Zweit-Handy steht die Ursache fest — und es ist **nicht** die App:
+
+- **Digest byte-korrekt am Draht.** Auf dem gerooteten Armor 8 per `tcpdump`
+  mitgeschnitten und die Response aus den *exakt gesendeten* Feldern (nonce/nc/cnonce)
+  neu berechnet: **alle Frames MATCH**. `nc`/`cnonce` gehen als reine Integer raus
+  (kein Format-/Führende-Null-Problem).
+- **Pro-Gerät-Verhalten (Erst-Nutzung nc=1 einer frischen Nonce):**
+  PC (Python) ~100 %, Armor 8 ~100 %, **Pixel 8 nur ~45 %** akzeptiert. Wiederverwendung
+  (nc≥2) überall ~100 %.
+- **Timing-unabhängig.** Wartezeit vor der Auth-Antwort getestet, head-to-head auf
+  sauberem Gerät: 0 ms ≈ 43 %, 1000 ms ≈ 38 % Akzeptanz — **1 s hilft nicht**. Die
+  „zu schnell geantwortet"-Theorie ist damit widerlegt.
+- Fazit: **dieser Pixel** lehnt geräteseitig ~55 % seiner korrekten Erst-Auth ab
+  (WLAN-/Netzwerk-Stack, unterhalb der App). In der App **nicht behebbar**, nur
+  abmilderbar. Dokumentierte Pixel-8/Tensor-WLAN-Macken + TX-Checksum-Offload (das
+  verfälschte Daten mit *gültiger* Prüfsumme durchreichen kann) sind die plausible
+  Mechanik.
+
+**Methodik-Falle (wichtig für künftige Messungen):** Ein `Shelly.Reboot` per RPC
+**scheitert still, wenn das Gerät gerade gesättigt ist** (die Reboot-RPC bekommt selbst
+429). Viele „frisches Gerät"-Messungen liefen dadurch in Wahrheit auf gesättigtem
+Gerät. Immer **verifizieren** (Uptime vor/nach prüfen, 429 aussitzen und erneut
+senden).
+
+**Haus-Nebenwirkung:** Ein dauernd scheiterndes Handy (Pixel) **verschmutzt beim
+Reconnect kurz den gemeinsamen 32er-Puffer** — im Test brauchte dann sogar der
+(sonst saubere) Armor 8 mehrere Challenges. Im Ruhezustand (stabile Verbindung,
+Nonce-Wiederverwendung) passiert das nicht.
+
+**Finale App-Maßnahme (OkHttp-only):**
+- `MAX_AUTH_SENDS` = **5** (1 Probe + 4 schnelle Wiederholungen): bringt die flakige
+  Erst-Nutzung mit hoher Wahrscheinlichkeit durch (~91 %/Verbindung), 100 % am Ende.
+- Auth-Wiederholung ohne künstliche Verzögerung (Delay-Experiment wieder entfernt).
+- **Schnelle Erholung** (`AUTH_RETRY_BASE_MS` 30 s → **5 s**) statt langem Hänger.
+- Zweigeteilter Abstand (`MIN_CALL_GAP` Handshake / `POST_AUTH_GAP` danach) bleibt.
+- Ergebnis: **Pixel** meist ~2 s, selten ~7 s, **immer erfolgreich, kein 429** im
+  Normalbetrieb; **Armor 8** auch während Pixel-Störung 6/6. Die ausführlichen
+  `AUTHDBG`-Logs bleiben vorerst drin (Feld-Diagnose).
+
+Der zwischenzeitlich gebaute **Roh-Socket-Transport wurde wieder entfernt** — er
+verhielt sich identisch (Problem liegt darunter), war fürs Debugging aber nützlich
+(er half, OkHttp als Ursache auszuschließen).
+
 ## Quellen
 
 - Shelly Technical Documentation – Authentication:

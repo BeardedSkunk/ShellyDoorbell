@@ -20,7 +20,9 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
@@ -35,13 +37,15 @@ import kotlin.random.Random
 
 private const val TAG = "ShellyClient"
 
-/** Max. Sendungen pro Call: 1 Probe + bis zu 3 Auth-Wiederholungen mit je frischer
- *  Challenge. Dieser Shelly bindet Nonces an die WS-Verbindung (nach einem Reconnect
- *  ist die alte Nonce ungueltig) und gibt beim Auth-Handshake gelegentlich zwei
- *  frische Challenges hintereinander aus, bevor eine "greift". Drei Wiederholungen
- *  geben dem Handshake genug Luft, damit ein transienter 401 nicht faelschlich als
- *  falsches Passwort gilt und die 30-s-Auth-Sperre ausloest. */
-private const val MAX_AUTH_SENDS = 4
+/** Max. Sendungen pro Call: 1 Probe + bis zu 4 Auth-Wiederholungen mit je frischer
+ *  Challenge. Hintergrund (am Geraet gemessen): manche Clients (Pixel 8) bekommen die
+ *  ERST-Nutzung (nc=1) einer frisch ausgegebenen Nonce vom Shelly ~55% der Zeit
+ *  abgelehnt – byte-korrekte Antwort, voellig zeitunabhaengig, also geraeteseitig
+ *  unterhalb der App. Die Wiederverwendung (nc>=2) klappt danach zu 100%. Mehrere
+ *  schnelle Wiederholungen bringen die Erst-Nutzung darum mit hoher Wahrscheinlichkeit
+ *  durch (4 Versuche bei ~45% Trefferchance -> ~91% pro Verbindung), ohne dass ein
+ *  transienter 401 faelschlich als falsches Passwort gilt. */
+private const val MAX_AUTH_SENDS = 5
 
 /**
  * Grund-Cooldown nach einem 429 ("too many requests"): so lange sendet der Client
@@ -55,7 +59,7 @@ private const val RATE_LIMIT_MAX_MS = 120_000L
  *  (das Passwort ist meist korrekt, der 401 war transient – z. B. waehrend einer
  *  429-/Busy-Phase des Shelly). Eskaliert, damit ein WIRKLICH falsches Passwort
  *  nicht dauerfeuert. */
-private const val AUTH_RETRY_BASE_MS = 30_000L
+private const val AUTH_RETRY_BASE_MS = 5_000L
 private const val AUTH_RETRY_MAX_MS = 300_000L
 
 /** Mindestabstand zwischen zwei RPC-Sendungen, solange die Nonce NOCH NICHT
@@ -360,11 +364,20 @@ class ShellyClient(
         backoffSkip?.complete(Unit)
     }
 
-    /** Verbindung sofort sauber schliessen (z. B. beim Herunterfahren des Dienstes),
-     *  damit der Shelly den Verbindungs-Slot umgehend freigibt statt auf sein
-     *  eigenes Timeout zu warten. */
+    /** Verbindung beim Herunterfahren SOFORT abreissen (cancel), damit der Shelly
+     *  die Verbindung + die zugehoerige Nonce umgehend freigibt.
+     *
+     *  WICHTIG: NICHT das grazioese close(1000, "bye") nehmen. OkHttp wartet dabei auf
+     *  das Close-Ack des Geraets und laesst den Socket bis zu seinem Timeout offen.
+     *  Da der App-Prozess einen Dienst-Neustart ueberlebt (nur der Service wird neu
+     *  erzeugt, der Prozess/OkHttp bleibt), stapeln sich bei schnellen App-Neustarts
+     *  mehrere so haengende Verbindungen auf dem Shelly. Jede haelt ihre Nonce im
+     *  32er-Puffer -> der laeuft voll -> das Geraet verdraengt frisch ausgegebene
+     *  Nonces sofort wieder und weist selbst korrekte Auth-Antworten mit 401 ab
+     *  (am Geraet reproduziert). cancel() reisst den Socket per TCP-FIN/RST ab; der
+     *  Shelly gibt Slot + Nonce sofort frei (per Script verifiziert: unkritisch). */
     fun close() {
-        runCatching { currentWs?.close(1000, "bye") }
+        runCatching { currentWs?.cancel() }
     }
 
     private fun buildClient(net: Network): OkHttpClient = OkHttpClient.Builder()
@@ -374,47 +387,41 @@ class ShellyClient(
         })
         .connectTimeout(5, TimeUnit.SECONDS)
         .pingInterval(25, TimeUnit.SECONDS)
+        // Haertung gegen OkHttp-Verbindungswiederverwendung: der Shelly mag keine
+        // wiederverwendeten/gepoolten Kanaele. Kein Idle-Pooling, nur HTTP/1.1
+        // (WS laeuft ohnehin nur darueber), keine stillen Wiederholungen.
+        .connectionPool(ConnectionPool(0, 1, TimeUnit.SECONDS))
+        .protocols(listOf(Protocol.HTTP_1_1))
+        .retryOnConnectionFailure(false)
         .build()
 
     /** Baut eine Verbindung auf und blockiert, bis sie wieder zerfaellt. */
     private suspend fun runSession(http: OkHttpClient, ip: String): Boolean {
-        // WICHTIG: Auth NICHT bei jedem Reconnect zuruecksetzen. Der Shelly haelt
-        // ausgegebene Nonces in einem Ringpuffer mit nur 32 Slots; eine neue Nonce
-        // anzufordern belegt einen Slot, und unter Reconnect-Churn fuellen verwaiste
-        // "pending" Challenges den Puffer -> anhaltende 429-Sperre (siehe
-        // docs/shelly-429-nonce-puffer.md). Deshalb behalten wir die gecachte Nonce
-        // ueber Reconnects hinweg. (Diese FW bindet die Nonce zwar an die WS-Verbindung
-        // und weist sie nach dem Reconnect mit 401 ab -> doCall holt dann genau eine
-        // frische Challenge; das Behalten schadet aber nicht und spart im Zweifel einen
-        // Roundtrip. Ein Passwortwechsel setzt die Auth separat ueber
-        // credentialsChanged() zurueck.)
-        // Frische Verbindung -> die alte Nonce gilt hier als unbestaetigt, also erst
-        // wieder der vorsichtige Handshake-Abstand, bis ein Call durchkommt.
+        // Jede frische Verbindung startet mit SAUBEREM Auth-Zustand: keine gecachte
+        // Nonce mitschleppen. Diese FW bindet die Nonce an die WS-Verbindung und lehnt
+        // eine wiederverwendete Nonce auf einer neuen Verbindung ab (beobachtet: der
+        // Shelly RESETet dann sogar die Verbindung). Deshalb genau wie das am Geraet
+        // mit 0 Fehlern verifizierte Vorgehen: erster Call unauthentifiziert -> 401 ->
+        // frische Challenge -> antworten. Ein 401, das man sauber zu Ende
+        // authentifiziert, ist "used once" = verdraengbar und fuellt den 32er-Puffer
+        // NICHT (nur nie-abgeschlossene pending Challenges tun das). authFailed bleibt
+        // erhalten (falsches Passwort faellt weiter schnell durch [scheduleAuthRetry]).
+        cachedChallenge = null
+        ncCounter.set(0)
         authEstablished = false
         val opened = CompletableDeferred<Boolean>()
         val closed = CompletableDeferred<Unit>()
         val ws = http.newWebSocket(
             Request.Builder().url("ws://$ip/rpc").build(),
             object : WebSocketListener() {
-                override fun onOpen(webSocket: WebSocket, response: Response) {
-                    opened.complete(true)
-                }
-
-                override fun onMessage(webSocket: WebSocket, text: String) {
-                    handleMessage(text)
-                }
-
+                override fun onOpen(webSocket: WebSocket, response: Response) { opened.complete(true) }
+                override fun onMessage(webSocket: WebSocket, text: String) { handleMessage(text) }
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     opened.complete(false)
                     closed.complete(Unit)
-                    // Laufende Calls sofort scheitern lassen statt in ihr Timeout laufen
                     failAllPending()
                 }
-
-                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                    webSocket.close(code, null)
-                }
-
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, null) }
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                     closed.complete(Unit)
                     failAllPending()
@@ -445,10 +452,13 @@ class ShellyClient(
             }
         } finally {
             currentWs = null
-            // Sauber schliessen (Close-Handshake) statt hart abzubrechen, damit der
-            // Shelly den Verbindungs-Slot sofort freigibt und nicht erst nach seinem
-            // eigenen Timeout – sonst gehen ihm bei Reconnects die 6 Slots aus.
-            if (!ws.close(1000, "bye")) ws.cancel()
+            // Sofort abreissen (cancel), NICHT grazioes schliessen: das grazioese
+            // close(1000) laesst den Socket bis zum OkHttp-Timeout offen; da der Prozess
+            // Dienst-Neustarts ueberlebt, stapeln sich so haengende Verbindungen auf dem
+            // Shelly und fuellen seinen Nonce-Puffer (-> 401 selbst auf korrekte Auth,
+            // dann 429). cancel() gibt Slot + Nonce per TCP-Abriss sofort frei (siehe
+            // [close], am Geraet verifiziert).
+            ws.cancel()
             failAllPending()
         }
         return helloOk
@@ -491,11 +501,19 @@ class ShellyClient(
         var attempt = 1
         while (true) {
             try {
-                val result = sendFrame(method, params, timeoutMs, requiresAuth)
+                // Ab dem 2. Versuch antworten wir auf eine eben empfangene Challenge
+                // -> ohne Gap senden. (Eine Wartezeit vor der Antwort wurde getestet
+                // und bringt NICHTS: die Erst-Nutzung einer frischen Nonce wird beim
+                // Pixel ~55% abgelehnt, voellig zeitunabhaengig – geraeteseitig,
+                // unterhalb der App. Deshalb hier ohne kuenstliche Verzoegerung.)
+                val result = sendFrame(method, params, timeoutMs, requiresAuth, immediate = attempt > 1)
                 onCallSucceeded()
                 // Ein authentifizierter Call ist durchgekommen -> die Nonce "greift".
                 // Ab jetzt duerfen weitere Calls mit dem engeren Abstand laufen.
-                if (requiresAuth && passwordFlow.value.isNotBlank()) authEstablished = true
+                if (requiresAuth && passwordFlow.value.isNotBlank()) {
+                    authEstablished = true
+                    if (attempt > 1) Log.i(TAG, "AUTHDBG OK m=$method bei Versuch $attempt")
+                }
                 return result
             } catch (e: ShellyRpcException) {
                 // 429: der Shelly hat dichtgemacht -> Sperre setzen und aufhoeren.
@@ -505,6 +523,7 @@ class ShellyClient(
                 }
                 if (e.code != 401) throw e
                 lastAuthMessage = e.message ?: lastAuthMessage
+                Log.i(TAG, "AUTHDBG 401 m=$method versuch=$attempt raw=${e.message}")
                 val challenge = ShellyAuth.Challenge.parse(e.message)
                 authMutex.withLock {
                     if (authFailed) throw ShellyRpcException(401, lastAuthMessage)
@@ -548,11 +567,24 @@ class ShellyClient(
         params: JSONObject?,
         timeoutMs: Long,
         requiresAuth: Boolean,
+        immediate: Boolean,
     ): JSONObject {
         // Sanftmut fuer das schwache Geraet: zwischen zwei Sendungen einen
         // Mindestabstand lassen (laeuft ohnehin seriell unter callMutex). Waehrend
         // des Auth-Handshakes grosszuegig, danach (bewaehrte Nonce) enger.
-        val gap = if (authEstablished) POST_AUTH_GAP_MS else MIN_CALL_GAP_MS
+        //
+        // AUSNAHME [immediate]: die Antwort auf eine gerade empfangene 401-Challenge
+        // MUSS ohne Verzoegerung raus. Die Shelly-Nonce hat nur ein sehr kurzes
+        // Gueltigkeitsfenster (<~200 ms, am Geraet gemessen: bei ~230 ms Abstand
+        // abgelehnt, bei ~1 ms akzeptiert). Kommt die Antwort zu spaet, ist die Nonce
+        // schon "stale" -> das Geraet lehnt ab und gibt eine neue Challenge aus; die
+        // abgelehnte bleibt als verwaiste "pending" Nonce liegen und fuellt den 32er-
+        // Puffer -> genau das loest die 429-Sperre aus (siehe docs/shelly-429-...md).
+        val gap = when {
+            immediate -> 0L
+            authEstablished -> POST_AUTH_GAP_MS
+            else -> MIN_CALL_GAP_MS
+        }
         val since = SystemClock.elapsedRealtime() - lastSendAtMs
         if (since in 0 until gap) delay(gap - since)
         lastSendAtMs = SystemClock.elapsedRealtime()
@@ -580,7 +612,9 @@ class ShellyClient(
                 if (requiresAuth && challenge != null && password.isNotBlank()) {
                     val nc = ncCounter.incrementAndGet()
                     val cnonce = Random.nextInt().toLong() and 0xFFFFFFFFL
-                    frame.put("auth", ShellyAuth.authObject(challenge, nc, cnonce, password))
+                    val authObj = ShellyAuth.authObject(challenge, nc, cnonce, password)
+                    frame.put("auth", authObj)
+                    Log.i(TAG, "AUTHDBG send m=$method nc=$nc cnonce=$cnonce nonce=${challenge.nonce} resp=${authObj.optString("response").take(12)}")
                 }
                 ws.send(frame.toString())
             }
