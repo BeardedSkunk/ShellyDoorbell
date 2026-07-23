@@ -1251,9 +1251,11 @@ class DoorbellService : Service() {
         )
         // Kleines Icon: Glocke, im Ruhemodus das DND-Symbol.
         val smallIcon = if (view.dnd) R.drawable.ic_stat_dnd else R.drawable.ic_stat_bell
+        // Kompakt 2-zeilig: Zeile 1 ist die (vom System gezeigte) App-Kopfzeile
+        // „Klingelüberwachung", Zeile 2 der Status als Titel. KEIN separater
+        // Content-Text und KEIN Titel=App-Name -> sonst stuende der Name doppelt.
         val b = NotificationCompat.Builder(this, Channels.SERVICE)
             .setSmallIcon(smallIcon)
-            .setContentTitle(getString(R.string.app_name))
             .setContentIntent(contentPi)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -1261,17 +1263,17 @@ class DoorbellService : Service() {
             // Android 12+: das App-Icon ist systemseitig fest (nicht pro Zustand
             // einfaerbbar). Deshalb faerben wir die GANZE Benachrichtigung in der
             // Zustandsfarbe. Ruhe/DND hat KEINE eigene Kartenfarbe (blau wie
-            // „verbunden"), sondern ein textfarbenes „⊖" vor dem Text.
+            // „verbunden"), sondern ein grafisches rotes DND-Zeichen „⛔" vor dem Text.
             val cardColor = if (view.dnd) NotifColor.BLUE.argb else view.color.argb
-            val text = if (view.dnd) "⊖ ${view.text}" else view.text
+            val title = if (view.dnd) "⛔ ${view.text}" else view.text
             b.setColorized(true)
                 .setColor(cardColor)
-                .setContentText(text)
+                .setContentTitle(title)
         } else {
             // Android <= 11: Standard-Layout, setColor toent das kleine Header-Icon
             // in der Zustandsfarbe (Glocke blau/grau/rot, Ruhe = rotes DND-Symbol).
             val tint = if (view.dnd) NotifColor.RED.argb else view.color.argb
-            b.setColor(tint).setContentText(view.text)
+            b.setColor(tint).setContentTitle(view.text)
         }
         return b.build()
     }
