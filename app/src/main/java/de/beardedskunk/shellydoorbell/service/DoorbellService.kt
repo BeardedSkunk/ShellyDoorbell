@@ -7,10 +7,6 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
@@ -22,7 +18,6 @@ import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
-import android.widget.RemoteViews
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -1254,40 +1249,41 @@ class DoorbellService : Service() {
         val contentPi = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
-        // Kleines Icon: Glocke, im Ruhemodus das DND-Symbol. Das DND-Symbol soll ROT
-        // sein (nicht in der blauen Verbunden-Farbe) -> Toenung entkoppeln.
+        // Kleines Icon: Glocke, im Ruhemodus das DND-Symbol.
         val smallIcon = if (view.dnd) R.drawable.ic_stat_dnd else R.drawable.ic_stat_bell
-        val tint = if (view.dnd) NotifColor.RED.argb else view.color.argb
         val b = NotificationCompat.Builder(this, Channels.SERVICE)
             .setSmallIcon(smallIcon)
-            .setColor(tint)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText(view.text)
             .setContentIntent(contentPi)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
         if (Build.VERSION.SDK_INT >= 31) {
-            // Android 12+: das Header-Icon der Standard-Notification ist das nicht
-            // einfaerbbare App-Icon -> eigenes Layout mit gerendertem, farbigem Icon
-            // (blau/grau/rot, im Ruhemodus mit rotem DND-Kreis).
-            val rv = RemoteViews(packageName, R.layout.notif_service).apply {
-                setImageViewBitmap(R.id.notif_icon, buildStateIcon(view.color.argb, view.dnd))
-                setTextViewText(R.id.notif_title, getString(R.string.app_name))
-                setTextViewText(R.id.notif_text, view.text)
-            }
-            b.setCustomContentView(rv).setCustomBigContentView(rv)
+            // Android 12+: das App-Icon ist systemseitig fest (nicht pro Zustand
+            // einfaerbbar). Deshalb faerben wir die GANZE Benachrichtigung in der
+            // Zustandsfarbe. Ruhe/DND hat KEINE eigene Kartenfarbe (blau wie
+            // „verbunden"), sondern ein textfarbenes „⊖" vor dem Text.
+            val cardColor = if (view.dnd) NotifColor.BLUE.argb else view.color.argb
+            val text = if (view.dnd) "⊖ ${view.text}" else view.text
+            b.setColorized(true)
+                .setColor(cardColor)
+                .setContentText(text)
+        } else {
+            // Android <= 11: Standard-Layout, setColor toent das kleine Header-Icon
+            // in der Zustandsfarbe (Glocke blau/grau/rot, Ruhe = rotes DND-Symbol).
+            val tint = if (view.dnd) NotifColor.RED.argb else view.color.argb
+            b.setColor(tint).setContentText(view.text)
         }
-        // Android <= 11: unveraendert das Standard-Layout — dort toent setColor das
-        // kleine Header-Icon in der Zustandsfarbe (Glocke/DND-Symbol farbig).
         return b.build()
     }
 
     /**
-     * Verbindungszustand + Ruhe/Klingelzeiten + Homezone -> Farbe, DND-Badge, Text:
+     * Verbindungszustand + Ruhe/Klingelzeiten + Homezone -> Farbe, DND-Flag, Text.
+     * Wie Farbe/DND dargestellt werden, entscheidet [buildServiceNotification] je
+     * nach Android-Version (getoentes Icon <=11 / eingefaerbte Karte 12+):
      *  - verbunden & aktiv        -> blau, „lausche auf die Klingel"
-     *  - verbunden & Klingel ruht -> blau + roter DND-Kreis, „Ruhe bis …" / „abgestellt"
-     *  - zu Hause, aber kein WLAN -> rot, Hinweis WLAN einschalten
-     *  - sonst (verbindet/anderes Netz/kein WLAN) -> grau, bisherige Texte
+     *  - verbunden & Klingel ruht -> blau + DND, „Ruhe bis …" / „abgestellt"
+     *  - zu Hause, aber kein WLAN -> rot
+     *  - sonst (verbindet/anderes Netz/kein WLAN) -> grau
      */
     private fun notifView(
         state: ConnectionState,
@@ -1333,44 +1329,6 @@ class DoorbellService : Service() {
     private fun currentNotifView(): NotifView = notifView(
         client.state.value, _muteUntil.value, _bellOn.value, _bellTimes.value, homeZone.status.value,
     )
-
-    /**
-     * Farbiges Zustands-Icon fuers grosse Notification-Icon: weisse Glocke auf
-     * gefuelltem Kreis in [color]; bei [dnd] unten links ein kleiner roter Kreis
-     * mit weissem Querstrich (Ruhe-/DND-Symbol).
-     */
-    private fun buildStateIcon(color: Int, dnd: Boolean): Bitmap {
-        val size = resources
-            .getDimensionPixelSize(android.R.dimen.notification_large_icon_width)
-            .coerceAtLeast(96)
-        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        val r = size / 2f
-        paint.color = color
-        canvas.drawCircle(r, r, r, paint)
-        val bell = ContextCompat.getDrawable(this, R.drawable.ic_stat_bell)?.mutate()
-        if (bell != null) {
-            bell.setTint(Color.WHITE)
-            val inset = (size * 0.22f).toInt()
-            bell.setBounds(inset, inset, size - inset, size - inset)
-            bell.draw(canvas)
-        }
-        if (dnd) {
-            val br = size * 0.30f
-            val cx = size - br - size * 0.03f   // unten rechts
-            val cy = size - br - size * 0.03f
-            paint.color = NotifColor.RED.argb
-            canvas.drawCircle(cx, cy, br, paint)
-            paint.color = Color.WHITE
-            paint.style = Paint.Style.STROKE
-            paint.strokeWidth = br * 0.30f
-            paint.strokeCap = Paint.Cap.ROUND
-            canvas.drawLine(cx - br * 0.5f, cy, cx + br * 0.5f, cy, paint)
-            paint.style = Paint.Style.FILL
-        }
-        return bmp
-    }
 
     private fun updateServiceNotification(view: NotifView) {
         // Nicht im Vordergrund (Alarm lokal aus) -> notify() wuerde die gerade
