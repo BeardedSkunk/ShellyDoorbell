@@ -1,6 +1,7 @@
 package de.beardedskunk.shellydoorbell.shelly
 
 import java.time.LocalDateTime
+import java.time.ZoneId
 
 /**
  * Eine Klingelzeit: ein Zeitfenster, in dem die Klingel aktiv sein soll.
@@ -74,6 +75,30 @@ object BellTimes {
 
     private fun timespec(minuteOfDay: Int, cronDays: Collection<Int>): String =
         "0 ${minuteOfDay % 60} ${minuteOfDay / 60} * * ${cronDays.sorted().joinToString(",")}"
+
+    /**
+     * Naechster kuenftiger Fensterbeginn ueber alle [windows] als Unix-Sekunden —
+     * also der Zeitpunkt, zu dem die Klingel ausserhalb aller Fenster wieder
+     * angeht. null, wenn keine Fenster vorhanden sind (dann ist die Klingel
+     * ohnehin immer an) oder keins in den naechsten 7 Tagen beginnt.
+     */
+    fun nextStart(windows: List<BellWindow>, now: LocalDateTime = LocalDateTime.now()): Long? {
+        var best: LocalDateTime? = null
+        for (w in windows) {
+            if (w.days.isEmpty()) continue
+            for (ahead in 0..7) {
+                val day = now.toLocalDate().plusDays(ahead.toLong())
+                val iso = day.dayOfWeek.value - 1 // ISO: Montag=1 -> 0
+                if (iso !in w.days) continue
+                val cand = day.atTime(w.startMin / 60, w.startMin % 60)
+                if (cand.isAfter(now)) {
+                    if (best == null || cand.isBefore(best)) best = cand
+                    break
+                }
+            }
+        }
+        return best?.atZone(ZoneId.systemDefault())?.toEpochSecond()
+    }
 
     /** Timespec des Ein-Jobs (Fenster-Beginn: Klingel an). */
     fun onTimespec(w: BellWindow): String = timespec(w.startMin, w.days.map { isoToCron(it) })

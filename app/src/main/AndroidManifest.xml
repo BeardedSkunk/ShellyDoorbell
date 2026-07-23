@@ -6,6 +6,8 @@
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Der Dauerdienst darf waehrend er laeuft den Standort nutzen (Homezone) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Noetig, damit die App in der "Nicht stoeren"-Zugriffsliste auftaucht -->
     <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
@@ -16,9 +18,9 @@
     <!-- WLAN-Namen (SSID) lesen, um Heim- von Fremdnetzen zu unterscheiden.
          Ab Android 13 ohne Standort (neverForLocation); darunter via Standort. -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
-    <uses-permission
-        android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:maxSdkVersion="32" />
+    <!-- Standort (optional): Homezone lernen/erkennen. Bis Android 12 zusaetzlich
+         der Weg, um die SSID lesen zu duerfen. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission
         android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation" />
@@ -70,7 +72,7 @@
         <service
             android:name=".service.DoorbellService"
             android:exported="false"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="specialUse|location">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Haelt eine dauerhafte WebSocket-Verbindung zu einem Shelly-Geraet im Heimnetz, um Tuerklingel-Ereignisse sofort zu melden." />

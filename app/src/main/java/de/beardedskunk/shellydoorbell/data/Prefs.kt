@@ -2,6 +2,7 @@ package de.beardedskunk.shellydoorbell.data
 
 import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.doublePreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
@@ -45,6 +46,11 @@ class Prefs(private val context: Context) {
         // Greylist = SSIDs, in denen der Shelly bisher NICHT gefunden wurde,
         // als JSON { "ssid": letzterVersuchEpochMs, ... }.
         val WIFI_GREYLIST = stringPreferencesKey("wifi_greylist")
+
+        // Homezone (siehe HomeZone): Mittelpunkt des Orts, an dem die Klingel
+        // zuletzt erreichbar war. Beide gesetzt = gelernt, sonst nicht gelernt.
+        val HOME_LAT = doublePreferencesKey("home_lat")
+        val HOME_LON = doublePreferencesKey("home_lon")
     }
 
     val settings: Flow<LocalSettings> = context.dataStore.data.map { p ->
@@ -105,6 +111,30 @@ class Prefs(private val context: Context) {
         val json = JSONObject()
         for ((k, v) in entries) json.put(k, v)
         context.dataStore.edit { it[Keys.WIFI_GREYLIST] = json.toString() }
+    }
+
+    // ---------- Homezone (HomeZone) ----------
+
+    /** Gelernter Homezone-Mittelpunkt (lat, lon) oder null = noch nicht gelernt. */
+    suspend fun getHome(): Pair<Double, Double>? {
+        val p = context.dataStore.data.first()
+        val lat = p[Keys.HOME_LAT] ?: return null
+        val lon = p[Keys.HOME_LON] ?: return null
+        return lat to lon
+    }
+
+    suspend fun setHome(lat: Double, lon: Double) {
+        context.dataStore.edit {
+            it[Keys.HOME_LAT] = lat
+            it[Keys.HOME_LON] = lon
+        }
+    }
+
+    suspend fun clearHome() {
+        context.dataStore.edit {
+            it.remove(Keys.HOME_LAT)
+            it.remove(Keys.HOME_LON)
+        }
     }
 
     companion object {

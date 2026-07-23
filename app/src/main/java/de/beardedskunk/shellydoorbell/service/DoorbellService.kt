@@ -7,6 +7,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
@@ -36,9 +40,11 @@ import de.beardedskunk.shellydoorbell.shelly.ConnectionState
 import de.beardedskunk.shellydoorbell.shelly.BellEntry
 import de.beardedskunk.shellydoorbell.shelly.BellTimes
 import de.beardedskunk.shellydoorbell.shelly.BellWindow
+import de.beardedskunk.shellydoorbell.shelly.GateDecision
 import de.beardedskunk.shellydoorbell.shelly.SharedSettings
 import de.beardedskunk.shellydoorbell.shelly.ShellyClient
 import de.beardedskunk.shellydoorbell.shelly.ShellyRpcException
+import de.beardedskunk.shellydoorbell.ui.Fmt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -86,6 +92,11 @@ class DoorbellService : Service() {
     private lateinit var alarm: AlarmController
     private lateinit var client: ShellyClient
     private lateinit var wifiGate: WifiGate
+    private lateinit var homeZone: HomeZone
+
+    /** true, sobald die Dauer-Notification mit dem FGS-Typ location laeuft
+     *  (Standort-Berechtigung war beim Start vorhanden). */
+    @Volatile private var locationFgsActive = false
 
     private val ip = MutableStateFlow("")
     private val password = MutableStateFlow("")
@@ -164,9 +175,26 @@ class DoorbellService : Service() {
         dao = AppDb.get(this).ringDao()
         alarm = AlarmController(this, scope)
         wifiGate = WifiGate(prefs, scope)
-        runBlocking { wifiGate.load() }
-        // Netzwerk-Tor: entscheidet vor jedem Verbindungsversuch (Subnetz / SSID-Listen).
-        client = ShellyClient(scope, ip, wifi, password) { ipStr, forced -> wifiGate.decide(ipStr, forced) }
+        homeZone = HomeZone(this, prefs, scope)
+        runBlocking {
+            wifiGate.load()
+            homeZone.load()
+        }
+        // Netzwerk-Tor: entscheidet vor jedem Verbindungsversuch. Zuerst die
+        // Ortung — wissen wir SICHER, dass wir ausserhalb der Homezone sind, gar
+        // nicht erst versuchen (ausser bei „Verbindung pruefen"/Reconnect = forced).
+        // Sonst wie bisher das Subnetz-/SSID-Tor (WifiGate).
+        client = ShellyClient(scope, ip, wifi, password) { ipStr, forced ->
+            if (!forced && homeZone.status.value == HomeStatus.OUTSIDE) {
+                GateDecision.Block(
+                    ConnectionState.OtherNetwork("Unterwegs – Klingel wird nicht gesucht."),
+                    HOME_OUTSIDE_RECHECK_MS,
+                )
+            } else {
+                wifiGate.decide(ipStr, forced)
+            }
+        }
+        homeZone.start()
 
         // Ohne lokalen Alarm laeuft der Dienst nur fuer die sichtbare UI mit —
         // dann ohne Dauer-Notification (und er beendet sich, wenn die UI zugeht).
@@ -206,13 +234,33 @@ class DoorbellService : Service() {
                     is ConnectionState.OtherNetwork -> "anderes Netz (${it.detail})"
                 }
                 Log.d(TAG, "Verbindungszustand: $label")
-                updateServiceNotification(it)
             }
         }
         scope.launch {
+            // Dauer-Notification aus mehreren Quellen zusammensetzen: Verbindungs-
+            // zustand, Ruhe/Klingelzeiten und Homezone bestimmen Farbe, DND-Badge
+            // und Text (siehe notifView).
+            combine(
+                client.state,
+                _muteUntil,
+                _bellOn,
+                _bellTimes,
+                homeZone.status,
+            ) { state, mute, bell, times, home ->
+                notifView(state, mute, bell, times, home)
+            }.distinctUntilChanged().collect { updateServiceNotification(it) }
+        }
+        scope.launch {
+            // Kommen wir (womoeglich) wieder nach Hause, den Reconnect-Loop wecken,
+            // damit er nicht bis zur naechsten Wiedervorlage im „Unterwegs"-Block haengt.
+            homeZone.status.collect { st -> if (st != HomeStatus.OUTSIDE) client.reconnectNow() }
+        }
+        scope.launch {
             client.connectedEvents.collect {
-                // Erreichbar in diesem WLAN -> SSID whitelisten, dann Daten laden.
+                // Erreichbar in diesem WLAN -> SSID whitelisten, Homezone lernen,
+                // dann Daten laden.
                 wifiGate.onConnected()
+                homeZone.recordConnected()
                 onConnected()
             }
         }
@@ -324,7 +372,7 @@ class DoorbellService : Service() {
             // status posten – sonst bliebe sie auf "verbinde" haengen, wenn der
             // Zustand danach nicht mehr wechselt (Verbindung stand schon).
             ContextCompat.startForegroundService(this, Intent(this, DoorbellService::class.java))
-            startForegroundCompat(serviceText(client.state.value))
+            startForegroundCompat(currentNotifView())
         } else {
             stopForeground(STOP_FOREGROUND_REMOVE)
             if (!uiVisible.value) stopSelf()
@@ -335,6 +383,7 @@ class DoorbellService : Service() {
         networkCallback?.let {
             runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
         }
+        homeZone.stop()
         alarm.stop()
         // Anstaendig vom Shelly abmelden (Verbindungs-Slot sofort frei), dann alle
         // Coroutinen beenden.
@@ -797,6 +846,15 @@ class DoorbellService : Service() {
 
     fun setUiVisible(visible: Boolean) {
         uiVisible.value = visible
+        if (visible) {
+            // Standort-Berechtigung koennte gerade erst erteilt worden sein:
+            // Updates starten und die Dauer-Notification ggf. auf den FGS-Typ
+            // location heben (sonst kaeme der Dienst im Hintergrund nicht an den Ort).
+            homeZone.start()
+            if (localAlarmEnabled && homeZone.hasPermission() && !locationFgsActive) {
+                startForegroundCompat(currentNotifView())
+            }
+        }
         // Ohne lokalen Alarm lief der Dienst nur fuer die UI mit
         if (!visible && !localAlarmEnabled) stopSelf()
     }
@@ -1160,43 +1218,147 @@ class DoorbellService : Service() {
 
     // ---------- Foreground-Notification ----------
 
-    private fun startForegroundCompat(text: String = getString(R.string.notif_connecting)) {
-        val notification = buildServiceNotification(text)
+    /** Farbe des Zustands-Icons (ARGB). */
+    private enum class NotifColor(val argb: Int) {
+        /** verbunden */
+        BLUE(0xFF1565C0.toInt()),
+        /** nicht erreichbar / verbindet / anderes Netz */
+        GREY(0xFF9E9E9E.toInt()),
+        /** zu Hause, aber kein WLAN */
+        RED(0xFFD32F2F.toInt()),
+    }
+
+    /** Gebuendelter Anzeigezustand der Dauer-Notification. */
+    private data class NotifView(val color: NotifColor, val dnd: Boolean, val text: String)
+
+    private fun startForegroundCompat(view: NotifView = currentNotifView()) {
+        val notification = buildServiceNotification(view)
+        val hasLoc = homeZone.hasPermission()
         if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIF_ID_SERVICE, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            // FGS-Typ location nur mit erteilter Standort-Berechtigung ergaenzen –
+            // sonst wirft startForeground eine SecurityException.
+            var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            if (hasLoc) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            startForeground(NOTIF_ID_SERVICE, notification, type)
         } else {
             startForeground(NOTIF_ID_SERVICE, notification)
         }
+        locationFgsActive = hasLoc
     }
 
-    private fun buildServiceNotification(text: String): Notification {
+    private fun buildServiceNotification(view: NotifView): Notification {
         val contentPi = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, Channels.SERVICE)
-            .setSmallIcon(R.drawable.ic_stat_bell)
+            .setSmallIcon(R.drawable.ic_stat_bell)          // Status-Leiste: systembedingt einfarbig
+            .setColor(view.color.argb)                       // toent das kleine Symbol im Shade
+            .setLargeIcon(buildStateIcon(view.color.argb, view.dnd))
             .setContentTitle(getString(R.string.app_name))
-            .setContentText(text)
+            .setContentText(view.text)
             .setContentIntent(contentPi)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .build()
     }
 
-    private fun serviceText(state: ConnectionState): String = when (state) {
-        is ConnectionState.Connected -> getString(R.string.notif_listening)
-        ConnectionState.Connecting -> getString(R.string.notif_connecting)
-        ConnectionState.NoWifi -> getString(R.string.notif_no_wifi)
-        is ConnectionState.OtherNetwork -> state.detail
+    /**
+     * Verbindungszustand + Ruhe/Klingelzeiten + Homezone -> Farbe, DND-Badge, Text:
+     *  - verbunden & aktiv        -> blau, „lausche auf die Klingel"
+     *  - verbunden & Klingel ruht -> blau + roter DND-Kreis, „Ruhe bis …" / „abgestellt"
+     *  - zu Hause, aber kein WLAN -> rot, Hinweis WLAN einschalten
+     *  - sonst (verbindet/anderes Netz/kein WLAN) -> grau, bisherige Texte
+     */
+    private fun notifView(
+        state: ConnectionState,
+        muteUntil: Long?,
+        bellOn: Boolean?,
+        bellTimes: List<BellEntry>?,
+        home: HomeStatus,
+    ): NotifView = when (state) {
+        is ConnectionState.Connected -> {
+            val nowS = System.currentTimeMillis() / 1000
+            val muted = (muteUntil ?: 0L) > nowS
+            val windows = bellTimes.orEmpty().filter { it.enabled }.map { it.window }
+            val outsideWindows = windows.isNotEmpty() && windows.none { it.isInsideNow() }
+            val quiet = muted || outsideWindows || bellOn == false
+            if (!quiet) {
+                NotifView(NotifColor.BLUE, false, getString(R.string.notif_listening))
+            } else {
+                val reactivateTs: Long? = when {
+                    muted -> muteUntil
+                    windows.isNotEmpty() -> BellTimes.nextStart(windows)
+                    else -> null
+                }
+                val text = if (reactivateTs != null) {
+                    getString(R.string.notif_listening_quiet_until, Fmt.muteUntil(reactivateTs))
+                } else {
+                    getString(R.string.notif_listening_quiet_off)
+                }
+                NotifView(NotifColor.BLUE, true, text)
+            }
+        }
+        ConnectionState.Connecting ->
+            NotifView(NotifColor.GREY, false, getString(R.string.notif_connecting))
+        ConnectionState.NoWifi ->
+            if (home == HomeStatus.INSIDE) {
+                NotifView(NotifColor.RED, false, getString(R.string.notif_home_no_wifi))
+            } else {
+                NotifView(NotifColor.GREY, false, getString(R.string.notif_no_wifi))
+            }
+        is ConnectionState.OtherNetwork ->
+            NotifView(NotifColor.GREY, false, state.detail)
     }
 
-    private fun updateServiceNotification(state: ConnectionState) {
+    private fun currentNotifView(): NotifView = notifView(
+        client.state.value, _muteUntil.value, _bellOn.value, _bellTimes.value, homeZone.status.value,
+    )
+
+    /**
+     * Farbiges Zustands-Icon fuers grosse Notification-Icon: weisse Glocke auf
+     * gefuelltem Kreis in [color]; bei [dnd] unten links ein kleiner roter Kreis
+     * mit weissem Querstrich (Ruhe-/DND-Symbol).
+     */
+    private fun buildStateIcon(color: Int, dnd: Boolean): Bitmap {
+        val size = resources
+            .getDimensionPixelSize(android.R.dimen.notification_large_icon_width)
+            .coerceAtLeast(96)
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val r = size / 2f
+        paint.color = color
+        canvas.drawCircle(r, r, r, paint)
+        val bell = ContextCompat.getDrawable(this, R.drawable.ic_stat_bell)?.mutate()
+        if (bell != null) {
+            bell.setTint(Color.WHITE)
+            val inset = (size * 0.22f).toInt()
+            bell.setBounds(inset, inset, size - inset, size - inset)
+            bell.draw(canvas)
+        }
+        if (dnd) {
+            val br = size * 0.30f
+            val cx = br + size * 0.03f
+            val cy = size - br - size * 0.03f
+            paint.color = NotifColor.RED.argb
+            canvas.drawCircle(cx, cy, br, paint)
+            paint.color = Color.WHITE
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = br * 0.30f
+            paint.strokeCap = Paint.Cap.ROUND
+            canvas.drawLine(cx - br * 0.5f, cy, cx + br * 0.5f, cy, paint)
+            paint.style = Paint.Style.FILL
+        }
+        return bmp
+    }
+
+    private fun updateServiceNotification(view: NotifView) {
         // Nicht im Vordergrund (Alarm lokal aus) -> notify() wuerde die gerade
         // entfernte Dauer-Notification wieder anheften
         if (!localAlarmEnabled) return
         runCatching {
             getSystemService(NotificationManager::class.java)
-                .notify(NOTIF_ID_SERVICE, buildServiceNotification(serviceText(state)))
+                .notify(NOTIF_ID_SERVICE, buildServiceNotification(view))
         }
     }
 
@@ -1215,6 +1377,10 @@ class DoorbellService : Service() {
         /** Verschnaufpause nach dem Verbinden, bevor der erste authentifizierte
          *  Call rausgeht – gibt dem schwachen Shelly nach dem Socket-Aufbau Luft. */
         private const val CONNECT_SETTLE_MS = 300L
+
+        /** „Sicher unterwegs" (ausserhalb der Homezone): erst spaeter neu bewerten.
+         *  Ein Standort-/Link-Wechsel weckt den Loop ohnehin sofort. */
+        private const val HOME_OUTSIDE_RECHECK_MS = 10 * 60_000L
 
         /** Aeltere Timestamps gelten als "keine echte Uhrzeit" (Shelly ohne NTP). */
         private const val MIN_VALID_TS = 1_000_000_000L

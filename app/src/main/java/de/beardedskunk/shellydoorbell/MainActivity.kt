@@ -58,10 +58,11 @@ class MainActivity : ComponentActivity() {
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
-    // WLAN-Namen (SSID) lesen, um Heim- von Fremdnetzen zu unterscheiden. Abgelehnt
-    // ist ok: die App faellt dann auf die reine Subnetz-Erkennung zurueck.
-    private val wifiPermission =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    // WLAN-Namen (SSID) lesen + Standort fuer die Homezone. Beides optional:
+    // ohne SSID faellt die App auf reine Subnetz-Erkennung zurueck, ohne Standort
+    // entfallen die Homezone-Funktionen.
+    private val permissions =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {}
 
     // Auf Activity-Ebene, nicht im SettingsScreen: waehrend der System-Picker
     // offen ist, wird der Service entbunden, die UI faellt auf den Lade-Spinner
@@ -87,14 +88,20 @@ class MainActivity : ComponentActivity() {
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         // SSID-Zugriff: ab Android 13 „Geräte in der Nähe" (ohne Standort), darunter Standort.
-        val wifiPerm = if (Build.VERSION.SDK_INT >= 33) {
+        // Zusätzlich Standort (FINE) für die Homezone; auf < 13 deckt die SSID-Anfrage das ab.
+        val wanted = mutableListOf<String>()
+        val ssidPerm = if (Build.VERSION.SDK_INT >= 33) {
             Manifest.permission.NEARBY_WIFI_DEVICES
         } else {
             Manifest.permission.ACCESS_FINE_LOCATION
         }
-        if (checkSelfPermission(wifiPerm) != PackageManager.PERMISSION_GRANTED) {
-            wifiPermission.launch(wifiPerm)
+        if (checkSelfPermission(ssidPerm) != PackageManager.PERMISSION_GRANTED) wanted += ssidPerm
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
+            Manifest.permission.ACCESS_FINE_LOCATION !in wanted
+        ) {
+            wanted += Manifest.permission.ACCESS_FINE_LOCATION
         }
+        if (wanted.isNotEmpty()) permissions.launch(wanted.toTypedArray())
         setContent {
             AppTheme {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
