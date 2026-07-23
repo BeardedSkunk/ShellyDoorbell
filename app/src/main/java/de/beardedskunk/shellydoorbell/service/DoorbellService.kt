@@ -22,6 +22,7 @@ import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.widget.RemoteViews
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -433,6 +434,9 @@ class DoorbellService : Service() {
 
             override fun onLost(network: Network) {
                 if (wifi.value == network) wifi.value = null
+                // WLAN weg: frischen Standort anstossen, um „zu Hause?" (roter
+                // Hinweis) verlaesslich zu beantworten.
+                homeZone.requestFreshFix()
             }
         }
         networkCallback = callback
@@ -1250,16 +1254,32 @@ class DoorbellService : Service() {
         val contentPi = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
-        return NotificationCompat.Builder(this, Channels.SERVICE)
-            .setSmallIcon(R.drawable.ic_stat_bell)          // Status-Leiste: systembedingt einfarbig
-            .setColor(view.color.argb)                       // toent das kleine Symbol im Shade
-            .setLargeIcon(buildStateIcon(view.color.argb, view.dnd))
+        // Kleines Icon: Glocke, im Ruhemodus das DND-Symbol. Das DND-Symbol soll ROT
+        // sein (nicht in der blauen Verbunden-Farbe) -> Toenung entkoppeln.
+        val smallIcon = if (view.dnd) R.drawable.ic_stat_dnd else R.drawable.ic_stat_bell
+        val tint = if (view.dnd) NotifColor.RED.argb else view.color.argb
+        val b = NotificationCompat.Builder(this, Channels.SERVICE)
+            .setSmallIcon(smallIcon)
+            .setColor(tint)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(view.text)
             .setContentIntent(contentPi)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .build()
+        if (Build.VERSION.SDK_INT >= 31) {
+            // Android 12+: das Header-Icon der Standard-Notification ist das nicht
+            // einfaerbbare App-Icon -> eigenes Layout mit gerendertem, farbigem Icon
+            // (blau/grau/rot, im Ruhemodus mit rotem DND-Kreis).
+            val rv = RemoteViews(packageName, R.layout.notif_service).apply {
+                setImageViewBitmap(R.id.notif_icon, buildStateIcon(view.color.argb, view.dnd))
+                setTextViewText(R.id.notif_title, getString(R.string.app_name))
+                setTextViewText(R.id.notif_text, view.text)
+            }
+            b.setCustomContentView(rv).setCustomBigContentView(rv)
+        }
+        // Android <= 11: unveraendert das Standard-Layout — dort toent setColor das
+        // kleine Header-Icon in der Zustandsfarbe (Glocke/DND-Symbol farbig).
+        return b.build()
     }
 
     /**
@@ -1338,7 +1358,7 @@ class DoorbellService : Service() {
         }
         if (dnd) {
             val br = size * 0.30f
-            val cx = br + size * 0.03f
+            val cx = size - br - size * 0.03f   // unten rechts
             val cy = size - br - size * 0.03f
             paint.color = NotifColor.RED.argb
             canvas.drawCircle(cx, cy, br, paint)
