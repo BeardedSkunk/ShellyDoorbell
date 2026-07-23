@@ -1,4 +1,4 @@
-let VERSION = 5; // MUSS die erste Zeile bleiben und bei jeder Aenderung hochgezaehlt werden:
+let VERSION = 6; // MUSS die erste Zeile bleiben und bei jeder Aenderung hochgezaehlt werden:
                  // die App liest sie per Script.GetCode und spielt bei aelterer/fehlender
                  // Version automatisch die von ihr gebuendelte doorbell.js ein.
 
@@ -31,6 +31,13 @@ let VERSION = 5; // MUSS die erste Zeile bleiben und bei jeder Aenderung hochgez
 //   dbell_mute_until       "Ruhe bis": Unix-Zeit (Sekunden), bis zu der die
 //                          Klingel stumm ist; laeuft ueber einen Script-Timer
 //                          ab (kein Schedule, hinterlaesst nichts)
+//   dbell_on_at            "Einschalten um": Unix-Zeit (Sekunden), zu der die
+//                          abgeschaltete Klingel wieder eingeschaltet wird;
+//                          Gegenstueck zu dbell_mute_until, ebenfalls per Timer
+//                          (kein Schedule). Es gibt immer nur EINEN der beiden
+//                          temporaeren Schaltpunkte — Setzen des einen loescht
+//                          den anderen. Ein manuelles Einschalten (Hardware-
+//                          Taster/Shelly-App) loescht den aktiven Schaltpunkt.
 //   dbell_log_head         Index des aktuellen Log-Chunks (0..9)
 //   dbell_log_0 .. _9      Log-Chunks: JSON-Array von Ereignis-Objekten
 //                          {t: Start-Unixzeit, n: Anzahl Druecke, d: Dauer in s}
@@ -52,8 +59,9 @@ let GROUP_GAP_MS = 180000;  // 3 min: danach gilt ein Klingel-Ereignis als beend
 let cfg = {
   thr: DEF_THRESHOLD_W,
   deb: DEF_DEBOUNCE_S,
-  ring: [],    // Klingelzeiten: Array von Schedule-Job-Paaren [einId, ausId]
-  muteUntil: 0 // "Ruhe bis" als Unix-Sekunden, 0 = keine Ruhe
+  ring: [],     // Klingelzeiten: Array von Schedule-Job-Paaren [einId, ausId]
+  muteUntil: 0, // "Ruhe bis" als Unix-Sekunden, 0 = keine Ruhe (temp. AUS)
+  onAt: 0       // "Einschalten um" als Unix-Sekunden, 0 = keins (temp. EIN)
 };
 
 let lastRingMs = 0;
@@ -114,7 +122,7 @@ function toNum(v, dflt) {
 // ---------- Konfiguration aus dem KVS ----------
 
 function loadCfg(cb) {
-  Shelly.call("KVS.GetMany", { match: "dbell_cfg_*,dbell_ring_*,dbell_mute_until" }, function (res) {
+  Shelly.call("KVS.GetMany", { match: "dbell_cfg_*,dbell_ring_*,dbell_mute_until,dbell_on_at" }, function (res) {
     let items = {};
     if (res && res.items) {
       if (res.items.length !== undefined) {
@@ -139,6 +147,12 @@ function loadCfg(cb) {
       Shelly.call("KVS.Delete", { key: "dbell_mute_until" });
       cfg.muteUntil = 0;
     }
+    cfg.onAt = toNum(items.dbell_on_at, 0);
+    if (res && cfg.onAt !== 0 && cfg.onAt <= Math.floor(Date.now() / 1000)) {
+      // abgelaufene Einschaltzeit aufraeumen
+      Shelly.call("KVS.Delete", { key: "dbell_on_at" });
+      cfg.onAt = 0;
+    }
     // Defaults einmalig ablegen, damit die Apps sie vorfinden — aber nur, wenn
     // die Abfrage wirklich geklappt hat (sonst wuerden echte Werte ueberschrieben).
     if (res) {
@@ -156,6 +170,7 @@ function loadCfg(cb) {
 function cfgChanged() {
   loadCfg(function () {
     scheduleMuteTimer();
+    scheduleOnAtTimer();
     Shelly.emitEvent("doorbell_cfg", null);
   });
   return true;
@@ -169,6 +184,7 @@ function cfgChanged() {
 // naechsten Tag faelschlich erneut zuschlagen koennte.
 
 let muteTimer = null;
+let onAtTimer = null;
 
 function scheduleMuteTimer() {
   if (muteTimer !== null) {
@@ -185,6 +201,58 @@ function scheduleMuteTimer() {
     reconcileBell();
     Shelly.emitEvent("doorbell_cfg", null);
   });
+}
+
+// ---------- "Einschalten um" (temporaere Wieder-Einschaltung) ----------
+//
+// Gegenstueck zu "Ruhe bis": die Klingel ist gerade AUS und soll zu einem
+// festen Zeitpunkt (vor dem naechsten reguleren Fenster-Beginn) wieder AN.
+// Beim Ablauf schaltet das Script hart ein, loescht den KVS-Key und
+// broadcastet doorbell_cfg. Kein Schedule -> nichts, was spaeter faelschlich
+// erneut zuschlagen koennte.
+function scheduleOnAtTimer() {
+  if (onAtTimer !== null) {
+    Timer.clear(onAtTimer);
+    onAtTimer = null;
+  }
+  let nowS = Math.floor(Date.now() / 1000);
+  if (cfg.onAt <= nowS) return;
+  onAtTimer = Timer.set((cfg.onAt - nowS) * 1000 + 1000, false, function () {
+    onAtTimer = null;
+    cfg.onAt = 0;
+    print("doorbell: Einschaltzeit erreicht, schalte Klingel EIN");
+    Shelly.call("KVS.Delete", { key: "dbell_on_at" });
+    setBell(true);
+    Shelly.emitEvent("doorbell_cfg", null);
+  });
+}
+
+// Ein manuelles Einschalten (Hardware-Taster oder Shelly-App) hebt einen
+// aktiven temporaeren Schaltpunkt auf -> zurueck zu den normalen Klingelzeiten.
+// Nur das EINSCHALTEN ist relevant: "Ruhe bis" wie "Einschalten um" halten die
+// Klingel AUS, ein manuelles AN widerspricht beiden. Die regulaeren Ablaeufe
+// (Timer-Ende, reconcileBell) setzen cfg.* VORHER auf 0, laufen hier also
+// ins Leere und loeschen nichts versehentlich.
+function onOutputChange(output) {
+  if (!output) return;
+  let now = Math.floor(Date.now() / 1000);
+  let cleared = false;
+  if (cfg.muteUntil > now) {
+    cfg.muteUntil = 0;
+    if (muteTimer !== null) { Timer.clear(muteTimer); muteTimer = null; }
+    Shelly.call("KVS.Delete", { key: "dbell_mute_until" });
+    cleared = true;
+  }
+  if (cfg.onAt > now) {
+    cfg.onAt = 0;
+    if (onAtTimer !== null) { Timer.clear(onAtTimer); onAtTimer = null; }
+    Shelly.call("KVS.Delete", { key: "dbell_on_at" });
+    cleared = true;
+  }
+  if (cleared) {
+    print("doorbell: manuelles Einschalten -> temporaeren Schaltpunkt geloescht");
+    Shelly.emitEvent("doorbell_cfg", null);
+  }
 }
 
 // ---------- Klingel-Log (Ringpuffer im KVS) ----------
@@ -308,6 +376,9 @@ function testRing() {
 
 Shelly.addStatusHandler(function (st) {
   if (st.component !== "switch:0" || !st.delta) return;
+  // Schaltzustand geaendert (auch per Hardware-Taster/Shelly-App): einen
+  // aktiven temporaeren Schaltpunkt ggf. aufheben.
+  if (typeof st.delta.output === "boolean") onOutputChange(st.delta.output);
   let p = st.delta.apower;
   if (typeof p !== "number") return;
   lastPower = p;
@@ -394,8 +465,11 @@ function setBell(on) {
 }
 
 function reconcileBell() {
-  // Laufende "Ruhe bis"-Stummschaltung hat Vorrang.
-  if (cfg.muteUntil > Math.floor(Date.now() / 1000)) {
+  let nowS = Math.floor(Date.now() / 1000);
+  // Ein laufender temporaerer Schaltpunkt haelt die Klingel AUS und hat Vorrang:
+  // "Ruhe bis" (bewusst still) genauso wie eine noch nicht erreichte
+  // "Einschalten um"-Zeit (soll erst spaeter angehen).
+  if (cfg.muteUntil > nowS || cfg.onAt > nowS) {
     setBell(false);
     return;
   }
@@ -451,6 +525,7 @@ function reconcileBell() {
 
 loadCfg(function () {
   scheduleMuteTimer();
+  scheduleOnAtTimer();
   reconcileBell();
 });
 initLog();

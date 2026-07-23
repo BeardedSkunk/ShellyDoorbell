@@ -101,6 +101,7 @@ fun MainScreen(
     val bellOn by service.bellOn.collectAsState()
     val bellTimes by service.bellTimes.collectAsState()
     val muteUntil by service.muteUntil.collectAsState()
+    val onAt by service.onAt.collectAsState()
     val scriptOk by service.scriptOk.collectAsState()
     val alarmActive by service.alarmActive.collectAsState()
     val connected = conn is ConnectionState.Connected
@@ -131,11 +132,15 @@ fun MainScreen(
             BellCard(
                 bellOn = bellOn,
                 muteUntil = muteUntil,
+                onAt = onAt,
+                bellTimes = bellTimes,
                 connected = connected,
                 listenOnly = listenOnly,
                 onToggle = { service.setBell(it) },
                 onMute = { service.setMute(it) },
                 onClearMute = { service.clearMute() },
+                onSetOnAt = { service.setOnAt(it) },
+                onClearOnAt = { service.clearOnAt() },
             )
             LocalAlarmCard()
             // Klingelzeiten schreiben auf den Shelly -> im Lauschmodus ausblenden.
@@ -298,14 +303,36 @@ private fun ScriptWarning() {
 private fun BellCard(
     bellOn: Boolean?,
     muteUntil: Long?,
+    onAt: Long?,
+    bellTimes: List<BellEntry>?,
     connected: Boolean,
     listenOnly: Boolean,
     onToggle: (Boolean) -> Unit,
     onMute: (Long) -> Unit,
     onClearMute: () -> Unit,
+    onSetOnAt: (Long) -> Unit,
+    onClearOnAt: () -> Unit,
 ) {
-    var pickMute by remember { mutableStateOf(false) }
+    var showPicker by remember { mutableStateOf(false) }
+    var warning by remember { mutableStateOf<String?>(null) }
     val off = bellOn == false
+
+    val nowS = System.currentTimeMillis() / 1000
+    val muteActive = (muteUntil ?: 0L) > nowS
+    val onAtActive = (onAt ?: 0L) > nowS
+    val tempActive = muteActive || onAtActive
+    // Naechster regulaerer Fenster-Beginn: sowohl fuer die Status-Anzeige (wann
+    // geht sie von selbst wieder an) als auch als Obergrenze fuer „Einschalten um".
+    val windows = bellTimes.orEmpty().filter { it.enabled }.map { it.window }
+    val nextStart = remember(bellTimes) { BellTimes.nextStart(windows) }
+    // Zeitpunkt, zu dem die abgeschaltete Klingel automatisch wieder angeht.
+    val reactivateTs: Long? = when {
+        muteActive -> muteUntil
+        onAtActive -> onAt
+        windows.isNotEmpty() -> nextStart
+        else -> null
+    }
+
     Card(
         colors = if (off) {
             CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
@@ -319,10 +346,11 @@ private fun BellCard(
                 Column(Modifier.weight(1f).padding(start = 12.dp)) {
                     Text("Klingel", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        when (bellOn) {
-                            true -> "Trafo eingeschaltet – Klingel funktioniert"
-                            false -> "Trafo AUS – es kann niemand klingeln!"
-                            null -> "Status unbekannt"
+                        when {
+                            bellOn == null -> "Status unbekannt"
+                            !off -> "Trafo eingeschaltet – Klingel funktioniert"
+                            reactivateTs != null -> "Abgeschaltet – Ruhe bis ${Fmt.muteUntil(reactivateTs)}"
+                            else -> "Abgeschaltet"
                         },
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -336,40 +364,79 @@ private fun BellCard(
                     )
                 }
             }
-            // "Ruhe bis" schreibt ebenfalls auf den Shelly -> im Lauschmodus weg.
+            // Temporaere Schaltpunkte schreiben ebenfalls auf den Shelly -> im
+            // Lauschmodus weglassen. Aktiv ist immer nur EINER (Ruhe/Einschalten).
             if (!listenOnly) {
-                if (muteUntil != null) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Text(
-                            "Ruhe bis ${Fmt.muteUntil(muteUntil)}",
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (off) {
+                        // Klingel aus: eine (fruehere) automatische Einschaltzeit setzen.
+                        OutlinedButton(
+                            onClick = { showPicker = true },
+                            enabled = connected,
                             modifier = Modifier.weight(1f),
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Bold,
-                        )
-                        OutlinedButton(onClick = { pickMute = true }, enabled = connected) { Text("Ändern") }
-                        OutlinedButton(onClick = onClearMute, enabled = connected) { Text("Beenden") }
+                        ) {
+                            Text("Einschalten um …")
+                        }
+                    } else {
+                        // Klingel an: temporaer stummschalten.
+                        OutlinedButton(
+                            onClick = { showPicker = true },
+                            enabled = connected,
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text("Ruhe bis …")
+                        }
                     }
-                } else {
-                    OutlinedButton(onClick = { pickMute = true }, enabled = connected) {
-                        Text("Ruhe bis …")
+                    // „Beenden" immer dann, wenn ein temporaerer Schaltpunkt laeuft —
+                    // hebt ihn frueh auf und faellt auf die Klingelzeiten zurueck.
+                    if (tempActive) {
+                        OutlinedButton(
+                            onClick = { if (muteActive) onClearMute() else onClearOnAt() },
+                            enabled = connected,
+                        ) {
+                            Text("Beenden")
+                        }
                     }
                 }
             }
         }
     }
 
-    if (pickMute) {
-        // Vorbelegung: laufende Ruhe, sonst in einer Stunde
-        val initial = muteUntil
+    if (showPicker) {
+        // Vorbelegung: laufender temporaerer Schaltpunkt, sonst eine Stunde voraus.
+        val initialTs = muteUntil?.takeIf { muteActive }
+            ?: onAt?.takeIf { onAtActive }
+        val initial = initialTs
             ?.let { Instant.ofEpochSecond(it).atZone(ZoneId.systemDefault()).toLocalTime() }
             ?: LocalTime.now().plusHours(1)
         TimePickerDialog(
             initialMin = initial.hour * 60 + initial.minute,
-            onDismiss = { pickMute = false },
-            onConfirm = { min -> pickMute = false; onMute(nextOccurrence(min)) },
+            onDismiss = { showPicker = false },
+            onConfirm = { min ->
+                showPicker = false
+                val target = nextOccurrence(min)
+                when {
+                    // Aus dem An-Zustand ODER laufende Ruhe justieren -> „Ruhe bis".
+                    !off || muteActive -> onMute(target)
+                    // „Einschalten um" muss VOR dem naechsten regulaeren Beginn liegen.
+                    nextStart != null && target >= nextStart ->
+                        warning = "Die Einschaltzeit muss vor der nächsten regulären " +
+                            "Einschaltzeit (${Fmt.muteUntil(nextStart)}) liegen."
+                    else -> onSetOnAt(target)
+                }
+            },
+        )
+    }
+
+    if (warning != null) {
+        AlertDialog(
+            onDismissRequest = { warning = null },
+            confirmButton = { TextButton(onClick = { warning = null }) { Text("OK") } },
+            title = { Text("Nicht übernommen") },
+            text = { Text(warning!!) },
         )
     }
 }
