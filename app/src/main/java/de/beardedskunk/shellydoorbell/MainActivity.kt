@@ -157,6 +157,7 @@ private fun AppRoot(
     when (screen) {
         Screen.Main -> MainScreen(
             service = service,
+            resumeTick = resumeTick,
             onHistory = { screen = Screen.History },
             onSettings = { screen = Screen.Settings },
         )

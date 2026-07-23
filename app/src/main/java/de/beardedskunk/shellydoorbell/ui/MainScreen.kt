@@ -2,16 +2,22 @@
 
 package de.beardedskunk.shellydoorbell.ui
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
@@ -28,7 +34,6 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -38,6 +43,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -77,6 +83,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun MainScreen(
     service: DoorbellService,
+    resumeTick: Int,
     onHistory: () -> Unit,
     onSettings: () -> Unit,
 ) {
@@ -136,6 +143,7 @@ fun MainScreen(
                 BellTimesCard(
                     entries = bellTimes,
                     connected = connected,
+                    resumeTick = resumeTick,
                     onAdd = { service.addBellTime(it) },
                     onRemove = { service.removeBellTime(it) },
                 )
@@ -419,10 +427,11 @@ private fun nextOccurrence(minuteOfDay: Int): Long {
 private fun BellTimesCard(
     entries: List<BellEntry>?,
     connected: Boolean,
+    resumeTick: Int,
     onAdd: (BellWindow) -> Unit,
     onRemove: (BellEntry) -> Unit,
 ) {
-    // Editor fuer eine NEUE Klingelzeit; uebernommen wird sie erst mit dem Plus.
+    // Editor fuer eine (neue oder uebernommene) Klingelzeit; wirksam erst mit Plus.
     var startMin by remember { mutableIntStateOf(BellWindow.DEFAULT.startMin) }
     var endMin by remember { mutableIntStateOf(BellWindow.DEFAULT.endMin) }
     var days by remember { mutableStateOf(BellWindow.DEFAULT.days) }
@@ -430,6 +439,25 @@ private fun BellTimesCard(
     var pickEnd by remember { mutableStateOf(false) }
     var warning by remember { mutableStateOf<String?>(null) }
     val ready = connected && entries != null
+
+    fun loadIntoEditor(w: BellWindow) {
+        startMin = w.startMin
+        endMin = w.endMin
+        days = w.days
+    }
+
+    // Bei frischem App-Resume den Editor mit der als naechstes geltenden
+    // Klingelzeit vorbelegen (sobald die Liste geladen ist – einmal pro Resume).
+    var handledResume by remember { mutableIntStateOf(-1) }
+    LaunchedEffect(resumeTick, entries) {
+        val es = entries
+        if (resumeTick != handledResume && !es.isNullOrEmpty()) {
+            es.filter { it.enabled }
+                .minByOrNull { BellTimes.nextStart(listOf(it.window)) ?: Long.MAX_VALUE }
+                ?.let { loadIntoEditor(it.window) }
+            handledResume = resumeTick
+        }
+    }
 
     Card {
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -472,14 +500,23 @@ private fun BellTimesCard(
                     Text("(über Nacht)", style = MaterialTheme.typography.bodySmall)
                 }
             }
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                Fmt.DAY_LABELS.forEachIndexed { day, label ->
-                    FilterChip(
-                        selected = day in days,
-                        onClick = { days = if (day in days) days - day else days + day },
-                        label = { Text(label) },
-                        enabled = ready,
-                    )
+            // Alle 7 Tage in EINER Zeile: gleich breite Chips (weight), damit sie
+            // auch auf schmalen Geraeten nicht umbrechen. Bei viel Platz (Querformat)
+            // nicht ueberdehnen -> Breite deckeln und zentrieren.
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().widthIn(max = 480.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Fmt.DAY_LABELS.forEachIndexed { day, label ->
+                        DayChip(
+                            label = label,
+                            selected = day in days,
+                            enabled = ready,
+                            onClick = { days = if (day in days) days - day else days + day },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
                 }
             }
             HorizontalDivider()
@@ -491,7 +528,13 @@ private fun BellTimesCard(
                 )
                 else -> Column {
                     entries.forEach { entry ->
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                        // Tippen auf die Zeile uebernimmt sie oben in den Editor.
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable(enabled = ready) { loadIntoEditor(entry.window) },
+                        ) {
                             Text(
                                 Fmt.window(entry.window) +
                                     if (entry.enabled) "" else " (in der Shelly-App deaktiviert)",
@@ -537,6 +580,42 @@ private fun BellTimesCard(
             onDismiss = { pickEnd = false },
             onConfirm = { pickEnd = false; endMin = it },
         )
+    }
+}
+
+/** Kompakter Wochentag-Chip — schmaler als FilterChip, damit alle 7 in eine Zeile passen. */
+@Composable
+private fun DayChip(
+    label: String,
+    selected: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val scheme = MaterialTheme.colorScheme
+    val bg = if (selected && enabled) scheme.secondaryContainer else Color.Transparent
+    val fg = when {
+        !enabled -> scheme.onSurface.copy(alpha = 0.38f)
+        selected -> scheme.onSecondaryContainer
+        else -> scheme.onSurfaceVariant
+    }
+    val border = if (selected) {
+        null
+    } else {
+        BorderStroke(1.dp, scheme.outline.copy(alpha = if (enabled) 1f else 0.38f))
+    }
+    Surface(
+        onClick = onClick,
+        enabled = enabled,
+        shape = RoundedCornerShape(8.dp),
+        color = bg,
+        contentColor = fg,
+        border = border,
+        modifier = modifier.height(40.dp),
+    ) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text(label, maxLines = 1, softWrap = false, style = MaterialTheme.typography.labelMedium)
+        }
     }
 }
 
