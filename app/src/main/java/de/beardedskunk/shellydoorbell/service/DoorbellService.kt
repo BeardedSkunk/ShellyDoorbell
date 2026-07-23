@@ -183,7 +183,7 @@ class DoorbellService : Service() {
         client = ShellyClient(scope, ip, wifi, password) { ipStr, forced ->
             if (!forced && homeZone.status.value == HomeStatus.OUTSIDE) {
                 GateDecision.Block(
-                    ConnectionState.OtherNetwork("Unterwegs – Klingel wird nicht gesucht."),
+                    ConnectionState.OtherNetwork(getString(R.string.notif_away)),
                     HOME_OUTSIDE_RECHECK_MS,
                 )
             } else {
@@ -1318,12 +1318,11 @@ class DoorbellService : Service() {
         }
         ConnectionState.Connecting ->
             NotifView(NotifColor.GREY, false, getString(R.string.notif_connecting))
-        ConnectionState.NoWifi ->
-            if (home == HomeStatus.INSIDE) {
-                NotifView(NotifColor.RED, false, getString(R.string.notif_home_no_wifi))
-            } else {
-                NotifView(NotifColor.GREY, false, getString(R.string.notif_no_wifi))
-            }
+        ConnectionState.NoWifi -> when (home) {
+            HomeStatus.INSIDE -> NotifView(NotifColor.RED, false, getString(R.string.notif_home_no_wifi))
+            HomeStatus.OUTSIDE -> NotifView(NotifColor.GREY, false, getString(R.string.notif_away))
+            HomeStatus.UNKNOWN -> NotifView(NotifColor.GREY, false, getString(R.string.notif_no_wifi))
+        }
         is ConnectionState.OtherNetwork ->
             NotifView(NotifColor.GREY, false, state.detail)
     }

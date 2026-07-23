@@ -642,8 +642,8 @@ private fun TimePickerDialog(initialMin: Int, onDismiss: () -> Unit, onConfirm: 
 private fun EventsCard(onHistory: () -> Unit) {
     val context = LocalContext.current
     val dao = remember { AppDb.get(context).ringDao() }
-    val since = remember { System.currentTimeMillis() / 1000 - 24 * 3600 }
-    val recent by dao.recent(since, 5).collectAsState(initial = emptyList())
+    // Immer die letzten 3 Ereignisse – egal wie lange sie zurueckliegen.
+    val recent by dao.recent(0, 3).collectAsState(initial = emptyList())
 
     Card {
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -657,7 +657,7 @@ private fun EventsCard(onHistory: () -> Unit) {
             }
             if (recent.isEmpty()) {
                 Text(
-                    "In den letzten 24 Stunden hat es nicht geklingelt.",
+                    "Es hat noch nicht geklingelt.",
                     style = MaterialTheme.typography.bodyMedium,
                 )
             } else {
