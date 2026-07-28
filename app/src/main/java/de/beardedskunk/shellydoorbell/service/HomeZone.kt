@@ -234,15 +234,22 @@ class HomeZone(
         val lat = homeLat ?: return HomeStatus.UNKNOWN
         val lon = homeLon ?: return HomeStatus.UNKNOWN
         if (!hasPermission() || !locationEnabled()) return HomeStatus.UNKNOWN
-        // ZUERST der aktuelle Aufenthalt: genauester Fix aus den letzten 5 min.
-        // Alte Fixes duerfen hier nicht mitbieten — sonst gewinnt der punktgenaue
-        // GPS-Fix von heute morgen zu Hause (5 m) gegen den groben, aber richtigen
-        // Netz-Fix aus dem Fremd-WLAN (50 m), und die App haelt sich stundenlang
-        // fuer daheim.
-        bestRecent(OUTSIDE_FRESH_MS)?.let { return statusOf(it, lat, lon, allowOutside = true) }
-        // Kein frischer Fix (Handy liegt still, Doze, Ortung gerade zickig): auf den
-        // letzten genauen Fix zurueckfallen — aber nur, um „zu Hause" zu bestaetigen.
-        // Ein alter Fix darf nie zur Blockade fuehren.
+        // Drei Stufen, jede mit ihrem eigenen Altersfenster — sie beantworten
+        // verschiedene Fragen und brauchen deshalb verschiedene Schwellen.
+        //
+        // 1. Wo bin ich JETZT? Der genaueste Fix der letzten Minuten entscheidet
+        //    allein. Aeltere duerfen nicht mitbieten, sonst gewinnt der punktgenaue
+        //    GPS-Fix von heute morgen zu Hause (5 m) gegen den groben, aber
+        //    richtigen Netz-Fix aus dem Fremd-WLAN (50 m).
+        bestRecent(DECIDE_FRESH_MS)?.let { return statusOf(it, lat, lon, allowOutside = true) }
+        // 2. Nichts Frisches (Handy liegt still, Doze, Ortung zickt): ein etwas
+        //    aelterer Fix darf weiter blockieren. Sonst kippte eine erkannte
+        //    Auswaertsfahrt schon nach wenigen ruhigen Minuten zurueck und die App
+        //    suchte die Klingel wieder im Fremdnetz.
+        bestRecent(OUTSIDE_MAX_AGE_MS)?.let { return statusOf(it, lat, lon, allowOutside = true) }
+        // 3. Gar nichts Aktuelles mehr: auf den letzten genauen Fix zurueckfallen —
+        //    aber nur, um „zu Hause" zu bestaetigen. So alt darf nichts mehr
+        //    blockieren, sonst verpassen wir die Klingel.
         bestRecent(INSIDE_MAX_AGE_MS)?.let { return statusOf(it, lat, lon, allowOutside = false) }
         return HomeStatus.UNKNOWN
     }
@@ -297,11 +304,16 @@ class HomeZone(
         /** Zum LERNEN muss der Fix aktuell sein. */
         private const val LEARN_MAX_AGE_MS = 5 * 60_000L
 
-        /** „Sicher weg" (und damit Blockade) nur mit frischem Fix. Zugleich das
-         *  Fenster, in dem ein Fix allein ueber den Aufenthalt entscheidet: kurz
-         *  gehalten, damit der genaue Fix von daheim nach dem Losfahren nicht
-         *  laenger gegen den aktuellen (groberen) vor Ort gewinnt. */
-        private const val OUTSIDE_FRESH_MS = 5 * 60_000L
+        /** Fenster, in dem ein Fix ALLEIN ueber den Aufenthalt entscheidet. Kurz
+         *  gehalten, damit der genaue Fix von daheim nach dem Losfahren nicht noch
+         *  lange gegen den aktuellen (groberen) vor Ort gewinnt. */
+        private const val DECIDE_FRESH_MS = 5 * 60_000L
+
+        /** So alt darf ein Fix hoechstens sein, um „sicher unterwegs" zu behaupten
+         *  (und damit Verbindungsversuche zu blockieren). Laenger als
+         *  [DECIDE_FRESH_MS], damit eine erkannte Auswaertsfahrt ruhige Minuten
+         *  ohne neue Fixes uebersteht. */
+        private const val OUTSIDE_MAX_AGE_MS = 15 * 60_000L
 
         /** Standort-Updates: auch im Stand regelmaessig (minDistance 0), damit der
          *  gecachte Fix nicht veraltet und die Homezone nicht „vergessen" wird. */
