@@ -76,11 +76,20 @@ object BellTimes {
     private fun timespec(minuteOfDay: Int, cronDays: Collection<Int>): String =
         "0 ${minuteOfDay % 60} ${minuteOfDay / 60} * * ${cronDays.sorted().joinToString(",")}"
 
+    /** Laeuft gerade mindestens eines der [windows]? */
+    fun insideNow(windows: List<BellWindow>, now: LocalDateTime = LocalDateTime.now()): Boolean =
+        windows.any { it.isInsideNow(now) }
+
     /**
      * Naechster kuenftiger Fensterbeginn ueber alle [windows] als Unix-Sekunden —
      * also der Zeitpunkt, zu dem die Klingel ausserhalb aller Fenster wieder
      * angeht. null, wenn keine Fenster vorhanden sind (dann ist die Klingel
      * ohnehin immer an) oder keins in den naechsten 7 Tagen beginnt.
+     *
+     * ACHTUNG: nur AUSSERHALB aller Fenster ist das auch der Zeitpunkt, zu dem
+     * die Klingel wieder angeht. Innerhalb eines Fensters ueberspringt die
+     * Suche den bereits begonnenen Beginn und liefert den von morgen — als
+     * "Ruhe bis" waere das grob falsch (siehe [insideNow]).
      */
     fun nextStart(windows: List<BellWindow>, now: LocalDateTime = LocalDateTime.now()): Long? {
         var best: LocalDateTime? = null

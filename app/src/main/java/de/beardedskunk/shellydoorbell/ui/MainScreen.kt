@@ -324,9 +324,13 @@ private fun BellCard(
     val windows = bellTimes.orEmpty().filter { it.enabled }.map { it.window }
     val nextStart = remember(bellTimes) { BellTimes.nextStart(windows) }
     // Zeitpunkt, zu dem die abgeschaltete Klingel automatisch wieder angeht.
+    // Innerhalb einer laufenden Klingelzeit gibt es keinen: dort gehoert die
+    // Klingel laut Zeitplan ohnehin an, ein Aus ist also von Hand gemacht —
+    // nextStart waere der Beginn von morgen und als „Ruhe bis" irrefuehrend.
     val reactivateTs: Long? = when {
         muteActive -> muteUntil
         onAtActive -> onAt
+        BellTimes.insideNow(windows) -> null
         windows.isNotEmpty() -> nextStart
         else -> null
     }

@@ -262,6 +262,10 @@ class DoorbellService : Service() {
             // Notification postet nur bei echter Aenderung neu.
             while (true) {
                 delay(msToNextMinute())
+                // Vor dem Neubau den Schalterzustand nachziehen, wenn gerade eine
+                // Fenstergrenze passiert wurde — sonst baut die Anzeige auf einem
+                // veralteten _bellOn auf (siehe catchUpBellState).
+                catchUpBellState()
                 updateServiceNotification(currentNotifView())
             }
         }
@@ -295,14 +299,34 @@ class DoorbellService : Service() {
         scope.launch {
             // Bleibt das 30-s-Lebenszeichen des Scripts aus, obwohl die Verbindung
             // steht, gilt das Script als nicht laufend.
+            var probedStale = false
             while (true) {
                 delay(30_000)
                 val last = lastHeartbeatMs
-                if (last != 0L &&
+                val stale = last != 0L &&
                     client.state.value is ConnectionState.Connected &&
                     SystemClock.elapsedRealtime() - last > STALE_MS
-                ) {
+                if (stale) {
                     _scriptOk.value = false
+                    // Kein Lebenszeichen mehr, aber die Verbindung gilt als offen:
+                    // entweder steht das Script, oder der Socket ist eine Leiche
+                    // (Doze). In beiden Faellen ist alles, was uns der Shelly von
+                    // sich aus melden wuerde — vor allem der Schalterzustand, den
+                    // ein anderes Geraet umgelegt haben kann — womoeglich veraltet.
+                    // EINMAL je Stille-Phase nachfragen: das holt den echten Stand
+                    // und laesst einen toten Socket auffliegen (Transportfehler ->
+                    // der Client verbindet neu). Nicht wiederholt, damit ein wirklich
+                    // gestopptes Script keinen Dauer-Poll auf dem schwachen Shelly
+                    // ausloest.
+                    if (!probedStale && !listenOnly.value && initialLoadDone.value &&
+                        client.rateLimitedForMs() <= 0
+                    ) {
+                        probedStale = true
+                        Log.i(TAG, "Kein Heartbeat seit >${STALE_MS / 1000}s – Zustand einmal aktiv nachfragen")
+                        runCatching { pollStatus() }
+                    }
+                } else {
+                    probedStale = false
                 }
             }
         }
@@ -894,6 +918,39 @@ class DoorbellService : Service() {
     private fun msToNextMinute(): Long =
         (60_000L - System.currentTimeMillis() % 60_000L).coerceIn(1_000L, 60_000L)
 
+    /** Zuletzt vom Zeitplan erwarteter Schalterzustand, null = noch unbekannt. */
+    private var lastExpectedOn: Boolean? = null
+
+    /**
+     * Der Shelly schaltet an den Fenstergrenzen selbst — die Meldung darueber
+     * (NotifyStatus) erreicht uns aber nur, wenn die Verbindung in dem Moment
+     * wirklich lebt. Schlief das Handy (Doze), ist [_bellOn] danach veraltet:
+     * die Klingel ging um 7:00 an, die Anzeige glaubt weiter "aus" — und der
+     * naechste Fensterbeginn ist dann schon der von morgen.
+     *
+     * Deshalb einmal je Fenstergrenze (genauer: sobald der laut Zeitplan
+     * erwartete Zustand kippt und nicht zum gemeldeten passt) den echten
+     * Schalterzustand holen. Ein von Hand abgeschalteter Trafo pollt hier
+     * NICHT dauerhaft mit — der erwartete Zustand kippt ja nur an der Grenze.
+     */
+    private suspend fun catchUpBellState() {
+        // Ohne geladene Klingelzeiten waere "erwartet" geraten -> abwarten.
+        if (_bellTimes.value == null) {
+            lastExpectedOn = null
+            return
+        }
+        val expected = expectedBellOn()
+        val previous = lastExpectedOn
+        lastExpectedOn = expected
+        if (previous == null || previous == expected) return
+        if (_bellOn.value == expected) return
+        if (listenOnly.value || !initialLoadDone.value) return
+        if (client.state.value !is ConnectionState.Connected) return
+        if (client.rateLimitedForMs() > 0) return
+        Log.i(TAG, "Fenstergrenze: erwartet ${if (expected) "EIN" else "AUS"}, gemeldet ${_bellOn.value} – Zustand nachziehen")
+        runCatching { pollStatus() }
+    }
+
     // Manueller „Neu verbinden"-Knopf: soll auch aus einem pausierten Zustand
     // (Fremdnetz/Greylist) heraus einen echten Versuch erzwingen.
     fun reconnect() = client.forceAttempt()
@@ -1219,17 +1276,24 @@ class DoorbellService : Service() {
         }
     }
 
-    private suspend fun alignBell() {
-        // Der Nutzer hat gerade bewusst an Klingelzeiten oder Ruhe gedreht:
-        // Schalter sofort auf den erwarteten Zustand bringen. Ein laufender
-        // temporaerer Schaltpunkt haelt die Klingel AUS und hat Vorrang ("Ruhe
-        // bis" wie "Einschalten um" bis zum jeweiligen Zeitpunkt); sonst:
-        // innerhalb eines Fensters -> an, ausserhalb -> aus; ohne Klingelzeiten
-        // gehoert die Klingel an.
+    /**
+     * Schalterzustand, den Klingelzeiten und temporaere Schaltpunkte gerade
+     * vorsehen. Ein laufender temporaerer Schaltpunkt haelt die Klingel AUS und
+     * hat Vorrang ("Ruhe bis" wie "Einschalten um" bis zum jeweiligen
+     * Zeitpunkt); sonst: innerhalb eines Fensters -> an, ausserhalb -> aus;
+     * ohne Klingelzeiten gehoert die Klingel an.
+     */
+    private fun expectedBellOn(): Boolean {
         val nowS = System.currentTimeMillis() / 1000
         val tempOff = (_muteUntil.value ?: 0) > nowS || (_onAt.value ?: 0) > nowS
         val windows = _bellTimes.value.orEmpty().filter { it.enabled }
-        val expectedOn = !tempOff && (windows.isEmpty() || windows.any { it.window.isInsideNow() })
+        return !tempOff && (windows.isEmpty() || windows.any { it.window.isInsideNow() })
+    }
+
+    private suspend fun alignBell() {
+        // Der Nutzer hat gerade bewusst an Klingelzeiten oder Ruhe gedreht:
+        // Schalter sofort auf den erwarteten Zustand bringen.
+        val expectedOn = expectedBellOn()
         if (_bellOn.value != expectedOn) {
             client.call("Switch.Set", JSONObject().put("id", 0).put("on", expectedOn))
         }
@@ -1429,6 +1493,13 @@ class DoorbellService : Service() {
                 val reactivateTs: Long? = when {
                     muted -> muteUntil
                     onAtPending -> onAt
+                    // Laeuft gerade eine Klingelzeit, gehoert die Klingel laut
+                    // Zeitplan AN — dieses Aus hat kein geplantes Ende (von Hand
+                    // abgeschaltet) oder unser Schalterzustand ist veraltet. Der
+                    // naechste Fensterbeginn liegt dann schon MORGEN; ihn als
+                    // „Ruhe bis" zu melden, war der Grund, warum die Notification
+                    // um 7:05 „Ruhe bis morgen 07:00" behauptete.
+                    BellTimes.insideNow(windows) -> null
                     windows.isNotEmpty() -> BellTimes.nextStart(windows)
                     else -> null
                 }
