@@ -90,8 +90,10 @@ class DoorbellService : Service() {
     private lateinit var wifiGate: WifiGate
     private lateinit var homeZone: HomeZone
 
-    /** true, sobald die Dauer-Notification mit dem FGS-Typ location laeuft
-     *  (Standort-Berechtigung war beim Start vorhanden). */
+    /** true, sobald die Dauer-Notification mit dem FGS-Typ location laeuft.
+     *  false heisst: Berechtigung fehlt ODER das System hat den Typ beim Start
+     *  abgelehnt (Dienst kam aus dem Hintergrund) – dann nachholen, sobald die
+     *  UI sichtbar wird (siehe setUiVisible). */
     @Volatile private var locationFgsActive = false
 
     private val ip = MutableStateFlow("")
@@ -1427,16 +1429,40 @@ class DoorbellService : Service() {
         lastPostedView = view
         val notification = buildServiceNotification(view)
         val hasLoc = homeZone.hasPermission()
-        if (Build.VERSION.SDK_INT >= 34) {
-            // FGS-Typ location nur mit erteilter Standort-Berechtigung ergaenzen –
-            // sonst wirft startForeground eine SecurityException.
-            var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            if (hasLoc) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
-            startForeground(NOTIF_ID_SERVICE, notification, type)
-        } else {
+        if (Build.VERSION.SDK_INT < 34) {
             startForeground(NOTIF_ID_SERVICE, notification)
+            locationFgsActive = hasLoc
+            return
         }
-        locationFgsActive = hasLoc
+        // FGS-Typ location nur mit erteilter Standort-Berechtigung ergaenzen –
+        // sonst wirft startForeground eine SecurityException. Die erteilte
+        // Berechtigung allein genuegt aber NICHT: ist sie „nur waehrend der
+        // Nutzung" erteilt (kein ACCESS_BACKGROUND_LOCATION), verlangt Android 14+
+        // zusaetzlich, dass die App gerade im Vordergrund ist. Startet der Dienst
+        // aus dem Hintergrund (Boot, App-Update via MY_PACKAGE_REPLACED, Neustart
+        // des Dienstes durch das System), lehnt es den Typ ab. Das laesst sich
+        // nicht sicher vorhersagen – checkSelfPermission sieht nur die Erteilung,
+        // nicht den App-Op-Zustand. Also versuchen und notfalls ohne den Typ
+        // weiterlaufen; setUiVisible hebt ihn nach, sobald die UI aufgeht.
+        val base = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        if (hasLoc) {
+            try {
+                startForeground(
+                    NOTIF_ID_SERVICE,
+                    notification,
+                    base or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
+                )
+                locationFgsActive = true
+                return
+            } catch (e: SecurityException) {
+                // Der Dienst ist hier noch NICHT im Vordergrund (das System prueft
+                // den Typ, bevor es ihn hochstuft) – der zweite Versuch unten ist
+                // also noetig, sonst stirbt der Dienst an einer ANR/Timeout.
+                Log.i(TAG, "FGS-Typ location abgelehnt (App nicht im Vordergrund?), starte ohne: ${e.message}")
+            }
+        }
+        startForeground(NOTIF_ID_SERVICE, notification, base)
+        locationFgsActive = false
     }
 
     private fun buildServiceNotification(view: NotifView): Notification {
