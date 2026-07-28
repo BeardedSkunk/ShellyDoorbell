@@ -270,9 +270,12 @@ class DoorbellService : Service() {
             }
         }
         scope.launch {
-            // Kommen wir (womoeglich) wieder nach Hause, den Reconnect-Loop wecken,
-            // damit er nicht bis zur naechsten Wiedervorlage im „Unterwegs"-Block haengt.
-            homeZone.status.collect { st -> if (st != HomeStatus.OUTSIDE) client.reconnectNow() }
+            // Jeder Ortswechsel weckt den Reconnect-Loop, damit er das Netzwerk-Tor
+            // neu befragt: nach Hause -> nicht bis zur Wiedervorlage im „Unterwegs"-
+            // Block haengen bleiben; und umgekehrt beim Wegfahren sofort auf
+            // „Unterwegs" umschalten, statt bis zu 30 min weiter „Verbinde …" zu
+            // zeigen und die Klingel in einem fremden Netz zu suchen.
+            homeZone.status.collect { client.reconnectNow() }
         }
         scope.launch {
             client.connectedEvents.collect {
@@ -459,7 +462,18 @@ class DoorbellService : Service() {
             }
 
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                ssid = readSsid(caps)
+                val newSsid = readSsid(caps)
+                // WLAN-Wechsel ist der staerkste Hinweis, dass wir woanders sind:
+                // frische Messung anstossen, sonst entscheidet die Homezone weiter
+                // mit dem alten (genauen) Fix von daheim und die App sucht die
+                // Klingel im Fremdnetz.
+                if (newSsid != ssid) {
+                    ssid = newSsid
+                    homeZone.start()
+                    homeZone.requestFreshFix()
+                } else {
+                    ssid = newSsid
+                }
                 wifiGate.onNetwork(ssid, ipv4, prefix)
             }
 
@@ -894,6 +908,10 @@ class DoorbellService : Service() {
             // Updates starten und die Dauer-Notification ggf. auf den FGS-Typ
             // location heben (sonst kaeme der Dienst im Hintergrund nicht an den Ort).
             homeZone.start()
+            // Wer die App aufmacht, weil die Anzeige nicht stimmt, soll damit auch
+            // etwas erreichen: neue Standortmessung anstossen. start() allein tut
+            // das nicht, es laeuft ja schon.
+            homeZone.requestFreshFix()
             if (localAlarmEnabled && homeZone.hasPermission() && !locationFgsActive) {
                 startForegroundCompat(currentNotifView())
             }

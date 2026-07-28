@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Looper
 import android.os.SystemClock
@@ -55,6 +56,9 @@ class HomeZone(
 
     /** true = beim Verbinden war kein Fix da; der naechste Fix lernt die Homezone. */
     @Volatile private var pendingLearn = false
+
+    /** Letzte Einzelmessung (elapsedRealtime) — bremst dichte Anfragen. */
+    @Volatile private var lastFixRequestMs = 0L
 
     private val _status = MutableStateFlow(HomeStatus.UNKNOWN)
     val status: StateFlow<HomeStatus> = _status
@@ -177,16 +181,35 @@ class HomeZone(
             .minByOrNull { if (it.hasAccuracy()) it.accuracy else Float.MAX_VALUE }
     }
 
-    /** Einmalig einen frischen Fix anstossen (z. B. wenn das WLAN wegfaellt und wir
-     *  klaeren wollen, ob wir zu Hause sind). Best effort, aktualisiert [last]. */
+    /**
+     * Einmalig einen frischen Fix anstossen (WLAN-Wechsel, WLAN-Verlust, App wird
+     * sichtbar): genau dann steht die Frage „bin ich noch daheim?" neu. Best
+     * effort, aktualisiert [last] und damit den Status.
+     *
+     * Auf API 30+ ueber getCurrentLocation — das erzwingt wirklich eine neue
+     * Messung; das alte requestSingleUpdate liefert auch gern nur den Cache.
+     */
     fun requestFreshFix() {
         val m = lm ?: return
         if (!hasPermission() || !locationEnabled()) return
+        // Die Aufrufer koennen dicht aufeinander folgen (WLAN-Wechsel + Connect).
+        val nowMs = SystemClock.elapsedRealtime()
+        if (nowMs - lastFixRequestMs < FRESH_FIX_MIN_GAP_MS) return
+        lastFixRequestMs = nowMs
+        val ps = providers()
         runCatching {
-            for (p in providers()) {
-                m.requestSingleUpdate(p, listenerOf(), Looper.getMainLooper())
+            for (p in ps) {
+                if (Build.VERSION.SDK_INT >= 30) {
+                    m.getCurrentLocation(p, null, context.mainExecutor) { loc ->
+                        loc?.let { onLocation(it) }
+                    }
+                } else {
+                    @Suppress("DEPRECATION")
+                    m.requestSingleUpdate(p, listenerOf(), Looper.getMainLooper())
+                }
             }
-        }
+            Log.i(TAG, "frischen Standort angefordert (${ps.joinToString()})")
+        }.onFailure { Log.w(TAG, "frischer Standort nicht angefordert: ${it.message}") }
     }
 
     /** LocationListener mit expliziten Overrides (auf API 29 sind die Methoden
@@ -211,25 +234,37 @@ class HomeZone(
         val lat = homeLat ?: return HomeStatus.UNKNOWN
         val lon = homeLon ?: return HomeStatus.UNKNOWN
         if (!hasPermission() || !locationEnabled()) return HomeStatus.UNKNOWN
-        // Genauesten Fix bis 12 h heranziehen (stehendes Handy liefert kaum neue
-        // Updates -> ein alter, aber genauer Fix im Umkreis heisst weiterhin daheim).
-        val loc = bestRecent(INSIDE_MAX_AGE_MS) ?: return HomeStatus.UNKNOWN
+        // ZUERST der aktuelle Aufenthalt: genauester Fix aus dem FRISCHEN Fenster.
+        // Alte Fixes duerfen hier nicht mitbieten — sonst gewinnt der punktgenaue
+        // GPS-Fix von heute morgen zu Hause (5 m) gegen den groben, aber richtigen
+        // Netz-Fix aus dem Fremd-WLAN (50 m), und die App haelt sich stundenlang
+        // fuer daheim.
+        bestRecent(OUTSIDE_FRESH_MS)?.let { return statusOf(it, lat, lon, allowOutside = true) }
+        // Kein frischer Fix (Handy liegt still, Doze, Ortung gerade zickig): auf den
+        // letzten genauen Fix zurueckfallen — aber nur, um „zu Hause" zu bestaetigen.
+        // Ein alter Fix darf nie zur Blockade fuehren.
+        bestRecent(INSIDE_MAX_AGE_MS)?.let { return statusOf(it, lat, lon, allowOutside = false) }
+        return HomeStatus.UNKNOWN
+    }
+
+    /** Bewertung EINES Fixes gegen die Homezone. */
+    private fun statusOf(loc: Location, lat: Double, lon: Double, allowOutside: Boolean): HomeStatus {
         val res = FloatArray(1)
         Location.distanceBetween(loc.latitude, loc.longitude, lat, lon, res)
         val dist = res[0]
         val acc = if (loc.hasAccuracy()) loc.accuracy else DEFAULT_ACC_M
-        val age = ageMs(loc)
-        return when {
-            // Klar zu Hause: der plausible Aufenthalt liegt im Umkreis. Bewusst
-            // GROSSZUEGIG mit dem Alter — wer daheim steht, bewegt sich nicht, also
-            // kommen keine neuen Fixes; ein alter Fix im Umkreis heisst weiterhin
-            // „zu Hause". Nur uralte Fixes (>12 h) verwerfen wir.
-            dist <= RADIUS_M + acc && age <= INSIDE_MAX_AGE_MS -> HomeStatus.INSIDE
-            // Klar weg: nur mit FRISCHEM Fix blocken (sonst verpassen wir die
-            // Klingel). Grosszuegige Marge gegen Fehlblockaden.
-            age <= OUTSIDE_FRESH_MS && dist - acc > RADIUS_M + OUTSIDE_MARGIN_M -> HomeStatus.OUTSIDE
+        val status = when {
+            // Klar zu Hause: der plausible Aufenthalt liegt im Umkreis.
+            dist <= RADIUS_M + acc -> HomeStatus.INSIDE
+            // Klar weg: nur mit frischem UND brauchbar genauem Fix blocken (sonst
+            // verpassen wir wegen eines Funkmast-Schaetzers die Klingel).
+            // Grosszuegige Marge gegen Fehlblockaden.
+            allowOutside && acc <= MAX_OUTSIDE_ACC_M && dist - acc > RADIUS_M + OUTSIDE_MARGIN_M ->
+                HomeStatus.OUTSIDE
             else -> HomeStatus.UNKNOWN
         }
+        Log.d(TAG, "Ortsbewertung: $status (Abstand ${dist.toInt()} m, Genauigkeit ${acc.toInt()} m, Alter ${ageMs(loc) / 1000}s)")
+        return status
     }
 
     companion object {
@@ -246,6 +281,11 @@ class HomeZone(
 
         /** Ohne echte Genauigkeit vorsichtig mit dieser rechnen. */
         private const val DEFAULT_ACC_M = 30f
+
+        /** So ungenaue Fixes duerfen „sicher unterwegs" nicht behaupten (Funkmast-
+         *  Schaetzer koennen um Kilometer daneben liegen, und eine Fehlblockade
+         *  kostet die Klingel). Fuer „zu Hause" sind sie weiter willkommen. */
+        private const val MAX_OUTSIDE_ACC_M = 200f
 
         /** Nur so genaue Fixes fuers Lernen der Homezone akzeptieren. */
         private const val MAX_LEARN_ACC_M = 50f
@@ -267,5 +307,8 @@ class HomeZone(
 
         /** Nachfuehr-Gewicht beim Lernen (0..1); klein = traege/stabil. */
         private const val LEARN_ALPHA = 0.25
+
+        /** Mindestabstand zwischen zwei angeforderten Einzelmessungen. */
+        private const val FRESH_FIX_MIN_GAP_MS = 20_000L
     }
 }
