@@ -1,7 +1,9 @@
 package de.beardedskunk.shellydoorbell.shelly
 
+import java.time.Duration
 import java.time.LocalDateTime
 import java.time.ZoneId
+import kotlin.math.abs
 
 /**
  * Eine Klingelzeit: ein Zeitfenster, in dem die Klingel aktiv sein soll.
@@ -66,6 +68,9 @@ object BellTimes {
 
     private const val WEEK_MIN = 7 * 1440
 
+    /** Abstand zwischen den Rangstufen von [nearness] (30 Tage in Sekunden). */
+    private const val TIER = 30L * 24 * 3600
+
     private fun isoToCron(day: Int) = (day + 1) % 7
     private fun cronToIso(day: Int) = (day + 6) % 7
 
@@ -108,6 +113,40 @@ object BellTimes {
         }
         return best?.atZone(ZoneId.systemDefault())?.toEpochSecond()
     }
+
+    /**
+     * Sortierschluessel „welche Klingelzeit ist gerade gemeint" — kleiner = passender.
+     * Reihenfolge der Rangstufen:
+     *  0. die gerade laufende Klingelzeit,
+     *  1. die heute beginnenden, die zeitlich naeher liegende zuerst (bei mehreren
+     *     Zeiten pro Tag — z. B. Mittagspause — gewinnt so die dichtere, egal ob
+     *     sie noch bevorsteht oder gerade vorbei ist),
+     *  2. alle uebrigen nach ihrem naechsten Beginn.
+     *
+     * Damit bleibt es am Freitagabend bei der Mo–Fr-Zeit und wechselt erst um
+     * Mitternacht auf die Sa–So-Zeit. [nextStart] taugt dafuer nicht: es
+     * ueberspringt den heute bereits begonnenen Beginn und liefert den von
+     * naechster Woche, wodurch am Freitag die Samstagszeit gewann.
+     */
+    fun nearness(w: BellWindow, now: LocalDateTime = LocalDateTime.now()): Long {
+        if (w.days.isEmpty()) return TIER * 3
+        if (w.isInsideNow(now)) return 0
+        val today = now.dayOfWeek.value - 1 // ISO: Montag=1 -> 0
+        if (today in w.days) {
+            val start = now.toLocalDate().atTime(w.startMin / 60, w.startMin % 60)
+            val end = start.plusMinutes(durationMin(w).toLong())
+            return TIER + minOf(absSeconds(start, now), absSeconds(end, now))
+        }
+        val next = nextStart(listOf(w), now) ?: return TIER * 3
+        return TIER * 2 + (next - now.atZone(ZoneId.systemDefault()).toEpochSecond())
+    }
+
+    /** Fensterlaenge in Minuten (Fenster ueber Mitternacht laufen in den Folgetag). */
+    private fun durationMin(w: BellWindow): Int =
+        if (w.endMin > w.startMin) w.endMin - w.startMin else 1440 - w.startMin + w.endMin
+
+    private fun absSeconds(a: LocalDateTime, b: LocalDateTime): Long =
+        abs(Duration.between(a, b).seconds)
 
     /** Timespec des Ein-Jobs (Fenster-Beginn: Klingel an). */
     fun onTimespec(w: BellWindow): String = timespec(w.startMin, w.days.map { isoToCron(it) })

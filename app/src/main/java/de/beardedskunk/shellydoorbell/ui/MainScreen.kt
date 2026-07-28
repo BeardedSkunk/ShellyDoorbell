@@ -474,14 +474,15 @@ private fun BellTimesCard(
         days = w.days
     }
 
-    // Bei frischem App-Resume den Editor mit der als naechstes geltenden
-    // Klingelzeit vorbelegen (sobald die Liste geladen ist – einmal pro Resume).
+    // Bei frischem App-Resume den Editor mit der gerade gemeinten Klingelzeit
+    // vorbelegen (sobald die Liste geladen ist – einmal pro Resume): die laufende,
+    // sonst die heute am naechsten liegende, sonst die naechste ueberhaupt.
     var handledResume by remember { mutableIntStateOf(-1) }
     LaunchedEffect(resumeTick, entries) {
         val es = entries
         if (resumeTick != handledResume && !es.isNullOrEmpty()) {
             es.filter { it.enabled }
-                .minByOrNull { BellTimes.nextStart(listOf(it.window)) ?: Long.MAX_VALUE }
+                .minByOrNull { BellTimes.nearness(it.window) }
                 ?.let { loadIntoEditor(it.window) }
             handledResume = resumeTick
         }
