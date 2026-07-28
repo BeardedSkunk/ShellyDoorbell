@@ -2,8 +2,10 @@
 
 package de.beardedskunk.shellydoorbell.ui
 
+import android.Manifest
 import android.app.NotificationManager
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.RingtoneManager
 import android.os.Build
 import android.os.PowerManager
@@ -94,6 +96,14 @@ fun SettingsScreen(
         Build.VERSION.SDK_INT < 34 || notificationManager.canUseFullScreenIntent()
     }
     val dndBypassOk = remember(resumeTick) { Channels.canBypassDnd(context) }
+    val locationOk = remember(resumeTick) {
+        context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+    val bgLocationOk = remember(resumeTick) {
+        context.checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+    }
 
     Scaffold(
         topBar = {
@@ -296,6 +306,31 @@ fun SettingsScreen(
                         context.startActivity(
                             Intent(
                                 Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                "package:${context.packageName}".toUri()
+                            )
+                        )
+                    }
+                    // Ab Android 11 laesst sich „Immer zulassen" nicht mehr per Dialog
+                    // erfragen -> hier nur der Weg in die App-Infos.
+                    PermissionRow(
+                        ok = bgLocationOk,
+                        title = if (bgLocationOk) "Standort immer erlaubt" else "Standort nur bei Nutzung",
+                        detail = when {
+                            bgLocationOk ->
+                                "Die Homezone erkennt auch nach einem Neustart, ob du daheim bist."
+                            !locationOk ->
+                                "Ohne Standort-Berechtigung bleibt die Homezone aus – " +
+                                    "Standort erlauben und danach auf „Immer zulassen“ stellen."
+                            else ->
+                                "Die Homezone arbeitet erst, wenn die App einmal offen war – nach " +
+                                    "einem Neustart des Handys also nicht. In den App-Infos: " +
+                                    "Berechtigungen → Standort → „Immer zulassen“."
+                        },
+                        buttonText = "Einstellen",
+                    ) {
+                        context.startActivity(
+                            Intent(
+                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                                 "package:${context.packageName}".toUri()
                             )
                         )

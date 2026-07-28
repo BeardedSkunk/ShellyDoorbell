@@ -21,6 +21,14 @@
     <!-- Standort (optional): Homezone lernen/erkennen. Bis Android 12 zusaetzlich
          der Weg, um die SSID lesen zu duerfen. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!-- Standort auch im Hintergrund („Immer zulassen"). Nur damit darf der
+         Dauerdienst den FGS-Typ location auch dann setzen, wenn er AUS dem
+         Hintergrund startet (Boot, App-Update). Fehlt sie, ist der Standort nur
+         „waehrend der Nutzung" erlaubt: die Homezone arbeitet dann erst, nachdem
+         die App einmal offen war, nach einem Handy-Neustart also gar nicht.
+         Muss der Nutzer in den App-Infos erteilen, ein Dialog reicht ab
+         Android 11 nicht mehr (siehe Einstellungen-Karte "Zuverlaessigkeit"). -->
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
     <uses-permission
         android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation" />

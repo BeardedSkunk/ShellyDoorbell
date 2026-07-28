@@ -78,6 +78,17 @@ class HomeZone(
         context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
             PackageManager.PERMISSION_GRANTED
 
+    /**
+     * Standort „immer zulassen"? Nur dann darf der Dauerdienst den FGS-Typ
+     * location auch setzen, wenn er aus dem Hintergrund startet (Boot,
+     * App-Update). Ohne diese Berechtigung ist der Standort nur „waehrend der
+     * Nutzung" erlaubt — hasPermission() liefert dann trotzdem true, sagt aber
+     * nichts darueber, ob der Zugriff JETZT erlaubt ist.
+     */
+    fun hasBackgroundPermission(): Boolean =
+        context.checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+
     private fun locationEnabled(): Boolean = lm?.isLocationEnabled == true
 
     private fun providers(): List<String> {
