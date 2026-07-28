@@ -255,6 +255,17 @@ class DoorbellService : Service() {
             }.distinctUntilChanged().collect { updateServiceNotification(it) }
         }
         scope.launch {
+            // Die Ruhe-Anzeige ("morgen 9:00" / naechster Fensterbeginn) ist
+            // relativ zur aktuellen Zeit. Ohne Anstoss von aussen bliebe sie ueber
+            // Mitternacht stehen ("morgen 9:00", obwohl morgen laengst heute ist).
+            // Minuetlich (an der Minutengrenze) neu aufbauen — updateService-
+            // Notification postet nur bei echter Aenderung neu.
+            while (true) {
+                delay(msToNextMinute())
+                updateServiceNotification(currentNotifView())
+            }
+        }
+        scope.launch {
             // Kommen wir (womoeglich) wieder nach Hause, den Reconnect-Loop wecken,
             // damit er nicht bis zur naechsten Wiedervorlage im „Unterwegs"-Block haengt.
             homeZone.status.collect { st -> if (st != HomeStatus.OUTSIDE) client.reconnectNow() }
@@ -867,6 +878,22 @@ class DoorbellService : Service() {
         if (!visible && !localAlarmEnabled) stopSelf()
     }
 
+    /**
+     * „App komplett beenden" aus dem Zurueck-Dialog: den Dauerdienst herunter-
+     * fahren und die Dauer-Notification entfernen. Reines Backgrounden (Home /
+     * App-Wechsel) laeuft NICHT hierueber — dort bleibt der Dienst absichtlich
+     * im Vordergrund. onDestroy schaltet fuer den naechsten Start wieder scharf.
+     */
+    fun requestFullStop() {
+        localAlarmEnabled = false
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    /** Millisekunden bis zur naechsten vollen Minute (fuer den Anzeige-Ticker). */
+    private fun msToNextMinute(): Long =
+        (60_000L - System.currentTimeMillis() % 60_000L).coerceIn(1_000L, 60_000L)
+
     // Manueller „Neu verbinden"-Knopf: soll auch aus einem pausierten Zustand
     // (Fremdnetz/Greylist) heraus einen echten Versuch erzwingen.
     fun reconnect() = client.forceAttempt()
@@ -1315,6 +1342,7 @@ class DoorbellService : Service() {
     private data class NotifView(val color: NotifColor, val dnd: Boolean, val text: String)
 
     private fun startForegroundCompat(view: NotifView = currentNotifView()) {
+        lastPostedView = view
         val notification = buildServiceNotification(view)
         val hasLoc = homeZone.hasPermission()
         if (Build.VERSION.SDK_INT >= 34) {
@@ -1380,15 +1408,24 @@ class DoorbellService : Service() {
         home: HomeStatus,
     ): NotifView = when (state) {
         is ConnectionState.Connected -> {
+            // Wahrheit ist der tatsaechliche Schalterzustand — exakt wie die
+            // Klingel-Karte (BellCard) rechnet. Schaltet der Nutzer die Klingel
+            // waehrend der Ruhe irgendwo (auch am Hardware-Taster) von Hand EIN,
+            // ist bellOn==true und die Anzeige zeigt wieder „lausche", statt
+            // stur DND zu behaupten. Ausserhalb der Klingelzeiten schaltet der
+            // Shelly selbst aus -> bellOn==false deckt das mit ab (kein separates
+            // „ausserhalb Fenster", das den manuellen Ein-Zustand ueberstimmt).
             val nowS = System.currentTimeMillis() / 1000
-            val muted = (muteUntil ?: 0L) > nowS
-            val onAtPending = (onAt ?: 0L) > nowS
-            val windows = bellTimes.orEmpty().filter { it.enabled }.map { it.window }
-            val outsideWindows = windows.isNotEmpty() && windows.none { it.isInsideNow() }
-            val quiet = muted || onAtPending || outsideWindows || bellOn == false
-            if (!quiet) {
+            val off = bellOn == false
+            if (!off) {
                 NotifView(NotifColor.BLUE, false, getString(R.string.notif_listening))
             } else {
+                val muted = (muteUntil ?: 0L) > nowS
+                val onAtPending = (onAt ?: 0L) > nowS
+                val windows = bellTimes.orEmpty().filter { it.enabled }.map { it.window }
+                // Zeitpunkt, zu dem die Klingel automatisch wieder angeht — relativ
+                // zur AKTUELLEN Zeit formatiert (siehe Minuten-Ticker in onCreate,
+                // damit „morgen 9:00" nach Mitternacht zu „9:00" wird).
                 val reactivateTs: Long? = when {
                     muted -> muteUntil
                     onAtPending -> onAt
@@ -1418,10 +1455,15 @@ class DoorbellService : Service() {
         client.state.value, _muteUntil.value, _onAt.value, _bellOn.value, _bellTimes.value, homeZone.status.value,
     )
 
+    /** Zuletzt gepostete Ansicht — verhindert unnoetiges Neu-Posten (Minuten-Ticker). */
+    @Volatile private var lastPostedView: NotifView? = null
+
     private fun updateServiceNotification(view: NotifView) {
         // Nicht im Vordergrund (Alarm lokal aus) -> notify() wuerde die gerade
         // entfernte Dauer-Notification wieder anheften
         if (!localAlarmEnabled) return
+        if (view == lastPostedView) return
+        lastPostedView = view
         runCatching {
             getSystemService(NotificationManager::class.java)
                 .notify(NOTIF_ID_SERVICE, buildServiceNotification(view))

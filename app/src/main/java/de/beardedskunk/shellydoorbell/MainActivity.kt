@@ -19,9 +19,12 @@ import androidx.core.content.IntentCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -109,6 +112,14 @@ class MainActivity : ComponentActivity() {
                         service = service.value,
                         resumeTick = resumeTick.intValue,
                         onPickRingtone = ringtonePicker::launch,
+                        // „Im Hintergrund weiterlaufen": Task in den Hintergrund, der
+                        // Dauerdienst (und seine Notification) bleiben bestehen.
+                        onRunInBackground = { moveTaskToBack(true) },
+                        // „App komplett beenden": Dienst herunterfahren + Task entfernen.
+                        onQuit = {
+                            service.value?.requestFullStop()
+                            finishAndRemoveTask()
+                        },
                     )
                 }
             }
@@ -142,8 +153,11 @@ private fun AppRoot(
     service: DoorbellService?,
     resumeTick: Int,
     onPickRingtone: (Intent) -> Unit,
+    onRunInBackground: () -> Unit,
+    onQuit: () -> Unit,
 ) {
     var screen by rememberSaveable { mutableStateOf(Screen.Main) }
+    var showExitDialog by rememberSaveable { mutableStateOf(false) }
 
     if (service == null) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -152,7 +166,24 @@ private fun AppRoot(
         return
     }
 
+    // Zurueck auf einem Unterbildschirm -> zurueck zum Hauptbildschirm.
     BackHandler(enabled = screen != Screen.Main) { screen = Screen.Main }
+    // Zurueck auf dem Hauptbildschirm -> nachfragen: Hintergrund oder beenden.
+    BackHandler(enabled = screen == Screen.Main) { showExitDialog = true }
+
+    if (showExitDialog) {
+        ExitDialog(
+            onDismiss = { showExitDialog = false },
+            onRunInBackground = {
+                showExitDialog = false
+                onRunInBackground()
+            },
+            onQuit = {
+                showExitDialog = false
+                onQuit()
+            },
+        )
+    }
 
     when (screen) {
         Screen.Main -> MainScreen(
@@ -169,4 +200,33 @@ private fun AppRoot(
             onBack = { screen = Screen.Main },
         )
     }
+}
+
+/**
+ * Zurueck-Dialog auf dem Hauptbildschirm: weiter im Hintergrund lauschen
+ * (Standard – die Klingel-Ueberwachung bleibt aktiv) oder die App komplett
+ * beenden (Dauerdienst aus, keine Klingel-Alarme mehr auf diesem Handy).
+ */
+@Composable
+private fun ExitDialog(
+    onDismiss: () -> Unit,
+    onRunInBackground: () -> Unit,
+    onQuit: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("App verlassen?") },
+        text = {
+            Text(
+                "Soll die Klingel-Überwachung im Hintergrund weiterlaufen? " +
+                    "Nur beim kompletten Beenden schlägt dieses Handy nicht mehr Alarm.",
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onRunInBackground) { Text("Im Hintergrund weiterlaufen") }
+        },
+        dismissButton = {
+            TextButton(onClick = onQuit) { Text("App beenden") }
+        },
+    )
 }

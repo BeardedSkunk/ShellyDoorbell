@@ -24,7 +24,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Notifications
-import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Warning
@@ -142,7 +141,6 @@ fun MainScreen(
                 onSetOnAt = { service.setOnAt(it) },
                 onClearOnAt = { service.clearOnAt() },
             )
-            LocalAlarmCard()
             // Klingelzeiten schreiben auf den Shelly -> im Lauschmodus ausblenden.
             if (!listenOnly) {
                 BellTimesCard(
@@ -438,47 +436,6 @@ private fun BellCard(
             title = { Text("Nicht übernommen") },
             text = { Text(warning!!) },
         )
-    }
-}
-
-/**
- * Rein lokaler Schalter: Alarm nur auf DIESEM Handy aus. Shelly, andere
- * Geraete und die History bleiben unberuehrt.
- */
-@Composable
-private fun LocalAlarmCard() {
-    val context = LocalContext.current
-    val prefs = remember { Prefs(context) }
-    val scope = rememberCoroutineScope()
-    val settings by prefs.settings.collectAsState(initial = null)
-    val enabled = settings?.alarmEnabled ?: true
-
-    Card(
-        colors = if (!enabled) {
-            CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
-        } else {
-            CardDefaults.cardColors()
-        }
-    ) {
-        Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Filled.Phone, contentDescription = null)
-            Column(Modifier.weight(1f).padding(start = 12.dp)) {
-                Text("Alarm auf diesem Handy", style = MaterialTheme.typography.titleMedium)
-                Text(
-                    if (enabled) {
-                        "Dieses Handy schlägt bei Klingeln Alarm"
-                    } else {
-                        "Stumm – Lausch-Dienst pausiert, andere Geräte klingeln weiter"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-            Switch(
-                checked = enabled,
-                onCheckedChange = { on -> scope.launch { prefs.setAlarmEnabled(on) } },
-                enabled = settings != null,
-            )
-        }
     }
 }
 
