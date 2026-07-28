@@ -234,7 +234,7 @@ class HomeZone(
         val lat = homeLat ?: return HomeStatus.UNKNOWN
         val lon = homeLon ?: return HomeStatus.UNKNOWN
         if (!hasPermission() || !locationEnabled()) return HomeStatus.UNKNOWN
-        // ZUERST der aktuelle Aufenthalt: genauester Fix aus dem FRISCHEN Fenster.
+        // ZUERST der aktuelle Aufenthalt: genauester Fix aus den letzten 5 min.
         // Alte Fixes duerfen hier nicht mitbieten — sonst gewinnt der punktgenaue
         // GPS-Fix von heute morgen zu Hause (5 m) gegen den groben, aber richtigen
         // Netz-Fix aus dem Fremd-WLAN (50 m), und die App haelt sich stundenlang
@@ -297,8 +297,11 @@ class HomeZone(
         /** Zum LERNEN muss der Fix aktuell sein. */
         private const val LEARN_MAX_AGE_MS = 5 * 60_000L
 
-        /** „Sicher weg" (und damit Blockade) nur mit frischem Fix. */
-        private const val OUTSIDE_FRESH_MS = 15 * 60_000L
+        /** „Sicher weg" (und damit Blockade) nur mit frischem Fix. Zugleich das
+         *  Fenster, in dem ein Fix allein ueber den Aufenthalt entscheidet: kurz
+         *  gehalten, damit der genaue Fix von daheim nach dem Losfahren nicht
+         *  laenger gegen den aktuellen (groberen) vor Ort gewinnt. */
+        private const val OUTSIDE_FRESH_MS = 5 * 60_000L
 
         /** Standort-Updates: auch im Stand regelmaessig (minDistance 0), damit der
          *  gecachte Fix nicht veraltet und die Homezone nicht „vergessen" wird. */
