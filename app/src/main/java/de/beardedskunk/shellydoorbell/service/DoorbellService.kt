@@ -21,6 +21,7 @@ import android.os.IBinder
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.Person
 import androidx.core.content.ContextCompat
 import de.beardedskunk.shellydoorbell.AlarmActivity
 import de.beardedskunk.shellydoorbell.Channels
@@ -29,6 +30,7 @@ import de.beardedskunk.shellydoorbell.MainActivity
 import de.beardedskunk.shellydoorbell.OpenDoorActivity
 import de.beardedskunk.shellydoorbell.R
 import de.beardedskunk.shellydoorbell.data.AppDb
+import de.beardedskunk.shellydoorbell.data.EventLog
 import de.beardedskunk.shellydoorbell.data.Prefs
 import de.beardedskunk.shellydoorbell.data.RingDao
 import de.beardedskunk.shellydoorbell.data.RingEvent
@@ -89,6 +91,7 @@ class DoorbellService : Service() {
     private lateinit var client: ShellyClient
     private lateinit var wifiGate: WifiGate
     private lateinit var homeZone: HomeZone
+    private lateinit var events: EventLog
 
     /** true, sobald die Dauer-Notification mit dem FGS-Typ location laeuft.
      *  false heisst: Berechtigung fehlt ODER das System hat den Typ beim Start
@@ -177,6 +180,7 @@ class DoorbellService : Service() {
         prefs = Prefs(this)
         dao = AppDb.get(this).ringDao()
         alarm = AlarmController(this, scope)
+        events = EventLog(filesDir)
         wifiGate = WifiGate(prefs, scope)
         homeZone = HomeZone(this, prefs, scope)
         runBlocking {
@@ -203,6 +207,10 @@ class DoorbellService : Service() {
         // dann ohne Dauer-Notification (und er beendet sich, wenn die UI zugeht).
         val initial = runBlocking { prefs.settings.first() }
         Log.i(TAG, "onCreate: ip=${initial.ip}, lauschmodus=${initial.listenOnly}, lokalerAlarm=${initial.alarmEnabled}")
+        events.log(
+            "Dienst gestartet (ip=${initial.ip}, lauschmodus=${initial.listenOnly}, " +
+                "lokalerAlarm=${initial.alarmEnabled})",
+        )
         ip.value = initial.ip
         password.value = initial.password
         alarmUri = initial.alarmUri
@@ -240,6 +248,22 @@ class DoorbellService : Service() {
                     is ConnectionState.OtherNetwork -> "anderes Netz (${it.detail})"
                 }
                 Log.d(TAG, "Verbindungszustand: $label")
+                events.log("Verbindung: $label")
+            }
+        }
+        scope.launch {
+            // Lebenszeichen ins Protokoll: eine Luecke darin heisst, dass der
+            // Dienst gar nicht lief (vom System beendet, Handy aus). Ohne diese
+            // Zeilen liesse sich "es war ruhig" nicht von "die App war weg"
+            // unterscheiden — beides sieht im Protokoll sonst gleich aus.
+            while (true) {
+                delay(EventLog.ALIVE_MINUTES * 60_000L)
+                val hbAgo = if (lastHeartbeatMs == 0L) "nie" else
+                    "${(SystemClock.elapsedRealtime() - lastHeartbeatMs) / 1000}s"
+                events.log(
+                    "laeuft (verbindung=${client.state.value::class.simpleName}, " +
+                        "letztesLebenszeichenVomScript=$hbAgo)",
+                )
             }
         }
         scope.launch {
@@ -396,7 +420,12 @@ class DoorbellService : Service() {
                 }
             }
         }
-        scope.launch { alarm.active.collect { if (!it) cancelRingNotification() } }
+        scope.launch {
+            alarm.active.collect {
+                events.log(if (it) "Alarm laeuft" else "Alarm aus")
+                if (!it) cancelRingNotification()
+            }
+        }
         scope.launch {
             // lokale History auf ~1 Jahr begrenzen
             dao.prune(System.currentTimeMillis() / 1000 - PRUNE_AFTER_S)
@@ -430,6 +459,7 @@ class DoorbellService : Service() {
         networkCallback?.let {
             runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
         }
+        events.log("Dienst beendet")
         homeZone.stop()
         alarm.release()
         // Anstaendig vom Shelly abmelden (Verbindungs-Slot sofort frei), dann alle
@@ -799,6 +829,7 @@ class DoorbellService : Service() {
         // Ohne NTP-Zeit schickt das Script einen Mini-Timestamp -> Handy-Zeit nehmen
         val ts = data?.optLong("ts", 0L)?.takeIf { it > MIN_VALID_TS } ?: nowS
         Log.i(TAG, "Klingel-Event (ts=$ts, lokalerAlarm=$localAlarmEnabled)")
+        events.log("Klingel-Ereignis empfangen (lokalerAlarm=$localAlarmEnabled)")
         scope.launch { recordProvisional(ts) }
         // Lokal stummgeschaltet: Ereignis landet trotzdem in der History
         if (localAlarmEnabled) startAlarm()
@@ -878,25 +909,47 @@ class DoorbellService : Service() {
             Intent(this, DoorbellService::class.java).setAction(ACTION_STOP_ALARM),
             PendingIntent.FLAG_IMMUTABLE
         )
+        // "Annehmen" = zur Tuersprecher-App springen (dort sieht und hoert man,
+        // wer geklingelt hat) — der Alarm wird dabei gestoppt. Ist sie nicht
+        // installiert, fuehrt Annehmen auf den Vollbild-Alarm der App selbst.
+        val answerPi = if (DoorIntents.doorIntent(this) != null) {
+            PendingIntent.getActivity(
+                this, 3,
+                Intent(this, OpenDoorActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                PendingIntent.FLAG_IMMUTABLE
+            )
+        } else {
+            fullScreenPi
+        }
+        // Als EINGEHENDER ANRUF melden, nicht als gewoehnliche Benachrichtigung:
+        // Ein Klingeln an der Tuer ist genau das — man nimmt an und spricht mit
+        // dem Besuch. Praktisch entscheidend ist, dass Android Anrufe anders
+        // behandelt: sie werden ganz oben einsortiert und bleiben als auffaelliges
+        // Banner stehen, AUCH waehrend man das Handy gerade benutzt. Vorher blieb
+        // in dem Fall nur eine stille graue Zeile in der Leiste uebrig, weil der
+        // Vollbild-Alarm systemseitig nur bei dunklem/gesperrtem Bildschirm
+        // startet und der Alarmkanal bewusst lautlos ist (den Ton macht der
+        // Dienst selbst, siehe AlarmController).
+        //
+        // Die Beschriftung der beiden Knoepfe gibt das System vor (Annehmen /
+        // Ablehnen) — eigene Texte sind bei CallStyle nicht vorgesehen.
+        val caller = Person.Builder()
+            .setName(getString(R.string.notif_ring_caller))
+            .setImportant(true)
+            .build()
         val builder = NotificationCompat.Builder(this, Channels.alarmChannelId(this))
             .setSmallIcon(R.drawable.ic_stat_bell)
             .setContentTitle(getString(R.string.notif_ring_title))
             .setContentText(getString(R.string.notif_ring_text))
             .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            // Bleibt noetig: unter Android 12 faellt CallStyle auf eine normale
+            // Benachrichtigung zurueck, und der Vollbild-Alarm ueber dem
+            // Sperrbildschirm haengt ohnehin hieran. Ausserdem ist er die
+            // Voraussetzung dafuer, dass CallStyle nicht herabgestuft wird.
             .setFullScreenIntent(fullScreenPi, true)
             .setOngoing(true)
-            .addAction(0, getString(R.string.notif_ring_stop), stopPi)
-        // Ist die Tuersprecher-App installiert: direkt zur Tuerkamera springen
-        // (stoppt den Alarm gleich mit). Ohne die App fehlt der Button einfach.
-        if (DoorIntents.doorIntent(this) != null) {
-            val doorPi = PendingIntent.getActivity(
-                this, 3,
-                Intent(this, OpenDoorActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                PendingIntent.FLAG_IMMUTABLE
-            )
-            builder.addAction(0, getString(R.string.notif_ring_door), doorPi)
-        }
+            .setStyle(NotificationCompat.CallStyle.forIncomingCall(caller, stopPi, answerPi))
         runCatching { getSystemService(NotificationManager::class.java).notify(NOTIF_ID_RING, builder.build()) }
     }
 

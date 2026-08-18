@@ -17,4 +17,6 @@
     <string name="notif_ring_text">Jemand ist an der Tür.</string>
     <string name="notif_ring_stop">Stopp</string>
     <string name="notif_ring_door">🚪 Tür ansehen</string>
+    <!-- Name des "Anrufers" in der Anruf-Benachrichtigung (CallStyle) -->
+    <string name="notif_ring_caller">Haustür</string>
 </resources>
