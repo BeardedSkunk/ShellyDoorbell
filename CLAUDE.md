@@ -206,11 +206,13 @@ einfach der Button.
 
 ## Aktueller Stand
 
-Branch `main`, sauberer Baum, HEAD 2026-07-28, 38 Commits. `versionName` 1.1.0, Script-Version 6.
+Branch `main`, HEAD 2026-08-18, 41 Commits. `versionName` 1.1.0, Script-Version 6.
 
-Zuletzt gebaut: Homezone (Lernen, drei Altersfenster, Hintergrund-Berechtigung), die Dauer-
-Notification mit Zustandsfarben und Minuten-Ticker, „Einschalten um" als Gegenstück zu „Ruhe bis",
-die Anmelde-Beschleunigung aus der 429-Analyse und die Türsprecher-Anbindung.
+Zuletzt: das Klingeln meldet sich als eingehender Anruf, dazu ein dauerhaftes Ereignis-Protokoll
+(neu: `data/EventLog.kt`), und der Alarmton kommt sofort statt nach viereinhalb Sekunden. Davor
+Homezone (Lernen, drei Altersfenster, Hintergrund-Berechtigung), die Dauer-Notification mit
+Zustandsfarben und Minuten-Ticker, „Einschalten um" als Gegenstück zu „Ruhe bis", die
+Anmelde-Beschleunigung aus der 429-Analyse und die Türsprecher-Anbindung.
 
 Bekannte Grenze ohne Lösung in der App: die flakige Erst-Auth dieses Pixel 8 (siehe oben) — nur
 abgemildert, nicht behoben. Die ausführlichen `AUTHDBG`-Logs sind für die Feld-Diagnose absichtlich
