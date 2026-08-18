@@ -1,0 +1,217 @@
+# ShellyDoorbell — Entwickler-Einstieg für Claude-Sessions
+
+Zwei Deploy-Artefakte aus einem Repo: eine **Android-App** (`app/`) und ein **mJS-Script fürs
+Shelly-Gerät** (`shelly/doorbell.js`). Ein Shelly Plug M Gen3 versorgt den Klingeltrafo und misst
+dessen Wirkleistung; steigt sie, meldet das Script das per WebSocket an alle Handys im Haus, die
+einen Dauer-Alarm über den Wecker-Stream spielen. Funktionsweise aus Nutzersicht: `README.md`.
+
+Diese Datei ist eine **Landkarte**: wo etwas steht, warum es so gebaut ist, und was einen sonst in
+die Falle laufen lässt. Der Code ist dicht kommentiert — er erklärt das Wie. **Gehen Datei und Code
+auseinander, gilt der Code**, und die Datei gehört korrigiert.
+
+## Bauen, Testen, Deployen
+
+```bash
+JAVA_HOME="/c/Program Files/Android/Android Studio1/jbr" ./gradlew :app:assembleDebug
+JAVA_HOME="/c/Program Files/Android/Android Studio1/jbr" ./gradlew assembleRelease
+adb install app/build/outputs/apk/release/app-release.apk
+```
+
+- **Der JDK-Pfad in `gradle.properties` ist falsch für diesen Rechner** (`Android Studio` ohne `1`).
+  Die eingecheckte Datei **nicht** anpassen — pro Aufruf übersteuern, notfalls zusätzlich mit
+  `-Dorg.gradle.java.home=…`. Das Repo liegt auf mehreren Maschinen.
+- Toolchain: AGP 9.0.1, Gradle 9.1.0, Kotlin 2.3.20 (+ KSP für Room), compileSdk/targetSdk 36,
+  minSdk 29, JVM-Target 17. Klassische DSL (`android.builtInKotlin=false`, `android.newDsl=false`),
+  `kotlin.incremental=false` wegen des Virenscanners.
+- **Es gibt keine Tests.** `app/src/test/` existiert nicht, `junit` ist nur deklariert. Kein Lint-
+  oder Format-Gate. Verifikation heißt hier: kompilieren, aufs Gerät, hinschauen.
+- **Das Release-APK ist bewusst mit dem Debug-Key signiert**, damit es ohne eigenen Keystore per USB
+  auf die Haushaltsgeräte kommt. `local.properties` mit `sdk.dir=…` wird lokal gebraucht.
+- **`.serena/` ist hier gitignored** (anders als in HomeShare). Die Serena-Memories
+  (`mem:core`, `tech_stack`, `suggested_commands`, `conventions`, `task_completion`) existieren nur
+  lokal auf diesem Rechner — sie sind eine zusätzliche Quelle, aber kein Backup.
+
+## Geräte
+
+- **Shelly Plug M Gen3** am Klingeltrafo, Default-IP `192.168.178.20` (in den App-Einstellungen
+  änderbar). Nicht zu verwechseln mit dem Plug am Balkonkraftwerk aus dem ShellyPower-Projekt.
+- **F101** (`192.168.178.2:5555`) = Standard-Testgerät.
+- **Pixel 8 Pro** = Alltagsgerät des Nutzers — und zugleich das Gerät mit der flakigen Erst-Auth
+  (siehe unten). Nur fertige Stände draufspielen.
+- **Armor 8** ist gerootet und war das Messgerät für die `tcpdump`-Analyse der Digest-Auth.
+- Matter muss auf dem Shelly **aus** sein, sonst läuft auf Gen3 kein Scripting. NTP muss gehen.
+
+## Die zwei Hälften
+
+**Das Script ist die Erkennungs-Wahrheit.** Es misst `switch:0 / apower`, erkennt Klingeln über
+Schwelle + Sperrzeit und broadcastet an alle verbundenen Clients. Die App entscheidet nichts über
+das Klingeln — sie hört zu und schlägt Alarm.
+
+**Die Handys verbinden sich ZUM Shelly** (`ws://<ip>/rpc`), nie umgekehrt. Jede App hält per
+Foreground-Service eine dauerhafte WebSocket-Verbindung, gebunden ans WLAN-`Network` (SocketFactory
++ DNS) — **Mobilfunk wird nie benutzt**. Idle sind das ~ein Ping alle 25 s.
+
+**Script-Single-Source:** `shelly/doorbell.js` wird von `CopyDoorbellScriptTask`
+(`app/build.gradle.kts`) als Asset gebündelt — **nie ein Duplikat unter `app/src/main/assets/`
+anlegen**. Die App vergleicht beim Verbinden die Version am Gerät und spielt das Script bei Bedarf
+selbst ein oder startet es neu. **Die Version steht in Zeile 1 von `doorbell.js` und MUSS bei jeder
+inhaltlichen Änderung hochgezählt werden** — sonst merkt keine App das Update.
+
+**Drei Broadcast-Kanäle** vom Script an alle Clients, alle **ohne Passwort** empfangbar:
+`doorbell` (Alarm, debounced), `doorbell_log` (abgeschlossenes Klingel-Ereignis), `doorbell_hb`
+(Lebenszeichen alle 30 s mit Versionsnummer). Der Heartbeat ist der einzige Weg, auf dem eine App
+ohne Passwort erfährt, dass und welches Script läuft — daran hängt der **Lauschmodus**.
+
+**mJS ist eine JS-Teilmenge**: kein `try/catch`, kein `split()`, kein `parseInt()`. Das Script bringt
+seine eigenen Helfer (`splitStr`, `parseDec`, `toNum`) mit. Nicht aus Vorliebe, sondern aus Not.
+
+### Gemeinsame Config = KVS auf dem Gerät
+
+Es gibt keine Konten und keine Server-Wahrheit: **der Schalterzustand des Shelly ist die Wahrheit**,
+die Einstellungen liegen im KVS des Geräts und gelten für alle. Keys einheitlich `dbell_*`
+(vollständige Tabelle im `README.md`). Nach jeder Änderung ruft die App
+`Script.Eval {code:"cfgChanged()"}`, das Script lädt neu und broadcastet `doorbell_cfg`.
+
+**KVS-Limits sind eng: max. 50 Keys à 253 Zeichen.** Der Ringpuffer nimmt davon 12 (10 Chunks à
+6 Ereignisse ≈ 60 Ereignisse). Ältere Ereignisse leben nur noch in den lokalen App-Datenbanken.
+Wer neue Keys hinzufügt, rechnet gegen dieses Budget.
+
+**Klingel-Ereignisse statt Einzeltöne**: das Script zählt jede steigende Flanke und fasst Drücke
+innerhalb von 3 Minuten zu EINEM Ereignis `{t, n, d}` zusammen — unabhängig vom Alarm-Debounce.
+Lokal in Room ist `ts` (Gruppen-Start) der Primärschlüssel, dadurch dedupliziert der KVS-Merge beim
+Reconnect von selbst. `authoritative = false` markiert einen nur aus Alarm-Events geschätzten
+Vorläufer, den der exakte Datensatz des Scripts später ersetzt.
+
+## Die Shelly-Auth — das größte Zeitgrab des Projekts
+
+**Lies `docs/shelly-429-nonce-puffer.md`, bevor du irgendetwas an `ShellyClient`/`ShellyAuth`
+anfasst.** Das Dokument ist am Gerät gemessen (eigene Python-Skripte, `tcpdump` auf einem gerooteten
+Handy) und gilt für alle Shelly-Gen2/Gen3-Projekte, nicht nur für dieses. Kurzfassung:
+
+- Der **429 hat nichts mit dem Anfrage-Volumen** und nichts mit dem oft zitierten
+  „6-Verbindungen-Limit" zu tun. Er kommt aus dem **Nonce-Ringpuffer (32 Einträge)**: eine per 401
+  ausgegebene, nie zu Ende authentifizierte Challenge bleibt als „pending" liegen und ist vor
+  Verdrängung geschützt. Läuft der Puffer voll, öffnet das Gerät ein 2-s-Throttle — und **jede
+  weitere Neuanfrage verlängert es**, man hält sich die Sperre selbst am Leben.
+- **Goldene Regel:** eine Nonce besorgen und mit `nc++` wiederverwenden. Eine neue nur bei
+  `401 stale=true`, beim ersten Connect oder bei Passwortwechsel — und die dann **sofort** zu Ende
+  authentifizieren. Deshalb ruft `runSession()` **kein** `resetAuth()` mehr; das tut nur
+  `credentialsChanged()`.
+- **Nonces sind an die WS-Verbindung gebunden.** Ein Persistieren über den Prozess-Neustart wurde
+  gebaut, gemessen und wieder verworfen — es bringt nichts, der erste Call zieht ohnehin einen 401.
+- **`MAX_AUTH_SENDS = 5` ist kein Fantasiewert.** Dieser Pixel 8 lehnt die *Erst*-Nutzung (nc=1)
+  einer frischen Nonce zu ~55 % ab — byte-korrekte Antwort, zeitunabhängig, also geräteseitig
+  unterhalb der App und **dort nicht behebbar**. Vier schnelle Wiederholungen bringen sie mit ~91 %
+  pro Verbindung durch. Wer den Wert senkt, holt sich die 30-Sekunden-Hänger zurück.
+- **Zweigeteilter Sendeabstand**: `MIN_CALL_GAP_MS = 250` solange die Nonce nicht bestätigt ist
+  (der Handshake braucht Luft, enger getaktet scheitert er häufiger), danach `POST_AUTH_GAP_MS = 120`.
+  Alle RPCs laufen strikt seriell über `callMutex`; `sendLock` hält nc-Vergabe und Sendereihenfolge
+  zusammen, sonst überholt `nc=2` die `nc=1` und das Gerät wertet das als Replay.
+- **Messfalle:** ein `Shelly.Reboot` per RPC **scheitert still, wenn das Gerät gesättigt ist** (die
+  Reboot-RPC bekommt selbst 429). „Frisches Gerät"-Messungen immer über die Uptime verifizieren.
+- Aus einem 429 erholt man sich durch **Stille** und Weiterverwenden der vorhandenen Nonce, nicht
+  durch neue Versuche. Ein Shelly-Reboot leert den Puffer sofort.
+
+## Drei Tore vor einem Verbindungsversuch
+
+Damit die App im Supermarkt-WLAN nicht sinnlos verbindet, fragt `ShellyClient` vor **jedem** Versuch
+ein Gate. Reihenfolge in `DoorbellService.onCreate`:
+
+1. **HomeZone** (`service/HomeZone.kt`): steht `OUTSIDE` fest, wird gar nicht erst versucht
+   (Wiedervorlage nach 10 min).
+2. **WifiGate** (`service/WifiGate.kt`): Subnetz-Tor ohne Berechtigung → SSID-Whitelist (dort
+   gemütlich alle 60 s) → Greylist (eine Probe je WLAN-Beitritt, dann alle 30 min). Unbekannte SSIDs
+   eskalieren 5 s → 30 min und landen nach 10 min erfolglos auf der Greylist.
+3. `forced = true` („Verbindung prüfen" / Reconnect) **überspringt beide Tore**.
+
+**Die HomeZone-Zahlen sind bewusst großzügig**, und zwar asymmetrisch: der Radius ist 80 m statt der
+gewünschten 15 m, weil stehende GPS-Fixes real 30–50 m driften. Ein Fix mit schlechterer Genauigkeit
+als 200 m darf **niemals** „sicher unterwegs" behaupten — eine Fehlblockade kostet die Klingel,
+während ein falsches „zu Hause" nur einen nutzlosen Verbindungsversuch kostet. Aus demselben Grund
+hat `computeStatus()` **drei** Altersfenster (5 min entscheidet allein, 15 min darf noch blockieren,
+12 h darf nur noch „zu Hause" bestätigen): sie beantworten verschiedene Fragen.
+
+**FGS-Typ ist `specialUse|location`.** Den Typ `location` darf der Dienst nur setzen, wenn
+`ACCESS_BACKGROUND_LOCATION` erteilt ist — sonst lehnt das System den Start aus dem Hintergrund
+(Boot, App-Update) ab und der Dienst stürzt ab. `locationFgsActive` merkt sich das und holt es nach,
+sobald die UI sichtbar wird.
+
+## Klingelzeiten, „Ruhe bis", „Einschalten um"
+
+- **Klingelzeiten sind Erlaubnisfenster**, keine Ruhezeiten: innerhalb ist die Klingel aktiv,
+  außerhalb ist der Trafo stromlos. Ohne Klingelzeiten ist sie immer an.
+- Jedes Fenster ist ein **Paar ganz normaler Shelly-Schedules** (ein/aus) — auch in der offiziellen
+  Shelly-App sichtbar und änderbar. Max. 20 Jobs am Gerät ⇒ `MAX_WINDOWS = 10`.
+- **Wochentage = Tage, an denen das Fenster BEGINNT** (Fenster über Mitternacht laufen in den
+  Folgetag). App-intern 0 = Montag, die Shelly-Oberfläche fängt beim Sonntag an — `BellTimes`
+  rechnet um (`isoToCron`/`cronToIso`).
+- Eine neue Klingelzeit, die eine bestehende **überschneidet oder auch nur berührt**, lehnt die App
+  ab: bei Berührung feuerten Aus- und Ein-Job in derselben Sekunde, die Reihenfolge wäre undefiniert.
+- **„Ruhe bis" und „Einschalten um" sind Timer im Script, keine Schedules** (`dbell_mute_until` /
+  `dbell_on_at`). Beim Ablauf schaltet das Script gemäß Klingelzeiten zurück, löscht den KVS-Key und
+  informiert alle Apps — es bleibt nichts liegen, das am nächsten Tag erneut zuschlägt. Es ist immer
+  **höchstens eines von beiden** gesetzt; ein manueller Eingriff am Gerät löscht das aktive.
+- `BellTimes.nextStart()` taugt **nur außerhalb** aller Fenster als „wann geht sie wieder an" —
+  innerhalb überspringt es den bereits begonnenen Beginn. Für „welche Klingelzeit ist gerade
+  gemeint" gibt es stattdessen `nearness()` mit seinen Rangstufen.
+
+## Source-Map (`de.beardedskunk.shellydoorbell`)
+
+| Pfad | Inhalt |
+|---|---|
+| `service/DoorbellService.kt` | Der Lausch-Service (~1650 Zeilen): hält die Verbindung, verteilt alle Zustände als Flows an die UI, spielt das Script ein, verwaltet Schedules/KVS, baut die Dauer-Notification |
+| `service/AlarmController.kt` | Dauerton auf dem Wecker-Stream + Vibration, Sicherheitsabschaltung nach 10 min |
+| `service/HomeZone.kt` / `WifiGate.kt` | die beiden Tore (siehe oben) |
+| `shelly/ShellyClient.kt` | WebSocket-RPC: Backoff, Auth-Lebensdauer, Rate-Limit, Serialisierung |
+| `shelly/ShellyAuth.kt` | Digest-Formel (`ha2` ist der feste String `dummy_method:dummy_uri`) |
+| `shelly/BellTimes.kt` | Klingelzeiten ↔ Cron-Timespecs, Überschneidungsprüfung, Rangfolge |
+| `data/Db.kt` / `Prefs.kt` | Room (lokale History) / DataStore (lokale Einstellungen, WLAN-Listen, Homezone) |
+| `ui/MainScreen.kt` | Verbindungs-, Klingel-, Klingelzeiten- und Ereignis-Karten |
+| `ui/SettingsScreen.kt` | Shelly-Zugang, Erkennung, Zuverlässigkeits-Checkliste (Berechtigungen) |
+| root | `MainActivity`, `AlarmActivity` (Vollbild über Sperrbildschirm), `OpenDoorActivity` (Trampolin), `DoorIntents`, `BootReceiver` |
+
+**Türsprecher-Anbindung** (`DoorIntents.kt`): ist `de.videoapp` installiert, zeigen Notification und
+Vollbild-Alarm zusätzlich „Tür ansehen" (Action `de.videoapp.action.OPEN_DOOR`). Braucht den
+`<queries>`-Eintrag im Manifest, sonst ist die Action ab Android 11 unsichtbar. Fehlt die App, fehlt
+einfach der Button.
+
+## Konventionen
+
+- **Deutsch** in UI-Strings und Kommentaren; Kommentarstil des Umfelds übernehmen.
+- **Kommentare in `build.gradle.kts` bewusst ASCII** (keine Umlaute) — im übrigen Kotlin-Code sind
+  Umlaute in Ordnung, im `doorbell.js` bewusst nicht.
+- Neue Dependencies über den Version-Catalog (`gradle/libs.versions.toml`), nie inline.
+- **Erst reden, dann bauen**: bei Meldungen erst Ursache + Vorschlag, Umbauten nach Absprache.
+  Rückfragen im Fließtext mit Empfehlung, nicht als Auswahl-Dialog.
+- **Fertige, verifizierte Schritte selbständig committen** — pro logischer Einheit einer, nicht alles
+  in einen Sammel-Commit. Message auf Deutsch im Stil der History: Betreff = Problem/Bereich, dann
+  Ursache und Wirkung. Mehrzeilig über `git commit -F` (PowerShell zerlegt Here-Strings).
+  **Nicht pushen** ohne Auftrag.
+
+## Fallstricke
+
+- **Script-Version vergessen hochzuzählen** = das Update kommt auf keinem Handy an. Erste Zeile.
+- **Kein Duplikat des Scripts** unter `app/src/main/assets/` anlegen — der Gradle-Task erzeugt es.
+- **Nicht parallel RPCs feuern.** Der Shelly ist schwach: parallele Calls quittiert er mit 429 und
+  sein Script bricht ab. `initialLoadDone` gated deshalb den Live-Watt-Poll, bis `onConnected`
+  komplett durch ist — sonst rennen beide gleichzeitig in die erste authentifizierte Anfrage.
+- **Max. 6 gleichzeitige RPC-Kanäle** laut Doku, aber das betrifft nur nicht-persistente HTTP-Kanäle;
+  12 gleichzeitige WebSockets liefen im Test problemlos. Web-UI und Shelly-App belegen zeitweise auch
+  welche.
+- Der Shelly misst die Leistung nur ~1× pro Sekunde — **Klingeldrücke deutlich unter einer Sekunde
+  können durchrutschen**.
+- `*.lmx` ist ein lokaler Hardlink-Workaround auf das Manifest und gitignored. Nie committen.
+- Die Verbindung ist ein **unverschlüsselter WebSocket** im Heim-WLAN (`usesCleartextTraffic`). Das
+  Shelly-Passwort schützt den Zugriff, nicht die Übertragung — so ist das Gerät gebaut.
+
+## Aktueller Stand
+
+Branch `main`, sauberer Baum, HEAD 2026-07-28, 38 Commits. `versionName` 1.1.0, Script-Version 6.
+
+Zuletzt gebaut: Homezone (Lernen, drei Altersfenster, Hintergrund-Berechtigung), die Dauer-
+Notification mit Zustandsfarben und Minuten-Ticker, „Einschalten um" als Gegenstück zu „Ruhe bis",
+die Anmelde-Beschleunigung aus der 429-Analyse und die Türsprecher-Anbindung.
+
+Bekannte Grenze ohne Lösung in der App: die flakige Erst-Auth dieses Pixel 8 (siehe oben) — nur
+abgemildert, nicht behoben. Die ausführlichen `AUTHDBG`-Logs sind für die Feld-Diagnose absichtlich
+noch drin.
