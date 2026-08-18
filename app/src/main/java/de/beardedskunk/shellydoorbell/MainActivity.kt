@@ -104,6 +104,15 @@ class MainActivity : ComponentActivity() {
         ) {
             wanted += Manifest.permission.ACCESS_FINE_LOCATION
         }
+        // Zugriff auf den gewaehlten Alarmton im MediaStore. Ohne ihn spielt der
+        // Alarm erst nach mehreren Sekunden ueber den Ringtone-Umweg (siehe
+        // AlarmController.prepare) — mit ihm sofort.
+        val audioPerm = if (Build.VERSION.SDK_INT >= 33) {
+            Manifest.permission.READ_MEDIA_AUDIO
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        if (checkSelfPermission(audioPerm) != PackageManager.PERMISSION_GRANTED) wanted += audioPerm
         if (wanted.isNotEmpty()) permissions.launch(wanted.toTypedArray())
         setContent {
             AppTheme {

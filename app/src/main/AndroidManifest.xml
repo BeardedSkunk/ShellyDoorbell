@@ -15,6 +15,16 @@
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Gewaehlter Alarmton: die Toene des Sound-Pickers liegen im MediaStore
+         (Android/media/com.google.android.soundpicker/Alarms/). Ohne diese
+         Berechtigung darf MediaPlayer sie nicht oeffnen — der Alarm faellt dann
+         auf den langsamen Umweg ueber die Ringtone-API zurueck (mehrere Sekunden
+         Stille vor dem ersten Ton, am Geraet gemessen). Optional: wird sie
+         verweigert, greift weiterhin der Umweg. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
     <!-- WLAN-Namen (SSID) lesen, um Heim- von Fremdnetzen zu unterscheiden.
          Ab Android 13 ohne Standort (neverForLocation); darunter via Standort. -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />

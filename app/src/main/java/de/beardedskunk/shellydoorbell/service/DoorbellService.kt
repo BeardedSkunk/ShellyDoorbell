@@ -206,6 +206,7 @@ class DoorbellService : Service() {
         ip.value = initial.ip
         password.value = initial.password
         alarmUri = initial.alarmUri
+        alarm.prepare(alarmUri?.let { Uri.parse(it) })
         localAlarmEnabled = initial.alarmEnabled
         listenOnly.value = initial.listenOnly
         if (localAlarmEnabled) startForegroundCompat()
@@ -217,6 +218,8 @@ class DoorbellService : Service() {
                 ip.value = it.ip
                 password.value = it.password
                 alarmUri = it.alarmUri
+                // Tonwechsel: den neuen Ton gleich vorbereiten (siehe AlarmController.prepare).
+                alarm.prepare(alarmUri?.let { u -> Uri.parse(u) })
                 val listenChanged = listenOnly.value != it.listenOnly
                 listenOnly.value = it.listenOnly
                 setLocalAlarmEnabled(it.alarmEnabled)
@@ -428,7 +431,7 @@ class DoorbellService : Service() {
             runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
         }
         homeZone.stop()
-        alarm.stop()
+        alarm.release()
         // Anstaendig vom Shelly abmelden (Verbindungs-Slot sofort frei), dann alle
         // Coroutinen beenden.
         runCatching { client.close() }

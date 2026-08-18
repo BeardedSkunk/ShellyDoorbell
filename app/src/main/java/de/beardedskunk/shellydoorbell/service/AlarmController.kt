@@ -32,8 +32,72 @@ class AlarmController(
     private var timeoutJob: Job? = null
     private var soundJob: Job? = null
 
+    /** Wunschton, fuer den unten vorgewaermt wurde (null = noch nichts vorbereitet). */
+    @Volatile
+    private var warmFor: Uri? = null
+
+    /** Fertig geoeffneter Player — wartet nur noch auf start(). */
+    @Volatile
+    private var warmPlayer: MediaPlayer? = null
+
+    /** Fertig erzeugtes Ringtone-Objekt fuer den Umweg ueber den Systemprozess. */
+    @Volatile
+    private var warmRingtone: Ringtone? = null
+
+    private var warmJob: Job? = null
+
     private val _active = MutableStateFlow(false)
     val active: StateFlow<Boolean> = _active
+
+    /**
+     * Bereitet den Alarmton vor, damit beim Klingeln nichts mehr zu tun ist.
+     *
+     * Hintergrund (am Pixel gemessen): zwischen der Alarm-Benachrichtigung und dem
+     * ersten Ton lagen **viereinhalb Sekunden** — lange genug, dass man die
+     * Meldung wegdrueckt, bevor ueberhaupt etwas zu hoeren ist. Die Zeit ging fuer
+     * das Suchen drauf: Die Toene des Sound-Pickers liegen im MediaStore, den
+     * MediaPlayer ohne READ_MEDIA_AUDIO nicht oeffnen darf; also faellt
+     * [startSound] auf die Ringtone-API zurueck, und deren Erzeugen geht ueber den
+     * Medien-Provider. Beides passiert jetzt im Voraus (beim Dienststart, nach
+     * jedem Tonwechsel und nach jedem Alarm), das Klingeln startet nur noch.
+     *
+     * Schlaegt beides fehl, aendert sich nichts: [startSound] laeuft dann wie
+     * bisher die Kandidatenkette durch.
+     */
+    fun prepare(soundUri: Uri?) {
+        if (warmFor == soundUri && (warmPlayer != null || warmRingtone != null)) return
+        warmJob?.cancel()
+        warmJob = scope.launch {
+            dropWarm()
+            warmFor = soundUri
+            val uri = soundUri ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM) ?: return@launch
+            // Nur den WUNSCHton vorwaermen, nie einen Ersatzton: sonst gaebe der
+            // vorbereitete Standardton den Ausschlag, obwohl der Wunschton ueber
+            // die Ringtone-API sehr wohl spielbar waere (Reihenfolge in startSound).
+            warmPlayer = opened(uri)
+            // Das Ringtone-Objekt kostet den Loewenanteil der Anlaufzeit; play()
+            // selbst ist billig. Auch dann vorhalten, wenn der Player klappt —
+            // faellt der beim Starten aus, greift es ohne neue Wartezeit.
+            warmRingtone = runCatching { RingtoneManager.getRingtone(context, uri) }.getOrNull()
+        }
+    }
+
+    /** Vorgewaermtes wegwerfen (Tonwechsel, Dienstende). */
+    private fun dropWarm() {
+        warmPlayer?.let { runCatching { it.release() } }
+        warmPlayer = null
+        warmRingtone = null
+    }
+
+    /** Beim Herunterfahren des Dienstes aufraeumen. */
+    fun release() {
+        // Reihenfolge: erst stoppen (das waermt selbst wieder vor), dann den
+        // frischen Auftrag abbrechen und wegwerfen — sonst bliebe ein Player offen.
+        stop()
+        warmJob?.cancel()
+        dropWarm()
+        warmFor = null
+    }
 
     fun start(soundUri: Uri?) {
         timeoutJob?.cancel()
@@ -62,6 +126,9 @@ class AlarmController(
         vibrator?.cancel()
         vibrator = null
         _active.value = false
+        // Fuers naechste Klingeln gleich wieder vorwaermen (der eben verbrauchte
+        // Player/Ringtone ist weg). Kostet nichts, wenn schon etwas bereitliegt.
+        prepare(warmFor)
     }
 
     private fun startSound(soundUri: Uri?) {
@@ -88,16 +155,27 @@ class AlarmController(
         .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
         .build()
 
-    private fun tryMediaPlayer(uri: Uri): Boolean {
+    /** Player fuer [uri] oeffnen und vorbereiten — ohne zu spielen (siehe [prepare]). */
+    private fun opened(uri: Uri): MediaPlayer? {
         val candidate = MediaPlayer()
         val ok = runCatching {
             candidate.setAudioAttributes(alarmAttributes())
             candidate.setDataSource(context, uri)
             candidate.isLooping = true
             candidate.prepare()
-            candidate.start()
         }.isSuccess
-        if (ok) {
+        if (ok) return candidate
+        candidate.release()
+        return null
+    }
+
+    private fun tryMediaPlayer(uri: Uri): Boolean {
+        // Vorgewaermten Player nehmen, wenn er zu genau diesem Ton gehoert — dann
+        // ist nur noch start() zu tun (das Oeffnen/Dekodieren ist schon erledigt).
+        val candidate = warmPlayer?.takeIf { warmFor == uri }?.also { warmPlayer = null }
+            ?: opened(uri)
+            ?: return false
+        if (runCatching { candidate.start() }.isSuccess) {
             player = candidate
             return true
         }
@@ -106,7 +184,11 @@ class AlarmController(
     }
 
     private suspend fun tryRingtone(uri: Uri): Boolean {
-        val r = runCatching { RingtoneManager.getRingtone(context, uri) }.getOrNull() ?: return false
+        // Vorgewaermtes Objekt fuer genau diesen Ton nehmen: das Erzeugen laeuft
+        // ueber den Medien-Provider und kostet den Grossteil der Anlaufzeit.
+        val r = warmRingtone?.takeIf { warmFor == uri }?.also { warmRingtone = null }
+            ?: runCatching { RingtoneManager.getRingtone(context, uri) }.getOrNull()
+            ?: return false
         // Vor dem isPlaying-Check merken, damit stop() den Ton immer erwischt
         ringtone = r
         val started = runCatching {
