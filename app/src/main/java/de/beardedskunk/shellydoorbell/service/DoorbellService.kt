@@ -191,17 +191,29 @@ class DoorbellService : Service() {
         // Ortung — wissen wir SICHER, dass wir ausserhalb der Homezone sind, gar
         // nicht erst versuchen (ausser bei „Verbindung pruefen"/Reconnect = forced).
         // Sonst wie bisher das Subnetz-/SSID-Tor (WifiGate).
+        // Reihenfolge ist Absicht: erst die kostenlosen Tore (SSID-Whitelist, Subnetz), die
+        // Ortung ganz zuletzt — und nur im mehrdeutigen Fall, also einem FREMDEN WLAN, dessen
+        // Subnetz zufaellig passt (192.168.178.x ist FRITZ!Box-Voreinstellung, das kommt bei
+        // Nachbarn und Freunden durchaus vor).
+        //
+        // Frueher wurde die Homezone ZUERST gefragt. Seit nicht mehr dauernd gemessen wird, waere
+        // das eine Falle: Ein stehengebliebenes "unterwegs" haette auch im eigenen Heim-WLAN
+        // blockiert. Siehe docs/standort-nur-wenn-noetig.md.
         client = ShellyClient(scope, ip, wifi, password) { ipStr, forced ->
-            if (!forced && homeZone.status.value == HomeStatus.OUTSIDE) {
+            val decision = wifiGate.decide(ipStr, forced)
+            if (forced || decision !is GateDecision.Attempt || wifiGate.isKnownGood()) {
+                decision
+            } else if (homeZone.verdict(wifiGate.currentSsid()) == HomeStatus.OUTSIDE) {
                 GateDecision.Block(
                     ConnectionState.OtherNetwork(getString(R.string.notif_away)),
                     HOME_OUTSIDE_RECHECK_MS,
                 )
             } else {
-                wifiGate.decide(ipStr, forced)
+                decision
             }
         }
-        homeZone.start()
+        // Kein homeZone.start() mehr: Gemessen wird nur noch dann, wenn das Tor es braucht
+        // (siehe verdict()). Frueher lief hier ein Dauerabo auf allen Providern.
 
         // Ohne lokalen Alarm laeuft der Dienst nur fuer die sichtbare UI mit —
         // dann ohne Dauer-Notification (und er beendet sich, wenn die UI zugeht).
@@ -504,8 +516,9 @@ class DoorbellService : Service() {
                 // Klingel im Fremdnetz.
                 if (newSsid != ssid) {
                     ssid = newSsid
-                    homeZone.start()
-                    homeZone.requestFreshFix()
+                    // Das alte Urteil galt fuers alte WLAN. Verworfen — gemessen wird erst,
+                    // wenn das Tor es wirklich braucht, und dann genau einmal.
+                    homeZone.onNetworkChanged(newSsid)
                 } else {
                     ssid = newSsid
                 }
@@ -521,9 +534,9 @@ class DoorbellService : Service() {
 
             override fun onLost(network: Network) {
                 if (wifi.value == network) wifi.value = null
-                // WLAN weg: frischen Standort anstossen, um „zu Hause?" (roter
-                // Hinweis) verlaesslich zu beantworten.
-                homeZone.requestFreshFix()
+                // Ohne WLAN wird ohnehin kein Verbindungsversuch unternommen — eine Messung
+                // koennte an nichts etwas aendern. Nur das Urteil verfaellt.
+                homeZone.onNetworkChanged(null)
             }
         }
         networkCallback = callback
@@ -962,14 +975,13 @@ class DoorbellService : Service() {
     fun setUiVisible(visible: Boolean) {
         uiVisible.value = visible
         if (visible) {
-            // Standort-Berechtigung koennte gerade erst erteilt worden sein:
-            // Updates starten und die Dauer-Notification ggf. auf den FGS-Typ
-            // location heben (sonst kaeme der Dienst im Hintergrund nicht an den Ort).
-            homeZone.start()
-            // Wer die App aufmacht, weil die Anzeige nicht stimmt, soll damit auch
-            // etwas erreichen: neue Standortmessung anstossen. start() allein tut
-            // das nicht, es laeuft ja schon.
-            homeZone.requestFreshFix()
+            // Wer die App aufmacht, weil die Anzeige nicht stimmt, soll damit etwas erreichen:
+            // Das Urteil verfaellt, der naechste Verbindungsversuch misst also neu — aber eben
+            // nur einmal und nur, wenn das Tor es ueberhaupt braucht.
+            homeZone.invalidate()
+            // Die Dauer-Notification ggf. auf den FGS-Typ location heben (die Berechtigung
+            // koennte gerade erst erteilt worden sein; ohne den Typ kaeme der Dienst im
+            // Hintergrund gar nicht an den Ort).
             if (localAlarmEnabled && homeZone.hasPermission() && !locationFgsActive) {
                 startForegroundCompat(currentNotifView())
             }
@@ -1029,7 +1041,13 @@ class DoorbellService : Service() {
 
     // Manueller „Neu verbinden"-Knopf: soll auch aus einem pausierten Zustand
     // (Fremdnetz/Greylist) heraus einen echten Versuch erzwingen.
-    fun reconnect() = client.forceAttempt()
+    fun reconnect() {
+        // Der Nutzer erwartet hier etwas: Urteil verwerfen, damit ein stehengebliebenes
+        // "unterwegs" den Versuch nicht still abwuergt. forceAttempt() ueberspringt die Tore
+        // ohnehin — das hier wirkt fuer die Versuche DANACH.
+        homeZone.invalidate()
+        client.forceAttempt()
+    }
 
     /**
      * Übernimmt IP/Passwort sofort in die laufende Verbindung, ohne auf den

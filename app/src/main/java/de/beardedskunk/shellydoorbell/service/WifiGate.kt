@@ -81,6 +81,21 @@ class WifiGate(private val prefs: Prefs, private val scope: CoroutineScope) {
     }
 
     /** Vor jedem Verbindungsversuch aufgerufen (siehe ShellyClient). */
+    /** Netzname des aktuellen WLANs (null = unbekannt/keine Berechtigung). */
+    fun currentSsid(): String? = ssid
+
+    /**
+     * Ist dieses WLAN nachweislich eines, in dem die Klingel erreichbar war?
+     *
+     * Das ist die **Heimnetz-Erkennung ohne Ortung**: Die Whitelist fuellt sich von selbst, sobald
+     * eine Verbindung zustande kam ([onConnected]). Wer hier true bekommt, braucht keinen Standort
+     * mehr — die SSID beantwortet die Frage bereits.
+     */
+    fun isKnownGood(): Boolean {
+        val s = ssid ?: return false
+        return synchronized(lock) { whitelist.contains(s) }
+    }
+
     fun decide(shellyIp: String, forced: Boolean): GateDecision {
         if (forced) return GateDecision.Attempt(WHITELIST_MAX_MS)
 

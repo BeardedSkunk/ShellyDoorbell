@@ -99,22 +99,87 @@ class HomeZone(
         }
     }
 
-    /** Standort-Updates starten (idempotent). Nur mit Berechtigung + aktiver Ortung. */
-    fun start() {
-        if (listener != null) return
-        val m = lm ?: return
-        if (!hasPermission() || !locationEnabled()) return
-        val l = listenerOf()
-        listener = l
-        runCatching {
-            for (p in providers()) m.getLastKnownLocation(p)?.let { onLocation(it) }
-            for (p in providers()) {
-                m.requestLocationUpdates(p, UPDATE_MIN_TIME_MS, UPDATE_MIN_DIST_M, l, Looper.getMainLooper())
-            }
-            Log.i(TAG, "Standort-Updates aktiv (${providers().joinToString()}), letzter=${last != null}")
-        }.onFailure { Log.w(TAG, "Standort-Updates nicht gestartet: ${it.message}") }
+    /**
+     * WLAN, für das das aktuelle Urteil gilt — und zugleich die Merkmarke „hier wurde schon
+     * gemessen". Ein anderer Netzname macht das Urteil ungültig (siehe [onNetworkChanged]).
+     */
+    @Volatile
+    private var judgedSsid: String? = null
+
+    /**
+     * Urteil für dieses WLAN — und **die einzige Stelle, die eine Messung auslöst**.
+     *
+     * Gemessen wird höchstens **einmal je WLAN-Beitritt**, nicht periodisch. Der Netzwechsel ist
+     * der bessere Auslöser als jede Uhr: Solange die SSID gleich bleibt, hat das Gerät das Netz
+     * nicht gewechselt — und nach Hause zu kommen heißt zwangsläufig, dass sie wechselt. Ein Timer
+     * könnte dagegen nur zu früh feuern (unnötige Ortung) oder zu spät (verpasste Klingel).
+     *
+     * Liefert [HomeStatus.UNKNOWN], solange nichts entschieden ist. Der Aufrufer blockiert dann
+     * **nicht**: Ein Verbindungsversuch ist billig, eine verpasste Klingel nicht.
+     */
+    fun verdict(ssid: String?): HomeStatus {
+        if (!hasPermission() || !locationEnabled()) return HomeStatus.UNKNOWN
+        // Ohne gelernte Homezone gibt es nichts zu vergleichen — dann gar nicht erst messen.
+        if (homeLat == null || homeLon == null) return HomeStatus.UNKNOWN
+        if (judgedSsid != ssid) {
+            // Marke sofort setzen, nicht erst im Rückruf: Sonst liefe bei jedem
+            // Verbindungsversuch eine neue Messung an, wenn die Ortung gerade nichts liefert.
+            judgedSsid = ssid
+            measureOnce()
+        }
+        return _status.value
     }
 
+    /** Netzwechsel: Das Urteil galt für das alte WLAN und ist damit hinfällig. */
+    fun onNetworkChanged(ssid: String?) {
+        if (judgedSsid == ssid) return
+        judgedSsid = null
+        if (_status.value != HomeStatus.UNKNOWN) {
+            _status.value = HomeStatus.UNKNOWN
+            Log.i(TAG, "WLAN gewechselt -> Ortsurteil verworfen")
+        }
+    }
+
+    /**
+     * Urteil verwerfen, ohne dass sich das Netz geändert hat — für die Momente, in denen der
+     * Nutzer selbst etwas erwartet: App geöffnet, „Neu verbinden" gedrückt.
+     */
+    fun invalidate() {
+        judgedSsid = null
+    }
+
+    /**
+     * **Eine** Messung, kein Abo.
+     *
+     * Vorher lief hier `requestLocationUpdates` auf allen Providern mit zwei Minuten Takt,
+     * dauerhaft — am Gerät gemessen sechseinhalb Tage am Stück und 6861 Ortungen, davon die
+     * Hälfte über GPS mit `HIGH_ACCURACY`. Das war die Ursache des dauerhaften blauen Punktes in
+     * der Statusleiste (siehe docs/standort-nur-wenn-noetig.md).
+     *
+     * Für die Frage „bin ich Kilometer weg?" genügt der **Netz**-Provider. GPS kostet Strom und
+     * ist drinnen ohnehin schwach; es wird nur angefragt, wenn es das Netz gar nicht gibt.
+     */
+    private fun measureOnce() {
+        val m = lm ?: return
+        val ps = providers()
+        // Erst der billige Weg: ein schon vorhandener Fix reicht oft und kostet gar nichts.
+        for (p in ps) runCatching { m.getLastKnownLocation(p) }.getOrNull()?.let { onLocation(it) }
+        val provider = ps.firstOrNull { it == LocationManager.NETWORK_PROVIDER } ?: ps.firstOrNull()
+        if (provider == null) return
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 30) {
+                m.getCurrentLocation(provider, null, context.mainExecutor) { loc ->
+                    loc?.let { onLocation(it) }
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                m.requestSingleUpdate(provider, listenerOf(), Looper.getMainLooper())
+            }
+            Log.i(TAG, "Einzelmessung angefordert ($provider)")
+        }.onFailure { Log.w(TAG, "Einzelmessung nicht moeglich: ${it.message}") }
+    }
+
+    /** Nur noch fürs Aufräumen beim Dienstende — ein laufendes Abo gibt es nicht mehr. */
     fun stop() {
         listener?.let { l -> runCatching { lm?.removeUpdates(l) } }
         listener = null
@@ -138,11 +203,18 @@ class HomeZone(
             Log.i(TAG, "recordConnected: keine Berechtigung/Ortung -> nichts lernen")
             return
         }
-        start() // falls die Berechtigung erst nach onCreate erteilt wurde
-        // Bis ein hinreichend genauer Fix gelernt wurde, auf weitere Fixes warten.
+        // Die Verbindung IST der Beweis, dass wir daheim sind — genauer als jedes GPS. Ein
+        // stehendes „unterwegs" kann damit nur falsch sein; dann muss die Zone neu gelernt werden.
+        val contradicts = _status.value == HomeStatus.OUTSIDE
+        _status.value = HomeStatus.INSIDE
+        judgedSsid = null
+        // Ein Haus bewegt sich nicht: Ist die Zone schon gelernt, wird hier NICHT gemessen.
+        // Genau das lief bisher bei jeder Verbindung und hielt die Ortung dauerhaft wach.
+        if (homeLat != null && homeLon != null && !contradicts) return
+        Log.i(TAG, if (contradicts) "verbunden trotz \"unterwegs\" -> Homezone neu lernen" else "Homezone noch nicht gelernt")
         pendingLearn = true
-        requestFreshFix() // genauen (GPS-)Fix anstossen
-        bestRecent(LEARN_MAX_AGE_MS)?.let { learnHome(it) } // ggf. sofort lernen
+        requestFreshFix() // hier lohnt der genaue (GPS-)Fix, er passiert nur einmal
+        bestRecent(LEARN_MAX_AGE_MS)?.let { learnHome(it) }
     }
 
     /** Homezone auf [fix] setzen bzw. leicht nachfuehren (wenn genau genug). */
@@ -325,11 +397,6 @@ class HomeZone(
          *  [DECIDE_FRESH_MS], damit eine erkannte Auswaertsfahrt ruhige Minuten
          *  ohne neue Fixes uebersteht. */
         private const val OUTSIDE_MAX_AGE_MS = 15 * 60_000L
-
-        /** Standort-Updates: auch im Stand regelmaessig (minDistance 0), damit der
-         *  gecachte Fix nicht veraltet und die Homezone nicht „vergessen" wird. */
-        private const val UPDATE_MIN_TIME_MS = 120_000L
-        private const val UPDATE_MIN_DIST_M = 0f
 
         /** Nachfuehr-Gewicht beim Lernen (0..1); klein = traege/stabil. */
         private const val LEARN_ALPHA = 0.25
