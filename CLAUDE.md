@@ -115,14 +115,35 @@ Handy) und gilt für alle Shelly-Gen2/Gen3-Projekte, nicht nur für dieses. Kurz
 ## Drei Tore vor einem Verbindungsversuch
 
 Damit die App im Supermarkt-WLAN nicht sinnlos verbindet, fragt `ShellyClient` vor **jedem** Versuch
-ein Gate. Reihenfolge in `DoorbellService.onCreate`:
+ein Gate. Reihenfolge in `DoorbellService.onCreate` — **billig nach teuer, die Ortung ganz zuletzt**
+(seit v1.2.0 umgedreht, Begründung in `docs/standort-nur-wenn-noetig.md`):
 
-1. **HomeZone** (`service/HomeZone.kt`): steht `OUTSIDE` fest, wird gar nicht erst versucht
-   (Wiedervorlage nach 10 min).
-2. **WifiGate** (`service/WifiGate.kt`): Subnetz-Tor ohne Berechtigung → SSID-Whitelist (dort
+1. **WifiGate** (`service/WifiGate.kt`): Subnetz-Tor ohne Berechtigung → SSID-Whitelist (dort
    gemütlich alle 60 s) → Greylist (eine Probe je WLAN-Beitritt, dann alle 30 min). Unbekannte SSIDs
    eskalieren 5 s → 30 min und landen nach 10 min erfolglos auf der Greylist.
-3. `forced = true` („Verbindung prüfen" / Reconnect) **überspringt beide Tore**.
+2. **Ist die SSID in der Whitelist, wird die HomeZone gar nicht erst gefragt.** Das ist die
+   Heimnetz-Erkennung, und sie kostet nichts: `WifiGate` trägt jedes Netz automatisch ein, sobald
+   die Klingel darüber erreichbar war (`onConnected`).
+3. **HomeZone** (`service/HomeZone.kt`) nur im Rest — fremdes WLAN, dessen Subnetz zufällig passt
+   (`192.168.178.x` ist FRITZ!Box-Voreinstellung, kommt bei Nachbarn durchaus vor). Steht dort
+   `OUTSIDE`, wird nicht versucht.
+4. `forced = true` („Verbindung prüfen" / Reconnect) **überspringt alles**.
+
+**Die Reihenfolge ist der Kern.** Früher stand die HomeZone an erster Stelle. Seit nicht mehr
+dauernd gemessen wird, wäre das eine Falle: Ein stehengebliebenes „unterwegs" hätte auch im eigenen
+Heim-WLAN blockiert.
+
+**Gemessen wird höchstens einmal je WLAN-Beitritt, nie periodisch.** Der Netzwechsel ist der bessere
+Auslöser als jede Uhr — solange die SSID gleich bleibt, hat das Gerät das Netz nicht gewechselt, und
+nach Hause zu kommen heißt zwangsläufig, dass sie wechselt. Jeder Netzwechsel verwirft das Urteil;
+`invalidate()` tut dasselbe, wenn der Nutzer die App öffnet oder „Neu verbinden" drückt. **Kein
+`requestLocationUpdates` mehr** — `getCurrentLocation`, Netz-Provider statt GPS. Vorher liefen zwei
+Dauerabos alle zwei Minuten, sechseinhalb Tage am Stück, 6861 Ortungen; daher der dauerhafte blaue
+Punkt. Kontrolle: `dumpsys location | grep shellydoorbell` — eine Zeile mit `Request[` heißt, es
+läuft wieder ein Abo.
+
+Bei fehlendem Urteil wird **nicht** blockiert, sondern versucht: Ein Versuch ist billig, eine
+verpasste Klingel nicht.
 
 **Die HomeZone-Zahlen sind bewusst großzügig**, und zwar asymmetrisch: der Radius ist 80 m statt der
 gewünschten 15 m, weil stehende GPS-Fixes real 30–50 m driften. Ein Fix mit schlechterer Genauigkeit
@@ -206,7 +227,7 @@ einfach der Button.
 
 ## Aktueller Stand
 
-Branch `main`, HEAD 2026-08-18, 41 Commits. `versionName` 1.1.0, Script-Version 6.
+Branch `main`, **v1.2.0**, Script-Version 6. Auf dem Pixel installiert und geprueft: kein Standort-Abo mehr (19.08.2026).
 
 Zuletzt: das Klingeln meldet sich als eingehender Anruf, dazu ein dauerhaftes Ereignis-Protokoll
 (neu: `data/EventLog.kt`), und der Alarmton kommt sofort statt nach viereinhalb Sekunden. Davor
