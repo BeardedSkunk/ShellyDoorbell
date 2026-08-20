@@ -211,6 +211,14 @@ sobald die UI sichtbar wird.
 | `ui/SettingsScreen.kt` | Shelly-Zugang, Erkennung, Zuverlässigkeits-Checkliste (Berechtigungen) |
 | root | `MainActivity`, `AlarmActivity` (Vollbild über Sperrbildschirm), `OpenDoorActivity` (Trampolin), `DoorIntents`, `BootReceiver` |
 
+> **Der Vollbild-Alarm bleibt bei eingeschaltetem Bildschirm absichtlich aus.** Android startet die
+> Activity aus einem `setFullScreenIntent` nur, wenn der Bildschirm **gesperrt oder aus** ist; sonst
+> gibt es die Heads-up-Benachrichtigung, und das ist kein Fehler. Am 19.08. habe ich daraus
+> fälschlich geschlossen, die Berechtigung sei abgelehnt — der Schalter in den Einstellungen war
+> längst umgelegt, mein `uiautomator`-Auszug hatte nur den falschen Knoten getroffen (die
+> `checked`-Angabe kam von einem umgebenden `FrameLayout`, nicht vom `Switch`). **Zustand einer
+> Oberfläche nie aus einem gegrepten Dump behaupten — Screenshot ansehen.**
+
 **Türsprecher-Anbindung** (`DoorIntents.kt`): ist `de.videoapp` installiert, zeigen Notification und
 Vollbild-Alarm zusätzlich „Tür ansehen" (Action `de.videoapp.action.OPEN_DOOR`). Braucht den
 `<queries>`-Eintrag im Manifest, sonst ist die Action ab Android 11 unsichtbar. Fehlt die App, fehlt
