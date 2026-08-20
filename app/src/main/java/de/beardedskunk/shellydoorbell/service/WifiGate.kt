@@ -1,5 +1,6 @@
 package de.beardedskunk.shellydoorbell.service
 
+import android.net.Network
 import android.os.SystemClock
 import android.util.Log
 import de.beardedskunk.shellydoorbell.data.Prefs
@@ -28,6 +29,7 @@ import kotlinx.coroutines.launch
 class WifiGate(private val prefs: Prefs, private val scope: CoroutineScope) {
 
     @Volatile private var ssid: String? = null
+    @Volatile private var net: Network? = null
     @Volatile private var myIpv4: ByteArray? = null
     @Volatile private var prefixLen: Int = 0
 
@@ -49,11 +51,15 @@ class WifiGate(private val prefs: Prefs, private val scope: CoroutineScope) {
         }
     }
 
-    /** Aus den Netzwerk-Callbacks: aktuelle SSID (null = unbekannt/keine Berechtigung),
-     *  eigene IPv4 (4 Bytes) und Prefix-Laenge. */
-    fun onNetwork(ssid: String?, ipv4: ByteArray?, prefix: Int) {
-        val joined = ssid != this.ssid
+    /** Aus den Netzwerk-Callbacks: aktuelles [Network], SSID (null = unbekannt/keine
+     *  Berechtigung), eigene IPv4 (4 Bytes) und Prefix-Laenge. */
+    fun onNetwork(net: Network?, ssid: String?, ipv4: ByteArray?, prefix: Int) {
+        // Auch das Network zaehlt als Netzkennung: Ohne Namen (geschwaerzt/keine Berechtigung)
+        // waere ein Beitritt sonst gar nicht erkennbar und der Fehlversuchs-Timer liefe ewig
+        // vom letzten Erfolg aus weiter.
+        val joined = ssid != this.ssid || net != this.net
         this.ssid = ssid
+        this.net = net
         this.myIpv4 = ipv4
         this.prefixLen = prefix
         if (joined) {
@@ -80,10 +86,6 @@ class WifiGate(private val prefs: Prefs, private val scope: CoroutineScope) {
         }
     }
 
-    /** Vor jedem Verbindungsversuch aufgerufen (siehe ShellyClient). */
-    /** Netzname des aktuellen WLANs (null = unbekannt/keine Berechtigung). */
-    fun currentSsid(): String? = ssid
-
     /**
      * Ist dieses WLAN nachweislich eines, in dem die Klingel erreichbar war?
      *
@@ -96,6 +98,7 @@ class WifiGate(private val prefs: Prefs, private val scope: CoroutineScope) {
         return synchronized(lock) { whitelist.contains(s) }
     }
 
+    /** Vor jedem Verbindungsversuch aufgerufen (siehe ShellyClient). */
     fun decide(shellyIp: String, forced: Boolean): GateDecision {
         if (forced) return GateDecision.Attempt(WHITELIST_MAX_MS)
 
@@ -107,18 +110,27 @@ class WifiGate(private val prefs: Prefs, private val scope: CoroutineScope) {
             )
         }
 
-        // Ohne SSID (keine Berechtigung / noch unbekannt): nur Subnetz-Tor +
-        // eskalierender Backoff, keine Listen.
-        val s = ssid ?: return GateDecision.Attempt(UNKNOWN_MAX_MS)
+        // Ohne SSID (keine Berechtigung / vom System geschwaerzt) lassen sich keine Listen
+        // fuehren. Trotzdem darf die App dann nicht endlos "Verbinde ..." anzeigen: Genau so
+        // stand sie am 20.08. zwei Stunden 41 Minuten im WLAN eines Fremden. Nach derselben
+        // Frist wie bei der Greylist wird der Zustand ehrlich benannt. Die Wiedervorlage
+        // entspricht dem Backoff-Deckel — es geht also keine Probe verloren, nur der Text
+        // stimmt jetzt.
+        val s = ssid ?: return if (failingLongEnough(null)) {
+            GateDecision.Block(
+                ConnectionState.OtherNetwork("Klingel in diesem WLAN bisher nicht gefunden – seltene Prüfung."),
+                GREYLIST_RECHECK_MS,
+            )
+        } else {
+            GateDecision.Attempt(UNKNOWN_MAX_MS)
+        }
 
         synchronized(lock) {
             if (whitelist.contains(s)) return GateDecision.Attempt(WHITELIST_MAX_MS)
 
             if (!greylist.containsKey(s)) {
                 // Unbekannt: eskalierend versuchen; nach 10 min erfolglos -> Greylist.
-                val failingLongEnough =
-                    failSsid == s && SystemClock.elapsedRealtime() - failSinceMs > GREYLIST_AFTER_MS
-                if (!failingLongEnough) return GateDecision.Attempt(UNKNOWN_MAX_MS)
+                if (!failingLongEnough(s)) return GateDecision.Attempt(UNKNOWN_MAX_MS)
                 greylist[s] = 0L
                 Log.i(TAG, "SSID '$s' auf Greylist (10 min ohne Klingel)")
                 persist()
@@ -140,6 +152,11 @@ class WifiGate(private val prefs: Prefs, private val scope: CoroutineScope) {
             )
         }
     }
+
+    /** Wird auf dieser Netzkennung schon [GREYLIST_AFTER_MS] lang erfolglos versucht?
+     *  [failSinceMs] laeuft seit dem letzten WLAN-Beitritt bzw. der letzten Verbindung. */
+    private fun failingLongEnough(s: String?): Boolean =
+        failSsid == s && SystemClock.elapsedRealtime() - failSinceMs > GREYLIST_AFTER_MS
 
     private fun subnetPlausible(shellyIp: String): Boolean {
         val mine = myIpv4 ?: return true          // eigene IP unbekannt -> nicht blockieren

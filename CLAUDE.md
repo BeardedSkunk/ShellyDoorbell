@@ -134,13 +134,33 @@ dauernd gemessen wird, wäre das eine Falle: Ein stehengebliebenes „unterwegs"
 Heim-WLAN blockiert.
 
 **Gemessen wird höchstens einmal je WLAN-Beitritt, nie periodisch.** Der Netzwechsel ist der bessere
-Auslöser als jede Uhr — solange die SSID gleich bleibt, hat das Gerät das Netz nicht gewechselt, und
-nach Hause zu kommen heißt zwangsläufig, dass sie wechselt. Jeder Netzwechsel verwirft das Urteil;
+Auslöser als jede Uhr — solange dasselbe Netz steht, hat das Gerät nicht gewechselt, und nach Hause
+zu kommen heißt zwangsläufig, dass es wechselt. Jeder Netzwechsel verwirft das Urteil;
 `invalidate()` tut dasselbe, wenn der Nutzer die App öffnet oder „Neu verbinden" drückt. **Kein
 `requestLocationUpdates` mehr** — `getCurrentLocation`, Netz-Provider statt GPS. Vorher liefen zwei
 Dauerabos alle zwei Minuten, sechseinhalb Tage am Stück, 6861 Ortungen; daher der dauerhafte blaue
 Punkt. Kontrolle: `dumpsys location | grep shellydoorbell` — eine Zeile mit `Request[` heißt, es
-läuft wieder ein Abo.
+läuft wieder ein Abo (die Zahlen unter *Historical Aggregate* sind Summen von früher, kein Beleg).
+
+> **Der WLAN-Name ist geschwärzt, wenn man ihn nicht ausdrücklich anfordert.** Ab Android 12 liefert
+> `NetworkCapabilities.transportInfo` nur mit `FLAG_INCLUDE_LOCATION_INFO` einen echten Namen, sonst
+> dauerhaft `<unknown ssid>`. Ohne die Flagge waren Whitelist, Greylist **und** (nach dem Umbau vom
+> 19.08.) der Standort-Auslöser tot — die App stand am 20.08. zwei Stunden 41 Minuten auf „Verbinde
+> …" im WLAN eines Fremden. Seit v1.2.1 ist die Flagge gesetzt, und der Auslöser hängt am
+> `Network`-Objekt statt am Namen: Das gibt es bei jedem Beitritt, ohne jede Berechtigung.
+> Ganze Geschichte in `docs/standort-nur-wenn-noetig.md`, Abschnitt „Der Rückfall vom 20.08.".
+>
+> **Prüfstein am Gerät** (beweist, dass der Name ankommt — der Schlüssel fehlt sonst ganz):
+> ```
+> adb shell run-as de.beardedskunk.shellydoorbell cat files/datastore/settings.preferences_pb
+> ```
+> `wifi_whitelist` muss nach einer Verbindung daheim die eigene SSID enthalten.
+
+**`verdict()` rechnet immer neu.** `_status` ist nur ein Zwischenspeicher; die Altersfenster in
+`computeStatus()` wirken erst, wenn jemand rechnet. Dadurch **verfällt jede Fehlentscheidung von
+selbst** — das Schlimmste ist eine Verzögerung, kein Dauerzustand. Das ist die eigentliche Lehre aus
+dem 20.08.: nicht den Auslöser perfekt bauen, sondern dafür sorgen, dass ein ausgefallener Auslöser
+die App nicht dauerhaft blind macht.
 
 Bei fehlendem Urteil wird **nicht** blockiert, sondern versucht: Ein Versuch ist billig, eine
 verpasste Klingel nicht.
@@ -227,9 +247,12 @@ einfach der Button.
 
 ## Aktueller Stand
 
-Branch `main`, **v1.2.0**, Script-Version 6. Auf dem Pixel installiert und geprueft: kein Standort-Abo mehr (19.08.2026).
+Branch `main`, **v1.2.1**, Script-Version 6. Auf dem Pixel installiert und am Geraet geprueft
+(20.08.2026): kein Standort-Abo mehr, und `wifi_whitelist` enthaelt erstmals das Heim-WLAN — der
+WLAN-Name kommt also an.
 
-Zuletzt: das Klingeln meldet sich als eingehender Anruf, dazu ein dauerhaftes Ereignis-Protokoll
+Zuletzt: der Rueckfall vom 20.08. behoben (geschwaerzter WLAN-Name, siehe oben). Davor: das
+Klingeln meldet sich als eingehender Anruf, dazu ein dauerhaftes Ereignis-Protokoll
 (neu: `data/EventLog.kt`), und der Alarmton kommt sofort statt nach viereinhalb Sekunden. Davor
 Homezone (Lernen, drei Altersfenster, Hintergrund-Berechtigung), die Dauer-Notification mit
 Zustandsfarben und Minuten-Ticker, „Einschalten um" als Gegenstück zu „Ruhe bis", die

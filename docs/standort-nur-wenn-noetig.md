@@ -98,3 +98,76 @@ Heim-WLAN blockiert**. Die Reihenfolge ist deshalb umgedreht: erst die SSID, dan
 | Bekanntes WLAN, Klingel gerade nicht erreichbar | **keine** (SSID genügt) |
 | Fremdes WLAN, Subnetz passt nicht | **keine** |
 | Fremdes WLAN, Subnetz passt zufällig | **eine** Messung je Beitritt |
+
+---
+
+# Der Rückfall vom 20.08.
+
+Status: **gefunden und behoben am 20.08.2026 (v1.2.1).**
+
+Der Umbau oben war am 19.08. um 23:59 auf dem Pixel. Am nächsten Tag war der Nutzer im WLAN
+seines Vaters — und die App zeigte zwei Stunden 41 Minuten am Stück „Verbinde mit dem Shelly …",
+statt „Unterwegs" zu melden und Ruhe zu geben.
+
+## Der Beweis stand im Ereignisprotokoll
+
+`files/log/events.log` auf dem Gerät:
+
+```
+08-20 09:57:05  Verbindung: kein WLAN          ← losgefahren
+08-20 10:01:16  Verbindung: verbinde           ← WLAN des Vaters
+08-20 10:17:01  laeuft (verbindung=Connecting …)
+   … unverändert bis …
+08-20 12:42:18  Verbindung: kein WLAN
+```
+
+Am 18. und 19.08. hatte dasselbe Tor **neunmal** auf „anderes Netz" geschaltet. Am 20.08., mit dem
+neuen Stand: **kein einziges Mal.** Der Umbau war die Ursache, nicht der Zufall.
+
+## Das Signal, auf das ich gebaut hatte, gab es nicht
+
+Der neue Auslöser war „einmal messen je WLAN-Beitritt", erkannt am **Netznamen**. Seit Android 12
+schwärzt das System `WifiInfo` in `NetworkCapabilities.transportInfo`; der Name kommt nur durch,
+wenn der Callback mit `FLAG_INCLUDE_LOCATION_INFO` registriert wurde. Der fehlte. Also war der
+Name auf dem Pixel **dauerhaft `null`** — und damit:
+
+| Stelle | Wirkung bei `ssid == null` |
+|---|---|
+| `verdict(null)`, `judgedSsid` startet auf `null` | `null != null` ist falsch → **nie gemessen** |
+| `onNetworkChanged(null)` | `judgedSsid == ssid` → kehrt sofort um → Urteil nie verworfen |
+| `_status` | eingefroren auf `INSIDE` vom letzten `recordConnected()` daheim |
+| `WifiGate.decide` | ohne Namen keine Greylist → `Attempt` für immer → Zustand bleibt `Connecting` |
+
+Das Alte funktionierte trotzdem, weil das Dauerabo den Standort unabhängig vom Netznamen aktuell
+hielt. Beim Entfernen des Abos ist die stille Abhängigkeit sichtbar geworden.
+
+## Der Beleg, den ich vorher hätte sehen können
+
+In `files/datastore/settings.preferences_pb` standen `home_lat` und `home_lon` — aber **weder
+`wifi_whitelist` noch `wifi_greylist`**. Nach Wochen täglicher Verbindungen zu Hause wäre das
+Heim-WLAN längst eingetragen gewesen, wenn die App den Namen je gesehen hätte. **Die SSID-Ebene
+war nie funktionsfähig**, lange vor dem Umbau — sie fiel nur nicht auf, weil die Ortung sie deckte.
+
+> Ein Signal, auf dem eine Entscheidung ruht, muss am Gerät nachgewiesen sein — nicht im Code
+> plausibel aussehen. Der leere Whitelist-Schlüssel war der Nachweis, und er lag die ganze Zeit da.
+
+## Was jetzt anders ist
+
+1. **Der Netzname kommt an.** Der Callback wird ab Android 12 mit `FLAG_INCLUDE_LOCATION_INFO`
+   registriert (zwei Klassen, weil es den Konstruktor mit Flagge erst ab API 31 gibt). Damit leben
+   Whitelist und Greylist überhaupt zum ersten Mal — und die **kostenlose** Heimnetz-Erkennung aus
+   Stufe 2 greift wirklich.
+2. **Der Auslöser hängt nicht mehr am Namen, sondern am `Network`-Objekt.** Jeder WLAN-Beitritt
+   liefert ein neues; das braucht keine Berechtigung und kann nicht geschwärzt werden. Derselbe
+   Gedanke wie vorher, nur auf einem Signal, das es wirklich gibt.
+3. **„Noch nie gemessen" ist von „für null gemessen" getrennt** (`judged`-Flag). Genau diese
+   Vermengung war die Falle.
+4. **`verdict()` rechnet immer neu.** `_status` ist nur ein Zwischenspeicher; die Altersfenster in
+   `computeStatus()` wirken erst, wenn jemand rechnet. Damit **verfällt jede Fehlentscheidung von
+   selbst**: Das Schlimmste ist eine Verzögerung, kein Dauerzustand.
+5. **Ohne Netznamen wird nicht mehr endlos „Verbinde …" gezeigt.** Nach denselben zehn Minuten wie
+   bei der Greylist wird der Zustand ehrlich benannt. Die Wiedervorlage entspricht dem
+   Backoff-Deckel — es geht keine Probe verloren, nur der Text stimmt jetzt.
+
+Punkt 4 ist die eigentliche Lehre: Nicht „diesen Auslöser richtig bauen", sondern **dafür sorgen,
+dass ein ausgefallener Auslöser die App nicht dauerhaft blind macht.**

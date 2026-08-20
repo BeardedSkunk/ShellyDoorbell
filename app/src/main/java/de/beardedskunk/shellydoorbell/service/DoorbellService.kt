@@ -20,6 +20,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
 import android.util.Log
+import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.app.Person
 import androidx.core.content.ContextCompat
@@ -203,7 +204,7 @@ class DoorbellService : Service() {
             val decision = wifiGate.decide(ipStr, forced)
             if (forced || decision !is GateDecision.Attempt || wifiGate.isKnownGood()) {
                 decision
-            } else if (homeZone.verdict(wifiGate.currentSsid()) == HomeStatus.OUTSIDE) {
+            } else if (homeZone.verdict(wifi.value) == HomeStatus.OUTSIDE) {
                 GateDecision.Block(
                     ConnectionState.OtherNetwork(getString(R.string.notif_away)),
                     HOME_OUTSIDE_RECHECK_MS,
@@ -497,52 +498,99 @@ class DoorbellService : Service() {
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .build()
-        val callback = object : ConnectivityManager.NetworkCallback() {
-            // Letzter bekannter Stand des aktuellen WLANs -> ans WifiGate.
-            private var ssid: String? = null
-            private var ipv4: ByteArray? = null
-            private var prefix = 0
-
-            override fun onAvailable(network: Network) {
-                wifi.value = network
-                client.reconnectNow()
+        val watcher = WifiWatcher()
+        // Ab Android 12 liefert transportInfo den WLAN-Namen NUR mit dieser Flagge; ohne sie
+        // kommt dauerhaft "<unknown ssid>" an. Genau daran hingen Whitelist, Greylist und (seit
+        // dem Umbau vom 19.08.) auch der Standort-Ausloeser — alle drei waren auf dem Pixel tot,
+        // ohne dass es auffiel. Siehe docs/standort-nur-wenn-noetig.md, "Der Rueckfall vom 20.08.".
+        val callback: ConnectivityManager.NetworkCallback =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                LocatedWifiCallback(watcher)
+            } else {
+                // Vor Android 12 wird nichts geschwaerzt, da genuegt der einfache Callback.
+                PlainWifiCallback(watcher)
             }
-
-            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                val newSsid = readSsid(caps)
-                // WLAN-Wechsel ist der staerkste Hinweis, dass wir woanders sind:
-                // frische Messung anstossen, sonst entscheidet die Homezone weiter
-                // mit dem alten (genauen) Fix von daheim und die App sucht die
-                // Klingel im Fremdnetz.
-                if (newSsid != ssid) {
-                    ssid = newSsid
-                    // Das alte Urteil galt fuers alte WLAN. Verworfen — gemessen wird erst,
-                    // wenn das Tor es wirklich braucht, und dann genau einmal.
-                    homeZone.onNetworkChanged(newSsid)
-                } else {
-                    ssid = newSsid
-                }
-                wifiGate.onNetwork(ssid, ipv4, prefix)
-            }
-
-            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
-                val la = lp.linkAddresses.firstOrNull { it.address is Inet4Address }
-                ipv4 = (la?.address as? Inet4Address)?.address
-                prefix = la?.prefixLength ?: 0
-                wifiGate.onNetwork(ssid, ipv4, prefix)
-            }
-
-            override fun onLost(network: Network) {
-                if (wifi.value == network) wifi.value = null
-                // Ohne WLAN wird ohnehin kein Verbindungsversuch unternommen — eine Messung
-                // koennte an nichts etwas aendern. Nur das Urteil verfaellt.
-                homeZone.onNetworkChanged(null)
-            }
-        }
         networkCallback = callback
         // requestNetwork (statt registerNetworkCallback) haelt das WLAN aktiv,
         // auch wenn das System sonst auf Mobilfunk wechseln wuerde.
         cm.requestNetwork(request, callback)
+    }
+
+    /**
+     * Die eigentliche Auswertung der Netzwerk-Rueckrufe. Steht getrennt von den Callback-Klassen,
+     * weil es davon zwei geben muss: Den Konstruktor mit Flagge gibt es erst ab Android 12, und in
+     * Kotlin laesst sich der Super-Konstruktor nicht zur Laufzeit waehlen.
+     */
+    private inner class WifiWatcher {
+        /** Aktuelles WLAN. Jeder Beitritt liefert ein neues [Network] — das ist der
+         *  berechtigungsfreie "WLAN gewechselt"-Ausloeser fuer die Homezone. */
+        private var net: Network? = null
+        private var ssid: String? = null
+        private var ipv4: ByteArray? = null
+        private var prefix = 0
+
+        fun available(network: Network) {
+            wifi.value = network
+            if (net != network) {
+                net = network
+                // Neues Netz -> altes Ortsurteil gilt nicht mehr. Gemessen wird erst, wenn das
+                // Tor es wirklich braucht (siehe HomeZone.verdict), und dann genau einmal.
+                homeZone.onNetworkChanged(network)
+                wifiGate.onNetwork(network, ssid, ipv4, prefix)
+            }
+            client.reconnectNow()
+        }
+
+        fun capabilities(network: Network, caps: NetworkCapabilities) {
+            ssid = readSsid(caps)
+            wifiGate.onNetwork(network, ssid, ipv4, prefix)
+        }
+
+        fun linkProperties(network: Network, lp: LinkProperties) {
+            val la = lp.linkAddresses.firstOrNull { it.address is Inet4Address }
+            ipv4 = (la?.address as? Inet4Address)?.address
+            prefix = la?.prefixLength ?: 0
+            wifiGate.onNetwork(network, ssid, ipv4, prefix)
+        }
+
+        fun lost(network: Network) {
+            // Beim Wechsel A->B kann onLost(A) NACH onAvailable(B) eintreffen. Dann gehoert der
+            // Rueckruf zum alten Netz und darf den neuen Stand nicht ueberschreiben.
+            if (net != null && net != network) return
+            net = null
+            ssid = null
+            ipv4 = null
+            prefix = 0
+            if (wifi.value == network) wifi.value = null
+            // Ohne WLAN wird ohnehin kein Verbindungsversuch unternommen — eine Messung
+            // koennte an nichts etwas aendern. Nur das Urteil verfaellt.
+            homeZone.onNetworkChanged(null)
+            wifiGate.onNetwork(null, null, null, 0)
+        }
+    }
+
+    /** Vor Android 12: Standort-Infos sind noch nicht geschwaerzt. */
+    private class PlainWifiCallback(private val w: WifiWatcher) :
+        ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) = w.available(network)
+        override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
+            w.capabilities(network, caps)
+        override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) =
+            w.linkProperties(network, lp)
+        override fun onLost(network: Network) = w.lost(network)
+    }
+
+    /** Ab Android 12: nur mit FLAG_INCLUDE_LOCATION_INFO kommt der WLAN-Name durch. Die Klasse
+     *  wird auf aelteren Systemen nie geladen (siehe Verzweigung in requestWifi). */
+    @RequiresApi(Build.VERSION_CODES.S)
+    private class LocatedWifiCallback(private val w: WifiWatcher) :
+        ConnectivityManager.NetworkCallback(FLAG_INCLUDE_LOCATION_INFO) {
+        override fun onAvailable(network: Network) = w.available(network)
+        override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
+            w.capabilities(network, caps)
+        override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) =
+            w.linkProperties(network, lp)
+        override fun onLost(network: Network) = w.lost(network)
     }
 
     /** SSID aus den Netzwerk-Capabilities; null ohne Berechtigung/Info. Der Name

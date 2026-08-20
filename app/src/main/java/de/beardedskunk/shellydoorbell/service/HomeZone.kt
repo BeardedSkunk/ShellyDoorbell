@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.net.Network
 import android.os.Build
 import android.os.Bundle
 import android.os.Looper
@@ -100,40 +101,63 @@ class HomeZone(
     }
 
     /**
-     * WLAN, für das das aktuelle Urteil gilt — und zugleich die Merkmarke „hier wurde schon
-     * gemessen". Ein anderer Netzname macht das Urteil ungültig (siehe [onNetworkChanged]).
+     * Netz, für das das aktuelle Urteil gilt — zugleich die Merkmarke „hier wurde schon gemessen".
+     *
+     * Bewusst das [Network]-Objekt und **nicht der WLAN-Name**: Seit Android 12 ist der Name in
+     * `NetworkCapabilities.transportInfo` geschwärzt, solange der Callback nicht mit
+     * `FLAG_INCLUDE_LOCATION_INFO` registriert wurde — auf dem Pixel war er dauerhaft null, und ein
+     * Urteil, das an null hängt, wird nie ungültig. Genau daran ist der 20.08. gescheitert (siehe
+     * docs/standort-nur-wenn-noetig.md, „Der Rückfall vom 20.08."). Ein neues [Network] gibt es
+     * dagegen bei **jedem** WLAN-Beitritt, ganz ohne Berechtigung — das ist derselbe Auslöser, nur
+     * auf einem Signal, das es wirklich gibt.
      */
     @Volatile
-    private var judgedSsid: String? = null
+    private var judgedNet: Network? = null
 
     /**
-     * Urteil für dieses WLAN — und **die einzige Stelle, die eine Messung auslöst**.
+     * Wurde überhaupt schon gemessen? Getrennt von [judgedNet] geführt, weil null dort ein
+     * gültiger Zustand ist („kein WLAN") und nicht „noch nichts gemessen" heißen darf — sonst
+     * entsteht wieder die Falle von oben.
+     */
+    @Volatile
+    private var judged = false
+
+    /**
+     * Urteil für dieses Netz — und **die einzige Stelle, die eine Messung auslöst**.
      *
      * Gemessen wird höchstens **einmal je WLAN-Beitritt**, nicht periodisch. Der Netzwechsel ist
-     * der bessere Auslöser als jede Uhr: Solange die SSID gleich bleibt, hat das Gerät das Netz
-     * nicht gewechselt — und nach Hause zu kommen heißt zwangsläufig, dass sie wechselt. Ein Timer
+     * der bessere Auslöser als jede Uhr: Solange dasselbe [Network] steht, hat das Gerät das Netz
+     * nicht gewechselt — und nach Hause zu kommen heißt zwangsläufig, dass es wechselt. Ein Timer
      * könnte dagegen nur zu früh feuern (unnötige Ortung) oder zu spät (verpasste Klingel).
      *
      * Liefert [HomeStatus.UNKNOWN], solange nichts entschieden ist. Der Aufrufer blockiert dann
      * **nicht**: Ein Verbindungsversuch ist billig, eine verpasste Klingel nicht.
      */
-    fun verdict(ssid: String?): HomeStatus {
+    fun verdict(net: Network?): HomeStatus {
         if (!hasPermission() || !locationEnabled()) return HomeStatus.UNKNOWN
         // Ohne gelernte Homezone gibt es nichts zu vergleichen — dann gar nicht erst messen.
         if (homeLat == null || homeLon == null) return HomeStatus.UNKNOWN
-        if (judgedSsid != ssid) {
+        if (!judged || judgedNet != net) {
             // Marke sofort setzen, nicht erst im Rückruf: Sonst liefe bei jedem
             // Verbindungsversuch eine neue Messung an, wenn die Ortung gerade nichts liefert.
-            judgedSsid = ssid
+            judged = true
+            judgedNet = net
             measureOnce()
         }
+        // Immer neu bewerten, auch ohne neuen Fix. [_status] ist nur ein Zwischenspeicher; die
+        // Altersfenster in [computeStatus] wirken erst, wenn jemand rechnet. Ohne diese Zeile
+        // bliebe ein „unterwegs" stehen, dessen Fix längst zu alt zum Blockieren ist — die Klingel
+        // wäre unerreichbar, bis zufällig etwas anderes misst. So verfällt jede Fehlentscheidung
+        // von selbst: Das Schlimmste ist eine Verzögerung, kein Dauerzustand.
+        recompute()
         return _status.value
     }
 
-    /** Netzwechsel: Das Urteil galt für das alte WLAN und ist damit hinfällig. */
-    fun onNetworkChanged(ssid: String?) {
-        if (judgedSsid == ssid) return
-        judgedSsid = null
+    /** Netzwechsel: Das Urteil galt fürs alte Netz und ist damit hinfällig. */
+    fun onNetworkChanged(net: Network?) {
+        if (judged && judgedNet == net) return
+        judged = false
+        judgedNet = null
         if (_status.value != HomeStatus.UNKNOWN) {
             _status.value = HomeStatus.UNKNOWN
             Log.i(TAG, "WLAN gewechselt -> Ortsurteil verworfen")
@@ -145,7 +169,8 @@ class HomeZone(
      * Nutzer selbst etwas erwartet: App geöffnet, „Neu verbinden" gedrückt.
      */
     fun invalidate() {
-        judgedSsid = null
+        judged = false
+        judgedNet = null
     }
 
     /**
@@ -207,7 +232,8 @@ class HomeZone(
         // stehendes „unterwegs" kann damit nur falsch sein; dann muss die Zone neu gelernt werden.
         val contradicts = _status.value == HomeStatus.OUTSIDE
         _status.value = HomeStatus.INSIDE
-        judgedSsid = null
+        judged = false
+        judgedNet = null
         // Ein Haus bewegt sich nicht: Ist die Zone schon gelernt, wird hier NICHT gemessen.
         // Genau das lief bisher bei jeder Verbindung und hielt die Ortung dauerhaft wach.
         if (homeLat != null && homeLon != null && !contradicts) return
