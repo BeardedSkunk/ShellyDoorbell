@@ -153,10 +153,20 @@ class WifiGate(private val prefs: Prefs, private val scope: CoroutineScope) {
         }
     }
 
+    /**
+     * Wie lange scheitern die Verbindungsversuche im aktuellen Netz schon?
+     *
+     * Die Uhr startet bei jedem WLAN-Beitritt neu und bei jeder geglueckten Verbindung
+     * ([onConnected]). Klein heisst also: "wir sind hier gerade erst angekommen oder es lief eben
+     * noch". Der Standort-Teil des Tors haengt daran — solange es eben noch lief, ist eine Ortung
+     * sinnlos.
+     */
+    fun failingForMs(): Long = SystemClock.elapsedRealtime() - failSinceMs
+
     /** Wird auf dieser Netzkennung schon [GREYLIST_AFTER_MS] lang erfolglos versucht?
      *  [failSinceMs] laeuft seit dem letzten WLAN-Beitritt bzw. der letzten Verbindung. */
     private fun failingLongEnough(s: String?): Boolean =
-        failSsid == s && SystemClock.elapsedRealtime() - failSinceMs > GREYLIST_AFTER_MS
+        failSsid == s && failingForMs() > GREYLIST_AFTER_MS
 
     private fun subnetPlausible(shellyIp: String): Boolean {
         val mine = myIpv4 ?: return true          // eigene IP unbekannt -> nicht blockieren

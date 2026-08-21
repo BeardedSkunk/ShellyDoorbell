@@ -165,6 +165,26 @@ die App nicht dauerhaft blind macht.
 Bei fehlendem Urteil wird **nicht** blockiert, sondern versucht: Ein Versuch ist billig, eine
 verpasste Klingel nicht.
 
+**Die Ortung kommt erst dran, wenn die Versuche in diesem Netz schon `HOME_ASK_AFTER_MS` (45 s)
+scheitern.** Das WLAN des Pixel zuckt häufig („verbinde / kein WLAN / verbinde" binnen Sekunden,
+im Ereignisprotokoll gut zu sehen), und jedes Zucken liefert ein neues `Network` — ohne diese
+Schranke würde bei jedem davon gemessen. Die Whitelist-Abkürzung allein genügt nicht: Beim Beitritt
+kommt zuerst `onAvailable`, der WLAN-Name erst mit `onCapabilitiesChanged`, und in dieser Lücke ist
+`isKnownGood()` blind. Deshalb zwei Schranken statt einer. Aus demselben Grund reicht `available()`
+**keinen** WLAN-Namen ans `WifiGate` durch — ein durchgereichtes `null` würde den bekannten Namen
+für Millisekunden löschen.
+
+Steht die Verbindung, kann die Ortung ohnehin nichts beitragen — die laufende Verbindung ist der
+bessere Beweis. Zu Hause wird deshalb **nie** gemessen.
+
+**Offene, noch nicht bewiesene Spur:** Der Dienst führt den FGS-Typ `location`
+(`types=0x40000008`). Ob der allein die Standortanzeige dauerhaft leuchten lässt, ist ungeklärt —
+falls der blaue Punkt nach v1.2.2 bleibt, ist das der nächste Verdächtige. Die App hat
+`ACCESS_BACKGROUND_LOCATION`, bräuchte den Typ zum Zugriff also womöglich gar nicht.
+
+Zurückgestellt: der Zugriff **von unterwegs** über WireGuard — durchdacht, nichts gebaut, alles in
+`docs/vpn-von-unterwegs.md`.
+
 **Die HomeZone-Zahlen sind bewusst großzügig**, und zwar asymmetrisch: der Radius ist 80 m statt der
 gewünschten 15 m, weil stehende GPS-Fixes real 30–50 m driften. Ein Fix mit schlechterer Genauigkeit
 als 200 m darf **niemals** „sicher unterwegs" behaupten — eine Fehlblockade kostet die Klingel,

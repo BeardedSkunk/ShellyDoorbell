@@ -202,7 +202,18 @@ class DoorbellService : Service() {
         // blockiert. Siehe docs/standort-nur-wenn-noetig.md.
         client = ShellyClient(scope, ip, wifi, password) { ipStr, forced ->
             val decision = wifiGate.decide(ipStr, forced)
-            if (forced || decision !is GateDecision.Attempt || wifiGate.isKnownGood()) {
+            // Die Ortung kommt erst dran, wenn die Versuche in diesem Netz schon eine Weile
+            // scheitern. Sonst fragt sie bei jedem WLAN-Zucken — und Zucken gibt es reichlich
+            // (siehe Ereignisprotokoll: "verbinde / kein WLAN / verbinde" binnen Sekunden). Die
+            // Whitelist-Abkuerzung allein reicht dafuer NICHT: Beim Beitritt kommt zuerst
+            // onAvailable, der WLAN-Name erst danach — in dieser Luecke ist isKnownGood() blind.
+            // Steht die Verbindung wieder (daheim eine Sache von Sekunden), kann die Ortung
+            // ohnehin nichts beitragen; die laufende Verbindung ist der bessere Beweis.
+            if (forced ||
+                decision !is GateDecision.Attempt ||
+                wifiGate.isKnownGood() ||
+                wifiGate.failingForMs() < HOME_ASK_AFTER_MS
+            ) {
                 decision
             } else if (homeZone.verdict(wifi.value) == HomeStatus.OUTSIDE) {
                 GateDecision.Block(
@@ -536,7 +547,11 @@ class DoorbellService : Service() {
                 // Neues Netz -> altes Ortsurteil gilt nicht mehr. Gemessen wird erst, wenn das
                 // Tor es wirklich braucht (siehe HomeZone.verdict), und dann genau einmal.
                 homeZone.onNetworkChanged(network)
-                wifiGate.onNetwork(network, ssid, ipv4, prefix)
+                // Hier bewusst KEIN wifiGate.onNetwork(): Der WLAN-Name kommt erst mit
+                // onCapabilitiesChanged, und ein hier durchgereichtes null wuerde den bekannten
+                // Namen fuer ein paar Millisekunden loeschen — genau lange genug, dass die
+                // Whitelist-Abkuerzung im Tor danebengreift. Die beiden Rueckrufe unten liefern
+                // Netz und Name gemeinsam und kommen unmittelbar hinterher.
             }
             client.reconnectNow()
         }
@@ -1726,6 +1741,12 @@ class DoorbellService : Service() {
         /** „Sicher unterwegs" (ausserhalb der Homezone): erst spaeter neu bewerten.
          *  Ein Standort-/Link-Wechsel weckt den Loop ohnehin sofort. */
         private const val HOME_OUTSIDE_RECHECK_MS = 10 * 60_000L
+
+        /** So lange muessen die Versuche in einem Netz scheitern, bevor die Ortung ueberhaupt
+         *  gefragt wird. Der Backoff hat dann schon vier Versuche hinter sich (5/10/20/40 s), und
+         *  ein normaler Reconnect daheim (Sekunden) kommt hier nie an. Kuerzer -> der blaue Punkt
+         *  kommt bei jedem WLAN-Zucken zurueck; laenger -> „Unterwegs" erscheint traeger. */
+        private const val HOME_ASK_AFTER_MS = 45_000L
 
         /** Aeltere Timestamps gelten als "keine echte Uhrzeit" (Shelly ohne NTP). */
         private const val MIN_VALID_TS = 1_000_000_000L

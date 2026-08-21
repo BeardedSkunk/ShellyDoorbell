@@ -277,7 +277,16 @@ class HomeZone(
      * oft der grobe Netzwerk-Fix (100 m) — fuer 15 m Homezone unbrauchbar; der
      * genaue GPS-Fix ist minimal aelter, aber der richtige.
      */
-    private fun bestRecent(maxAgeMs: Long): Location? {
+    private fun bestRecent(maxAgeMs: Long): Location? = best(candidates(), maxAgeMs)
+
+    /**
+     * Eigener Cache plus der letzte bekannte Fix jedes Providers.
+     *
+     * Getrennt von [best], weil [computeStatus] drei Altersfenster prueft: Frueher fragte es dafuer
+     * dreimal die Provider ab, also bis zu sechs `getLastKnownLocation`-Aufrufe je Bewertung. Jeder
+     * davon ist ein Standortzugriff und laesst die Anzeige in der Statusleiste aufblitzen.
+     */
+    private fun candidates(): List<Location> {
         val cands = mutableListOf<Location>()
         last?.let { cands += it }
         lm?.let { m ->
@@ -286,9 +295,12 @@ class HomeZone(
             }
         }
         return cands
-            .filter { ageMs(it) <= maxAgeMs }
-            .minByOrNull { if (it.hasAccuracy()) it.accuracy else Float.MAX_VALUE }
     }
+
+    /** Genauester Fix aus [cands], der nicht aelter als [maxAgeMs] ist. */
+    private fun best(cands: List<Location>, maxAgeMs: Long): Location? = cands
+        .filter { ageMs(it) <= maxAgeMs }
+        .minByOrNull { if (it.hasAccuracy()) it.accuracy else Float.MAX_VALUE }
 
     /**
      * Einmalig einen frischen Fix anstossen (WLAN-Wechsel, WLAN-Verlust, App wird
@@ -350,16 +362,18 @@ class HomeZone(
         //    allein. Aeltere duerfen nicht mitbieten, sonst gewinnt der punktgenaue
         //    GPS-Fix von heute morgen zu Hause (5 m) gegen den groben, aber
         //    richtigen Netz-Fix aus dem Fremd-WLAN (50 m).
-        bestRecent(DECIDE_FRESH_MS)?.let { return statusOf(it, lat, lon, allowOutside = true) }
+        // Die Provider EINMAL fragen, dann dreimal auswerten — nicht dreimal fragen.
+        val cands = candidates()
+        best(cands, DECIDE_FRESH_MS)?.let { return statusOf(it, lat, lon, allowOutside = true) }
         // 2. Nichts Frisches (Handy liegt still, Doze, Ortung zickt): ein etwas
         //    aelterer Fix darf weiter blockieren. Sonst kippte eine erkannte
         //    Auswaertsfahrt schon nach wenigen ruhigen Minuten zurueck und die App
         //    suchte die Klingel wieder im Fremdnetz.
-        bestRecent(OUTSIDE_MAX_AGE_MS)?.let { return statusOf(it, lat, lon, allowOutside = true) }
+        best(cands, OUTSIDE_MAX_AGE_MS)?.let { return statusOf(it, lat, lon, allowOutside = true) }
         // 3. Gar nichts Aktuelles mehr: auf den letzten genauen Fix zurueckfallen —
         //    aber nur, um „zu Hause" zu bestaetigen. So alt darf nichts mehr
         //    blockieren, sonst verpassen wir die Klingel.
-        bestRecent(INSIDE_MAX_AGE_MS)?.let { return statusOf(it, lat, lon, allowOutside = false) }
+        best(cands, INSIDE_MAX_AGE_MS)?.let { return statusOf(it, lat, lon, allowOutside = false) }
         return HomeStatus.UNKNOWN
     }
 
