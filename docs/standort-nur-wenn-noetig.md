@@ -248,3 +248,44 @@ angefasst?" ist `cmd appops get <paket>` die richtige Quelle: Der Zeitstempel `t
 solange nichts passiert, und springt bei jedem Zugriff zurück. Und die Gegenprobe, die den Fall
 gelöst hat, war das **Fehlen** von Logzeilen: Wenn der Standort angefasst wird und der eigene
 Prozess dazu schweigt, war es das System.
+
+## Ursache 3: die Standort-Flagge am Netzwerk-Callback (v1.2.4)
+
+Auch ohne FGS-Typ blieben Zugriffe im Minutentakt. Die Messung mit einem Zähler in
+`onCapabilitiesChanged` löste es — **eins zu eins**:
+
+```
+05:16:02  onCapabilitiesChanged #1 (ssid=LinkBash5)   → Ortungszugriff
+05:16:24–05:16:55  keine Zustellung → Zeitstempel wächst 22s → 53s
+05:16:59  onCapabilitiesChanged #2                     → nächster Zugriff
+```
+
+**Jede Zustellung an einen Callback mit `FLAG_INCLUDE_LOCATION_INFO` ist ein Standortzugriff** —
+der WLAN-Name *ist* eine Ortsangabe, das ist genau der Grund, warum die Flagge existiert. Und
+zugestellt wird nicht nur bei Netzwechseln, sondern bei jeder Änderung der Capabilities, also etwa
+jede Minute.
+
+Am 20.08. hatte ich die Flagge eingebaut, weil ohne sie der Name geschwärzt bleibt (Ursache des
+Rückfalls vom 20.08.). Beides stimmt — der Name wird gebraucht, aber nicht dauernd.
+
+**Lösung: zwei Callbacks.**
+
+- Der **Dauer-Callback** läuft ohne Flagge. Er liefert Netz, IP und Verbindungszustand; der Name
+  kommt dort geschwärzt an. Wichtig: Ein `null` darf den bekannten Namen **nicht** überschreiben.
+- Ein **kurzlebiger zweiter Callback** mit Flagge wird bei jedem WLAN-Beitritt angemeldet und beim
+  ersten Namen sofort wieder abgemeldet (`startSsidProbe`/`stopSsidProbe`). Notbremse nach
+  `SSID_PROBE_MAX_MS` (20 s), falls gar kein Name kommt — sonst hätte man den Dauerzugriff durch
+  die Hintertür zurück.
+
+Damit kostet der Name einen Standortzugriff **je WLAN-Beitritt** statt einen je Minute.
+
+## Die drei Ursachen nebeneinander
+
+| # | Ursache | Zugriffe | behoben in |
+|---|---|---|---|
+| 1 | Messung bei jedem WLAN-Zucken | Bündel à ~30 s | v1.2.2 |
+| 2 | FGS-Typ `location` | alle paar Sekunden | v1.2.3 |
+| 3 | Standort-Flagge am Dauer-Callback | ~jede Minute | v1.2.4 |
+
+Keine davon war die Homezone selbst. Sie misst nur noch in einem fremden WLAN, dessen Subnetz
+zufällig passt, und auch dort nur einmal je Beitritt.

@@ -46,6 +46,7 @@ import de.beardedskunk.shellydoorbell.shelly.ShellyRpcException
 import de.beardedskunk.shellydoorbell.ui.Fmt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -510,17 +511,12 @@ class DoorbellService : Service() {
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .build()
         val watcher = WifiWatcher()
-        // Ab Android 12 liefert transportInfo den WLAN-Namen NUR mit dieser Flagge; ohne sie
-        // kommt dauerhaft "<unknown ssid>" an. Genau daran hingen Whitelist, Greylist und (seit
-        // dem Umbau vom 19.08.) auch der Standort-Ausloeser — alle drei waren auf dem Pixel tot,
-        // ohne dass es auffiel. Siehe docs/standort-nur-wenn-noetig.md, "Der Rueckfall vom 20.08.".
-        val callback: ConnectivityManager.NetworkCallback =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                LocatedWifiCallback(watcher)
-            } else {
-                // Vor Android 12 wird nichts geschwaerzt, da genuegt der einfache Callback.
-                PlainWifiCallback(watcher)
-            }
+        // Der Dauer-Callback laeuft bewusst OHNE FLAG_INCLUDE_LOCATION_INFO. Mit Flagge ist
+        // naemlich JEDE Zustellung ein Standortzugriff (der WLAN-Name ist eine Ortsangabe), und
+        // zugestellt wird etwa jede Minute — am Geraet gemessen eins zu eins gegen den
+        // appop-Zeitstempel. Den Namen holt stattdessen ein kurzlebiger zweiter Callback, einmal
+        // je WLAN-Beitritt (siehe WifiWatcher.startSsidProbe).
+        val callback: ConnectivityManager.NetworkCallback = PlainWifiCallback(watcher)
         networkCallback = callback
         // requestNetwork (statt registerNetworkCallback) haelt das WLAN aktiv,
         // auch wenn das System sonst auf Mobilfunk wechseln wuerde.
@@ -540,6 +536,10 @@ class DoorbellService : Service() {
         private var ipv4: ByteArray? = null
         private var prefix = 0
 
+        /** Kurzlebiger Callback mit Standort-Flagge, solange ein Name gesucht wird. */
+        private var probe: ConnectivityManager.NetworkCallback? = null
+        private var probeJob: Job? = null
+
         fun available(network: Network) {
             wifi.value = network
             if (net != network) {
@@ -552,13 +552,72 @@ class DoorbellService : Service() {
                 // Namen fuer ein paar Millisekunden loeschen — genau lange genug, dass die
                 // Whitelist-Abkuerzung im Tor danebengreift. Die beiden Rueckrufe unten liefern
                 // Netz und Name gemeinsam und kommen unmittelbar hinterher.
+                startSsidProbe()
             }
             client.reconnectNow()
         }
 
         fun capabilities(network: Network, caps: NetworkCapabilities) {
-            ssid = readSsid(caps)
+            // Ab Android 12 ist der Name in diesem (ungeflaggten) Callback geschwaerzt. Ein null
+            // darf den bereits bekannten Namen NICHT loeschen — sonst waere die
+            // Whitelist-Abkuerzung dauerhaft blind. Den Namen liefert [startSsidProbe].
+            readSsid(caps)?.let { ssid = it }
             wifiGate.onNetwork(network, ssid, ipv4, prefix)
+        }
+
+        /**
+         * **Einen** WLAN-Namen holen, dann sofort wieder abmelden.
+         *
+         * Nur ein Callback mit `FLAG_INCLUDE_LOCATION_INFO` bekommt den echten Namen — und jede
+         * Zustellung an so einen Callback ist ein Standortzugriff. Am Geraet gemessen (21.08.2026)
+         * kam etwa jede Minute eine, eins zu eins gegen den appop-Zeitstempel; das allein liess
+         * die Standortanzeige praktisch dauerhaft leuchten. Deshalb ist die Anmeldung so kurz wie
+         * moeglich: einmal je WLAN-Beitritt, Abmeldung beim ersten Namen.
+         */
+        private fun startSsidProbe() {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return // dort schwaerzt nichts
+            if (probe != null) return
+            if (!homeZone.hasPermission()) return
+            val cm = getSystemService(ConnectivityManager::class.java) ?: return
+            val cb = SsidProbeCallback(this)
+            probe = cb
+            val ok = runCatching {
+                cm.registerNetworkCallback(
+                    NetworkRequest.Builder()
+                        .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                        .build(),
+                    cb,
+                )
+            }.isSuccess
+            if (!ok) {
+                probe = null
+                return
+            }
+            // Notbremse: Kommt kein Name (Ortung aus, Berechtigung entzogen), nicht angemeldet
+            // bleiben — sonst haetten wir den Dauerzugriff durch die Hintertuer zurueck.
+            probeJob = scope.launch {
+                delay(SSID_PROBE_MAX_MS)
+                stopSsidProbe()
+            }
+        }
+
+        fun stopSsidProbe() {
+            val cb = probe ?: return
+            probe = null
+            probeJob?.cancel()
+            probeJob = null
+            runCatching {
+                getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
+            }
+        }
+
+        /** Zustellung des kurzlebigen Callbacks — hier kommt der Name wirklich an. */
+        fun probed(network: Network, caps: NetworkCapabilities) {
+            val name = readSsid(caps) ?: return
+            ssid = name
+            Log.d(TAG, "WLAN-Name geholt: $name")
+            wifiGate.onNetwork(network, name, ipv4, prefix)
+            stopSsidProbe()
         }
 
         fun linkProperties(network: Network, lp: LinkProperties) {
@@ -572,6 +631,7 @@ class DoorbellService : Service() {
             // Beim Wechsel A->B kann onLost(A) NACH onAvailable(B) eintreffen. Dann gehoert der
             // Rueckruf zum alten Netz und darf den neuen Stand nicht ueberschreiben.
             if (net != null && net != network) return
+            stopSsidProbe()
             net = null
             ssid = null
             ipv4 = null
@@ -595,17 +655,17 @@ class DoorbellService : Service() {
         override fun onLost(network: Network) = w.lost(network)
     }
 
-    /** Ab Android 12: nur mit FLAG_INCLUDE_LOCATION_INFO kommt der WLAN-Name durch. Die Klasse
-     *  wird auf aelteren Systemen nie geladen (siehe Verzweigung in requestWifi). */
+    /**
+     * Ab Android 12 kommt der WLAN-Name nur mit `FLAG_INCLUDE_LOCATION_INFO` durch — und jede
+     * Zustellung an so einen Callback ist ein Standortzugriff. Deshalb ist diese Klasse bewusst
+     * **kurzlebig** und hoert nur auf das eine, was sie liefern soll; abgemeldet wird beim ersten
+     * Namen (siehe WifiWatcher.startSsidProbe). Auf aelteren Systemen wird sie nie geladen.
+     */
     @RequiresApi(Build.VERSION_CODES.S)
-    private class LocatedWifiCallback(private val w: WifiWatcher) :
+    private class SsidProbeCallback(private val w: WifiWatcher) :
         ConnectivityManager.NetworkCallback(FLAG_INCLUDE_LOCATION_INFO) {
-        override fun onAvailable(network: Network) = w.available(network)
         override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
-            w.capabilities(network, caps)
-        override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) =
-            w.linkProperties(network, lp)
-        override fun onLost(network: Network) = w.lost(network)
+            w.probed(network, caps)
     }
 
     /** SSID aus den Netzwerk-Capabilities; null ohne Berechtigung/Info. Der Name
@@ -1765,6 +1825,11 @@ class DoorbellService : Service() {
          *  ein normaler Reconnect daheim (Sekunden) kommt hier nie an. Kuerzer -> der blaue Punkt
          *  kommt bei jedem WLAN-Zucken zurueck; laenger -> „Unterwegs" erscheint traeger. */
         private const val HOME_ASK_AFTER_MS = 45_000L
+
+        /** So lange bleibt der kurzlebige Callback mit Standort-Flagge hoechstens angemeldet.
+         *  Kommt bis dahin kein WLAN-Name, kommt auch keiner mehr — dann lieber abmelden, sonst
+         *  haetten wir den Dauerzugriff durch die Hintertuer zurueck. */
+        private const val SSID_PROBE_MAX_MS = 20_000L
 
         /** Aeltere Timestamps gelten als "keine echte Uhrzeit" (Shelly ohne NTP). */
         private const val MIN_VALID_TS = 1_000_000_000L
