@@ -165,6 +165,14 @@ die App nicht dauerhaft blind macht.
 Bei fehlendem Urteil wird **nicht** blockiert, sondern versucht: Ein Versuch ist billig, eine
 verpasste Klingel nicht.
 
+> **Alle Fremdnetz-Fälle heißen auf dem Bildschirm gleich:** „Unterwegs – warte aufs Heimnetz",
+> grau. Egal ob falsches Subnetz, Greylist oder Homezone — *woran* die App gemerkt hat, dass sie
+> nicht daheim ist, ändert für den Nutzer nichts und stand früher nur als Rauschen in der Leiste
+> (samt Shelly-IP). Der Grund lebt in `ConnectionState.OtherNetwork.reason` und landet **nur** im
+> Ereignisprotokoll (`Verbindung: anderes Netz (…)`). Das Feld heißt bewusst `reason` und nicht
+> `detail`, damit es niemand versehentlich wieder auf den Bildschirm holt. Entschieden am
+> 21.08.2026.
+
 **Die Ortung kommt erst dran, wenn die Versuche in diesem Netz schon `HOME_ASK_AFTER_MS` (45 s)
 scheitern.** Das WLAN des Pixel zuckt häufig („verbinde / kein WLAN / verbinde" binnen Sekunden,
 im Ereignisprotokoll gut zu sehen), und jedes Zucken liefert ein neues `Network` — ohne diese

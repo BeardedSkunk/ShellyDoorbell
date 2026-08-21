@@ -258,7 +258,7 @@ private fun ConnectionCard(conn: ConnectionState, watts: Double?, onReconnect: (
                 is ConnectionState.Connected -> Triple(Color(0xFF43A047), "Verbunden", conn.deviceName)
                 ConnectionState.Connecting -> Triple(Color(0xFFFB8C00), "Verbinde …", "Shelly wird gesucht")
                 ConnectionState.NoWifi -> Triple(Color(0xFFE53935), "Kein WLAN", "Warte auf Heimnetz")
-                is ConnectionState.OtherNetwork -> Triple(Color(0xFF9E9E9E), "Anderes Netz", conn.detail)
+                is ConnectionState.OtherNetwork -> Triple(Color(0xFF9E9E9E), "Unterwegs", "Warte aufs Heimnetz")
             }
             Box(Modifier.size(14.dp).background(color, CircleShape))
             Column(Modifier.weight(1f).padding(start = 12.dp)) {

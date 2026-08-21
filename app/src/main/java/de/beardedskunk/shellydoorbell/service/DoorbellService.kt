@@ -218,7 +218,7 @@ class DoorbellService : Service() {
                 decision
             } else if (homeZone.verdict(wifi.value) == HomeStatus.OUTSIDE) {
                 GateDecision.Block(
-                    ConnectionState.OtherNetwork(getString(R.string.notif_away)),
+                    ConnectionState.OtherNetwork("Homezone: ausserhalb"),
                     HOME_OUTSIDE_RECHECK_MS,
                 )
             } else {
@@ -270,7 +270,7 @@ class DoorbellService : Service() {
                     is ConnectionState.Connected -> "verbunden (${it.deviceName})"
                     ConnectionState.Connecting -> "verbinde"
                     ConnectionState.NoWifi -> "kein WLAN"
-                    is ConnectionState.OtherNetwork -> "anderes Netz (${it.detail})"
+                    is ConnectionState.OtherNetwork -> "anderes Netz (${it.reason})"
                 }
                 Log.d(TAG, "Verbindungszustand: $label")
                 events.log("Verbindung: $label")
@@ -1777,8 +1777,12 @@ class DoorbellService : Service() {
             HomeStatus.OUTSIDE -> NotifView(NotifColor.GREY, false, getString(R.string.notif_away))
             HomeStatus.UNKNOWN -> NotifView(NotifColor.GREY, false, getString(R.string.notif_no_wifi))
         }
+        // Alle Fremdnetz-Faelle heissen gleich — falsches Subnetz, Greylist, Homezone. Woran die
+        // App gemerkt hat, dass sie nicht daheim ist, aendert fuer den Nutzer nichts und stand
+        // frueher nur als Rauschen in der Leiste (samt Shelly-IP). Der Grund steht im
+        // Ereignisprotokoll, siehe ConnectionState.OtherNetwork.reason.
         is ConnectionState.OtherNetwork ->
-            NotifView(NotifColor.GREY, false, state.detail)
+            NotifView(NotifColor.GREY, false, getString(R.string.notif_away))
     }
 
     private fun currentNotifView(): NotifView = notifView(

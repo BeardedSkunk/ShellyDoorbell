@@ -85,9 +85,16 @@ sealed class ConnectionState {
     data object Connecting : ConnectionState()
     data class Connected(val deviceName: String) : ConnectionState()
 
-    /** WLAN da, aber bewusst KEIN Verbindungsversuch (falsches Subnetz / Fremdnetz
-     *  / Greylist-Wartezeit). [detail] erklaert es fuer die Notification. */
-    data class OtherNetwork(val detail: String) : ConnectionState()
+    /**
+     * WLAN da, aber bewusst KEIN Verbindungsversuch (falsches Subnetz / Fremdnetz
+     * / Greylist-Wartezeit / Homezone sagt „unterwegs").
+     *
+     * [reason] ist **nur fuers Protokoll**, nicht fuer die Anzeige: Alle diese Faelle heissen auf
+     * dem Bildschirm gleich („Unterwegs – warte aufs Heimnetz"), weil es den Nutzer nicht
+     * interessiert, WORAN die App gemerkt hat, dass sie nicht daheim ist — und weil er daran
+     * ohnehin nichts aendern kann. Wenn etwas schieflaeuft, steht der Grund im Ereignisprotokoll.
+     */
+    data class OtherNetwork(val reason: String) : ConnectionState()
 }
 
 /**

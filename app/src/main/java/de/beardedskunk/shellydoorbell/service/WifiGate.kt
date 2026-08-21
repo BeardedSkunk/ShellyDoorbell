@@ -105,7 +105,7 @@ class WifiGate(private val prefs: Prefs, private val scope: CoroutineScope) {
         // Stufe 1: Subnetz-Tor (braucht keine Berechtigung).
         if (!subnetPlausible(shellyIp)) {
             return GateDecision.Block(
-                ConnectionState.OtherNetwork("Anderes WLAN – Klingel ($shellyIp) hier nicht erreichbar."),
+                ConnectionState.OtherNetwork("Subnetz passt nicht (Klingel $shellyIp)"),
                 RECHECK_WRONG_NET_MS,
             )
         }
@@ -113,12 +113,11 @@ class WifiGate(private val prefs: Prefs, private val scope: CoroutineScope) {
         // Ohne SSID (keine Berechtigung / vom System geschwaerzt) lassen sich keine Listen
         // fuehren. Trotzdem darf die App dann nicht endlos "Verbinde ..." anzeigen: Genau so
         // stand sie am 20.08. zwei Stunden 41 Minuten im WLAN eines Fremden. Nach derselben
-        // Frist wie bei der Greylist wird der Zustand ehrlich benannt. Die Wiedervorlage
-        // entspricht dem Backoff-Deckel — es geht also keine Probe verloren, nur der Text
-        // stimmt jetzt.
+        // Frist wie bei der Greylist gilt der Zustand als "unterwegs". Die Wiedervorlage
+        // entspricht dem Backoff-Deckel — es geht also keine Probe verloren.
         val s = ssid ?: return if (failingLongEnough(null)) {
             GateDecision.Block(
-                ConnectionState.OtherNetwork("Klingel in diesem WLAN bisher nicht gefunden – seltene Prüfung."),
+                ConnectionState.OtherNetwork("kein WLAN-Name, 10 min ohne Klingel"),
                 GREYLIST_RECHECK_MS,
             )
         } else {
@@ -147,7 +146,7 @@ class WifiGate(private val prefs: Prefs, private val scope: CoroutineScope) {
             }
             val wait = (GREYLIST_RECHECK_MS - (nowMs - last)).coerceAtLeast(60_000L)
             return GateDecision.Block(
-                ConnectionState.OtherNetwork("Klingel in diesem WLAN bisher nicht gefunden – seltene Prüfung."),
+                ConnectionState.OtherNetwork("Greylist: hier war die Klingel nie erreichbar"),
                 wait,
             )
         }
