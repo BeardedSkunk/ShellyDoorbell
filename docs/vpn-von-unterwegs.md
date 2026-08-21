@@ -1,7 +1,21 @@
 # Von unterwegs erreichbar sein (WireGuard)
 
-Status: **auf Eis gelegt am 21.08.2026.** Idee durchdacht, nichts gebaut. Der Nutzer will das
-zurückstellen — hier steht, was dazugehört, damit es später nicht neu erarbeitet werden muss.
+Status: **Schritt 1 erledigt am 21.08.2026** (videoapp v1.66). Schritt 2 (Klingel-App) steht aus.
+
+Vorgehen ist bewusst schrittweise. Reihenfolge und Stand:
+
+| Schritt | Stand |
+|---|---|
+| videoapp: VPN als erreichbares Netz | **fertig** (v1.66, nur aufs Pixel) |
+| Pixel mit der FRITZ!Box-Verbindung koppeln | offen — macht der Nutzer |
+| Test von außen (WLAN aus, nur Mobilfunk) | offen |
+| Klingel-App: Schalter „auch unterwegs" | offen |
+
+**Die Klingel bekommt einen Schalter, die videoapp nicht.** So hat es der Nutzer entschieden, und
+es ist richtig: Die Videoübertragung weckt niemanden — wenn sie von unterwegs kann, soll sie es
+einfach können. Die Klingel dagegen entscheidet darüber, ob nachts das Telefon losgeht und ob
+dauerhaft Funkverkehr läuft; das gehört unter seine Kontrolle. Ein installiertes WireGuard heißt
+nicht, dass er unterwegs geweckt werden will.
 
 ## Was erreicht werden soll
 
@@ -39,23 +53,33 @@ importiert. Zwei Angaben fehlen noch und sind die Voraussetzung für alles Weite
 |---|---|---|
 | FRITZ!Box | erledigt | Verbindung fürs Pixel anlegen — je Gerät eine eigene, nie dieselbe Konfiguration doppelt |
 | Pixel | klein | WireGuard-App, Konfiguration importieren, **„im Heim-WLAN automatisch aus"** |
-| videoapp | klein | VPN als gültiges Netz zulassen; Stationen über gemerkte Adressen finden |
+| videoapp | **erledigt** | VPN zählt als erreichbar (`Net.kt`); Stationen kommen aus dem Speicher |
 | ShellyDoorbell | mittel | feste WLAN-Bindung lösen |
 | Takte | klein | Wächter auf Minuten statt Sekunden, WebSocket-Ping raus |
 
-### videoapp — klein
+### videoapp — erledigt (v1.66, 21.08.2026)
 
-Die App bindet ihre Sockets **nicht** an ein bestimmtes Netz, sie nutzt das Standardnetz. Über
-einen aktiven Tunnel liefe der Verkehr also von allein richtig. Zwei Stellen:
+Es war weniger als gedacht: **An der Übertragung musste gar nichts geändert werden**, und das
+ist kein Zufall.
 
-- `hasLanNetwork()` in `master/ViewerActivity.kt` sowie die Entsprechungen in `master/MasterActivity.kt`
-  und `slave/SlaveActivity.kt` prüfen auf `TRANSPORT_WIFI`/`TRANSPORT_ETHERNET` und würden beim
-  VPN „nein" sagen. `TRANSPORT_VPN` muss dazu — oder besser: statt des Transports die
-  tatsächliche Erreichbarkeit prüfen.
-- **Die Stationssuche läuft über UDP-Broadcast auf Port 8802** (`stream/Beacon.kt`,
-  `master/BeaconListener.kt`). Broadcasts überqueren keinen Tunnel. Von unterwegs muss der Weg
-  über die gemerkten Adressen gehen (`known_stations` in `Prefs.kt` gibt es bereits) — dann ist
-  er allerdings der einzige Weg und nicht mehr nur die Rückfallebene.
+- Die App bindet ihre Sockets nicht an ein bestimmtes Netz, sondern nutzt die Standardroute.
+  Mit aktivem Tunnel ist das der Tunnel.
+- Die Station nimmt die Adresse des Betrachters **aus der eingehenden Verbindung**
+  (`serveWatch(out, query, socket.inetAddress)` in `slave/HttpServer.kt`), statt sie sich sagen
+  zu lassen. Der Betrachter schickt nur seinen Port (`/watch?vid=…&port=…`). Über den Tunnel
+  trifft das automatisch die Tunneladresse, und die FRITZ!Box routet das UDP-Bild zurück.
+
+Geändert wurde nur die Frage „habe ich überhaupt Netz?": Die drei gleichlautenden Prüfungen in
+`ViewerActivity`, `MasterActivity` und `SlaveActivity` sind jetzt eine gemeinsame Funktion
+(`Net.kt`, `canReachStations`) und lassen `TRANSPORT_VPN` zu. Ohne das hätte der Betrachter
+dauerhaft „kein Netz" angezeigt **und** `rescueVideoHost()` übersprungen — das läuft absichtlich
+nur, wenn Netz da ist.
+
+**Die Stationssuche geht über den Tunnel nicht** (Kurzruf per UDP-Broadcast auf 8802, mDNS). Das
+ist verkraftbar, weil die Übersicht bekannte Stationen ohnehin direkt per HTTP abfragt
+(`MasterActivity.loadKnownStations`, gespeist aus `Prefs.knownStations`). Von unterwegs ist der
+Stationsspeicher dann eben die einzige Quelle statt nur die zuverlässigere. **Praktische Folge:**
+Die Übersicht muss zu Hause einmal offen gewesen sein, damit der Speicher aktuell ist.
 
 ### ShellyDoorbell — der größere Brocken
 
