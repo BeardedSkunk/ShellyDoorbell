@@ -177,10 +177,16 @@ für Millisekunden löschen.
 Steht die Verbindung, kann die Ortung ohnehin nichts beitragen — die laufende Verbindung ist der
 bessere Beweis. Zu Hause wird deshalb **nie** gemessen.
 
-**Offene, noch nicht bewiesene Spur:** Der Dienst führt den FGS-Typ `location`
-(`types=0x40000008`). Ob der allein die Standortanzeige dauerhaft leuchten lässt, ist ungeklärt —
-falls der blaue Punkt nach v1.2.2 bleibt, ist das der nächste Verdächtige. Die App hat
-`ACCESS_BACKGROUND_LOCATION`, bräuchte den Typ zum Zugriff also womöglich gar nicht.
+> **Der FGS-Typ `location` war der eigentliche blaue Punkt.** Am Gerät gemessen (21.08.2026): Bei
+> laufendem location-Vordergrunddienst notiert Android `FINE_LOCATION` im Zustand `fgsvc` alle paar
+> Sekunden weiter — im Logcat desselben Prozesses steht in denselben Minuten **keine einzige
+> Zeile**. Es war also nie unser Code. Deshalb setzt der Dienst den Typ nur noch, wenn er ihn
+> braucht: **mit `ACCESS_BACKGROUND_LOCATION` gar nicht** (siehe `needsLocationFgsType()`), ohne
+> die Berechtigung weiterhin. Nachgeprüft: Der Startzugriff gelingt danach weiterhin im Zustand
+> `fgsvc`, ohne neue `Reject`-Zeile.
+>
+> **Prüfstein:** `dumpsys activity services de.beardedskunk.shellydoorbell` → `types=0x40000000`
+> ist nur `specialUse` (gut), `0x40000008` hätte `location` dabei.
 
 Zurückgestellt: der Zugriff **von unterwegs** über WireGuard — durchdacht, nichts gebaut, alles in
 `docs/vpn-von-unterwegs.md`.

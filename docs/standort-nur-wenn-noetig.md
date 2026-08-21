@@ -171,3 +171,80 @@ war nie funktionsfähig**, lange vor dem Umbau — sie fiel nur nicht auf, weil 
 
 Punkt 4 ist die eigentliche Lehre: Nicht „diesen Auslöser richtig bauen", sondern **dafür sorgen,
 dass ein ausgefallener Auslöser die App nicht dauerhaft blind macht.**
+
+---
+
+# Der blaue Punkt, zweiter Anlauf (21.08.2026, v1.2.2/v1.2.3)
+
+Nach dem Umbau vom 19.08. stand der blaue Punkt **weiter dauerhaft** in der Statusleiste, obwohl
+`dumpsys location` null aktive Registrierungen der App zeigte. Es waren zwei verschiedene
+Ursachen — die zweite hatte mit der Homezone gar nichts zu tun.
+
+## Ursache 1: jedes WLAN-Zucken löste eine Messung aus (v1.2.2)
+
+Das WLAN des Pixel zuckt im Minutentakt:
+
+```
+05:03:30.326  HomeZone: WLAN gewechselt -> Ortsurteil verworfen
+05:03:30.362  Verbindungszustand: kein WLAN
+05:03:31.394  WifiGate: WLAN gewechselt: ssid=LinkBash5
+05:03:31.806  ShellyClient: Verbunden mit 'Klingelueberwachung'
+```
+
+Jedes Zucken liefert ein neues `Network`, und seit v1.2.1 hängt der Auslöser genau daran. Aus
+„es wird nie gemessen" war „es wird bei jedem Zucken gemessen" geworden — beides falsch.
+
+Die Whitelist-Abkürzung fing das nicht ab: Beim Beitritt kommt zuerst `onAvailable`, der WLAN-Name
+erst mit `onCapabilitiesChanged`. **In dieser Lücke ist `isKnownGood()` blind** — und `available()`
+reichte obendrein ein `null` als Namen ans `WifiGate` durch und löschte damit kurz den bekannten.
+
+Zwei Schranken statt einer:
+
+- **`HOME_ASK_AFTER_MS` (45 s):** Die Ortung wird erst gefragt, wenn die Versuche in diesem Netz
+  schon eine Weile scheitern. Ein Reconnect daheim dauert Sekunden und kommt dort nie an. Der
+  Leitsatz dahinter: *Steht die Verbindung, kann der Standort nichts beitragen — die laufende
+  Verbindung ist der bessere Beweis.*
+- **`available()` reicht keinen Namen mehr durch.** Netz und Name kommen gemeinsam mit den beiden
+  folgenden Rückrufen.
+
+Nebenbei: `computeStatus()` fragte die Provider **dreimal** ab (bis zu sechs
+`getLastKnownLocation` je Bewertung, jedes ein Standortzugriff). Kandidaten werden jetzt einmal
+gesammelt und dreimal ausgewertet.
+
+## Ursache 2: der FGS-Typ `location` selbst (v1.2.3)
+
+Das war die eigentliche. Die Messung, die es zeigte:
+
+```
+>>> 05:05:22  ORTUNG_VOR=747ms
+>>> 05:05:32  ORTUNG_VOR=7s823ms
+>>> 05:05:42  ORTUNG_VOR=2s372ms
+>>> 05:05:52  ORTUNG_VOR=6s265ms
+```
+
+Zugriffe alle paar Sekunden — und im **Logcat desselben Prozesses in denselben Minuten keine
+einzige Zeile**. `recompute()` lief also nicht; es war nie unser Code. `dumpsys appops` bestätigte
+den Zustand: `Access: [fgsvc-s]`, also aus dem Vordergrunddienst.
+
+**Android hält für einen Vordergrunddienst mit Typ `location` die Standort-Zurechnung die ganze
+Laufzeit über wach.** Genau das ist der dauerhafte Punkt, und kein Abschalten von Abos bekommt ihn
+weg, solange der Typ gesetzt ist.
+
+Gebraucht wird der Typ nur, wenn der Standort **nicht** „immer zulassen" ist — dann käme der
+Dienst aus dem Hintergrund sonst nicht an den Ort. Mit `ACCESS_BACKGROUND_LOCATION` bringt er
+nichts und kostet nur die Anzeige. Deshalb `needsLocationFgsType()`:
+
+```kotlin
+homeZone.hasPermission() && !homeZone.hasBackgroundPermission()
+```
+
+Nachgeprüft am Gerät: `types=0x40000000` (nur `specialUse`), und der Startzugriff auf den Ort
+gelingt weiterhin im Zustand `fgsvc` — keine neue `Reject`-Zeile in `dumpsys appops`.
+
+## Was daraus zu lernen ist
+
+`dumpsys location` beantwortet **nur** die Frage „läuft ein Abo?". Für „wird der Standort
+angefasst?" ist `cmd appops get <paket>` die richtige Quelle: Der Zeitstempel `time=+Xs ago` altert,
+solange nichts passiert, und springt bei jedem Zugriff zurück. Und die Gegenprobe, die den Fall
+gelöst hat, war das **Fehlen** von Logzeilen: Wenn der Standort angefasst wird und der eigene
+Prozess dazu schweigt, war es das System.

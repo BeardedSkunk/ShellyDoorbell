@@ -1044,8 +1044,9 @@ class DoorbellService : Service() {
             homeZone.invalidate()
             // Die Dauer-Notification ggf. auf den FGS-Typ location heben (die Berechtigung
             // koennte gerade erst erteilt worden sein; ohne den Typ kaeme der Dienst im
-            // Hintergrund gar nicht an den Ort).
-            if (localAlarmEnabled && homeZone.hasPermission() && !locationFgsActive) {
+            // Hintergrund gar nicht an den Ort). Mit „immer zulassen" wird der Typ bewusst
+            // NICHT gesetzt — siehe needsLocationFgsType().
+            if (localAlarmEnabled && needsLocationFgsType() && !locationFgsActive) {
                 startForegroundCompat(currentNotifView())
             }
         }
@@ -1562,10 +1563,27 @@ class DoorbellService : Service() {
     /** Gebuendelter Anzeigezustand der Dauer-Notification. */
     private data class NotifView(val color: NotifColor, val dnd: Boolean, val text: String)
 
+    /**
+     * Braucht der Dauerdienst den FGS-Typ `location` ueberhaupt?
+     *
+     * **Nur ohne „Standort immer zulassen".** Mit `ACCESS_BACKGROUND_LOCATION` darf der Dienst den
+     * Ort jederzeit lesen; der Typ bringt dann nichts — kostet aber die **dauerhafte
+     * Standortanzeige in der Statusleiste**. Am Geraet gemessen (21.08.2026): Bei laufendem
+     * location-FGS notiert das System FINE_LOCATION im Zustand `fgsvc` alle paar Sekunden weiter,
+     * ohne dass die App irgendetwas tut — im Logcat des Prozesses steht in denselben Minuten
+     * keine einzige Zeile. Genau das war der blaue Punkt, den auch das Abschalten des
+     * Standort-Abos nicht wegbekommen hat.
+     *
+     * Ist der Standort nur „waehrend der Nutzung" erlaubt, bleibt der Typ noetig: Sonst kaeme der
+     * Dienst aus dem Hintergrund gar nicht an den Ort.
+     */
+    private fun needsLocationFgsType(): Boolean =
+        homeZone.hasPermission() && !homeZone.hasBackgroundPermission()
+
     private fun startForegroundCompat(view: NotifView = currentNotifView()) {
         lastPostedView = view
         val notification = buildServiceNotification(view)
-        val hasLoc = homeZone.hasPermission()
+        val hasLoc = needsLocationFgsType()
         if (Build.VERSION.SDK_INT < 34) {
             startForeground(NOTIF_ID_SERVICE, notification)
             locationFgsActive = hasLoc
