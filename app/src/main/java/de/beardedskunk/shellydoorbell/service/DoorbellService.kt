@@ -145,6 +145,21 @@ class DoorbellService : Service() {
     /** Fuer die UI: laeuft die Verbindung ueber den Tunnel? */
     val viaTunnel: StateFlow<Boolean> = link.map { it?.tunnel == true }.stateIn(scope, SharingStarted.Eagerly, false)
 
+    /** true, sobald „Verbinde …" schon [STUCK_AFTER_MS] am Stueck steht — die Versuche scheitern
+     *  also, das ist kein normaler Reconnect mehr (der dauert daheim Sekunden). */
+    private val stuck = MutableStateFlow(false)
+
+    /**
+     * Ein VPN steht, das Heim-WLAN liegt an, und die Verbindung kommt seit einer Weile nicht
+     * zustande: Das ist der Fall „Tunnel an im Heim-WLAN" — das VPN faengt den Verkehr ein (siehe
+     * [link]). Gilt **unabhaengig vom Schalter** „Auch unterwegs erreichbar": Auch ohne ihn weiss
+     * die App das alles und soll es sagen, statt ewig „Verbinde …" zu zeigen. Am Verhalten aendert
+     * es nichts, nur an der Anzeige. (Ein VPN, das das Heimnetz nicht routet, wuerde die Klingel
+     * gar nicht blockieren — dann kommt die Verbindung zustande und der Hinweis erscheint nie.)
+     */
+    val vpnBlocking: StateFlow<Boolean> = combine(vpnUp, homeWifi, stuck) { up, hw, st -> up && hw && st }
+        .stateIn(scope, SharingStarted.Eagerly, false)
+
     private val uiVisible = MutableStateFlow(false)
     private var alarmUri: String? = null
     private var localAlarmEnabled = true
@@ -327,6 +342,17 @@ class DoorbellService : Service() {
             }
         }
         scope.launch {
+            // „Verbinde …" mit Stoppuhr: Steht der Zustand laenger als STUCK_AFTER_MS, scheitern
+            // die Versuche. collectLatest setzt die Uhr bei jedem Zustandswechsel zurueck.
+            client.state.collectLatest { st ->
+                stuck.value = false
+                if (st == ConnectionState.Connecting) {
+                    delay(STUCK_AFTER_MS)
+                    stuck.value = true
+                }
+            }
+        }
+        scope.launch {
             // Lebenszeichen ins Protokoll: eine Luecke darin heisst, dass der
             // Dienst gar nicht lief (vom System beendet, Handy aus). Ohne diese
             // Zeilen liesse sich "es war ruhig" nicht von "die App war weg"
@@ -349,8 +375,11 @@ class DoorbellService : Service() {
             // buendeln, damit combine bei fuenf Quellen bleibt.
             val tempSwitch = combine(_muteUntil, _onAt) { mute, on -> mute to on }
             // Homezone und Tunnel-Lage zu einem Kontext buendeln (combine bleibt bei fuenf Quellen).
-            val ctx = combine(homeZone.status, viaTunnel, awayEnabled, vpnUp, homeWifi) { home, tunnel, away, up, hw ->
-                NetCtx(home, tunnel, away, up, hw)
+            val vpnLage = combine(viaTunnel, awayEnabled, vpnUp, vpnBlocking) { tunnel, away, up, blocking ->
+                listOf(tunnel, away, up, blocking)
+            }
+            val ctx = combine(homeZone.status, vpnLage) { home, (tunnel, away, up, blocking) ->
+                NetCtx(home, tunnel, away, up, blocking)
             }
             combine(
                 client.state,
@@ -1785,8 +1814,8 @@ class DoorbellService : Service() {
         val away: Boolean,
         /** Ein VPN-Netz steht (ob benutzt oder nicht). */
         val vpnUp: Boolean,
-        /** Ein WLAN aus der Whitelist liegt an — das Heim-WLAN. */
-        val homeWifi: Boolean,
+        /** VPN steht, Heim-WLAN liegt an, Verbindung scheitert seit einer Weile (siehe [vpnBlocking]). */
+        val vpnBlocking: Boolean,
     )
 
     /**
@@ -1938,10 +1967,10 @@ class DoorbellService : Service() {
             }
         }
         ConnectionState.Connecting -> when {
-            // Tunnel steht, aber das Heim-WLAN liegt auch an: Dann faengt das VPN den WLAN-Verkehr
-            // ein und die Klingel ist nicht erreichbar (siehe link). Der Nutzer kann das beheben —
-            // deshalb rot und eine Handlungsanweisung, nicht grau.
-            ctx.tunnel && ctx.homeWifi -> NotifView(NotifColor.RED, false, getString(R.string.notif_home_vpn_on))
+            // Ein VPN steht, das Heim-WLAN liegt auch an, und es klappt seit 45 s nicht: Das VPN
+            // faengt den Verkehr ein, die Klingel ist nicht erreichbar (siehe vpnBlocking). Der
+            // Nutzer kann das beheben — deshalb rot und eine Handlungsanweisung, nicht grau.
+            ctx.vpnBlocking -> NotifView(NotifColor.RED, false, getString(R.string.notif_home_vpn_on))
             ctx.tunnel -> NotifView(NotifColor.GREY, false, getString(R.string.notif_connecting_vpn))
             else -> NotifView(NotifColor.GREY, false, getString(R.string.notif_connecting))
         }
@@ -1966,7 +1995,7 @@ class DoorbellService : Service() {
 
     private fun currentNotifView(): NotifView = notifView(
         client.state.value, _muteUntil.value, _onAt.value, _bellOn.value, _bellTimes.value,
-        NetCtx(homeZone.status.value, viaTunnel.value, awayEnabled.value, vpnUp.value, homeWifi.value),
+        NetCtx(homeZone.status.value, viaTunnel.value, awayEnabled.value, vpnUp.value, vpnBlocking.value),
     )
 
     /** Zuletzt gepostete Ansicht — verhindert unnoetiges Neu-Posten (Minuten-Ticker). */
@@ -2010,6 +2039,11 @@ class DoorbellService : Service() {
          *  ein normaler Reconnect daheim (Sekunden) kommt hier nie an. Kuerzer -> der blaue Punkt
          *  kommt bei jedem WLAN-Zucken zurueck; laenger -> „Unterwegs" erscheint traeger. */
         private const val HOME_ASK_AFTER_MS = 45_000L
+
+        /** So lange darf „Verbinde …" stehen, bevor es als „scheitert" gilt (siehe [stuck]). Gleich
+         *  lang wie HOME_ASK_AFTER_MS, aus demselben Grund: Ein normaler Reconnect daheim kommt
+         *  hier nie an, und das WLAN-Zucken auch nicht. */
+        private const val STUCK_AFTER_MS = 45_000L
 
         /** So lange bleibt der kurzlebige Callback mit Standort-Flagge hoechstens angemeldet.
          *  Kommt bis dahin kein WLAN-Name, kommt auch keiner mehr — dann lieber abmelden, sonst

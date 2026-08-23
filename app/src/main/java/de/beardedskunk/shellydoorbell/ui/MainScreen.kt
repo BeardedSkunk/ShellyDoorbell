@@ -104,6 +104,7 @@ fun MainScreen(
     val scriptOk by service.scriptOk.collectAsState()
     val alarmActive by service.alarmActive.collectAsState()
     val viaTunnel by service.viaTunnel.collectAsState()
+    val vpnBlocking by service.vpnBlocking.collectAsState()
     val connected = conn is ConnectionState.Connected
 
     Scaffold(
@@ -127,7 +128,7 @@ fun MainScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             if (alarmActive) AlarmBanner(onStop = { service.stopAlarm() })
-            ConnectionCard(conn, watts, viaTunnel, onReconnect = { service.reconnect() })
+            ConnectionCard(conn, watts, viaTunnel, vpnBlocking, onReconnect = { service.reconnect() })
             if (connected && scriptOk == false) ScriptWarning()
             BellCard(
                 bellOn = bellOn,
@@ -249,7 +250,13 @@ private fun AlarmBanner(onStop: () -> Unit) {
 }
 
 @Composable
-private fun ConnectionCard(conn: ConnectionState, watts: Double?, viaTunnel: Boolean, onReconnect: () -> Unit) {
+private fun ConnectionCard(
+    conn: ConnectionState,
+    watts: Double?,
+    viaTunnel: Boolean,
+    vpnBlocking: Boolean,
+    onReconnect: () -> Unit,
+) {
     Card {
         Row(
             Modifier.fillMaxWidth().padding(16.dp),
@@ -259,8 +266,12 @@ private fun ConnectionCard(conn: ConnectionState, watts: Double?, viaTunnel: Boo
             val (color, title, sub) = when (conn) {
                 is ConnectionState.Connected ->
                     Triple(Color(0xFF43A047), if (viaTunnel) "Verbunden übers VPN" else "Verbunden", conn.deviceName)
-                ConnectionState.Connecting ->
-                    Triple(Color(0xFFFB8C00), if (viaTunnel) "Verbinde übers VPN …" else "Verbinde …", "Shelly wird gesucht")
+                // Ein VPN faengt den Verkehr ein (siehe DoorbellService.vpnBlocking): rot, mit Anweisung.
+                ConnectionState.Connecting -> when {
+                    vpnBlocking -> Triple(Color(0xFFE53935), "Zu Hause – VPN abschalten", "Das VPN blockiert den Weg zur Klingel")
+                    viaTunnel -> Triple(Color(0xFFFB8C00), "Verbinde übers VPN …", "Shelly wird gesucht")
+                    else -> Triple(Color(0xFFFB8C00), "Verbinde …", "Shelly wird gesucht")
+                }
                 ConnectionState.NoWifi -> Triple(Color(0xFFE53935), "Kein WLAN", "Warte auf Heimnetz")
                 is ConnectionState.OtherNetwork -> Triple(Color(0xFF9E9E9E), "Unterwegs", "Warte aufs Heimnetz")
             }

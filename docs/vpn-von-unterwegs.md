@@ -228,8 +228,12 @@ Umgesetzt in `DoorbellService` (`link`, `requestVpn`, `NetCtx`, `postQuietRingNo
   mit DND-Zeichen bei Ruhe wie daheim), „Verbinde übers VPN …" (grau). Schalter an, unterwegs,
   kein Tunnel → „Unterwegs – VPN ist aus" (grau). **Tunnel an und Heim-WLAN (Whitelist) liegt an,
   ohne Verbindung → „Zu Hause – VPN abschalten" (rot)** — das ist die Falle von oben, und der
-  Nutzer kann sie beheben, deshalb rot mit Handlungsanweisung. Alles andere bleibt; mit Schalter
-  aus bleiben **alle** Texte wie heute.
+  Nutzer kann sie beheben, deshalb rot mit Handlungsanweisung. **Dieser eine Hinweis gilt auch mit
+  Schalter aus** (v1.3.1): Die App weiß in dem Moment alles Nötige — VPN steht, Heim-WLAN liegt
+  an, seit 45 s scheitern die Versuche — und ewig „Verbinde …" zu zeigen wäre nur stumm, nicht
+  treu. Am Verhalten ändert der Schalter-aus-Fall nichts. Gefunden vom Nutzer am 23.08.: Tunnel an,
+  Schalter aus, „Verbinde …" ohne Ende. Alles andere bleibt; mit Schalter aus bleiben die übrigen
+  Texte wie heute.
 - **Klingeln unterwegs:** Ist „Nicht stören" am Handy aktiv (`currentInterruptionFilter != ALL`,
   ohne Berechtigung lesbar), kommt das Klingeln **leise**: eine Benachrichtigung auf einem
   zweiten Kanal ohne `setBypassDnd`, ohne Wecker-Stream, ohne Vollbild — mit „Tür ansehen", und
