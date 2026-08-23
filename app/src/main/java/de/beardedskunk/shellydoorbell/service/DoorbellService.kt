@@ -226,6 +226,10 @@ class DoorbellService : Service() {
     @Volatile
     private var lastHeartbeatMs = 0L
 
+    /** Zeitpunkt (elapsedRealtime), seit dem die aktuelle Verbindung steht; 0 = keine. */
+    @Volatile
+    private var connectedSinceMs = 0L
+
     /** Schuetzt den Aufbau der vorlaeufigen Klingel-Gruppe (recordProvisional). */
     private val logMutex = Mutex()
     private var provStart = 0L   // Start des offenen vorlaeufigen Ereignisses, 0 = keins
@@ -440,41 +444,62 @@ class DoorbellService : Service() {
             client.state.collect { st ->
                 if (st !is ConnectionState.Connected) {
                     lastHeartbeatMs = 0L
+                    connectedSinceMs = 0L
                     initialLoadDone.value = false
+                } else if (connectedSinceMs == 0L) {
+                    connectedSinceMs = SystemClock.elapsedRealtime()
                 }
             }
         }
         scope.launch {
             // Bleibt das 30-s-Lebenszeichen des Scripts aus, obwohl die Verbindung
             // steht, gilt das Script als nicht laufend.
-            var probedStale = false
+            var staleRounds = 0      // aufeinanderfolgende stumme Pruefrunden (alle 30 s)
+            var silentRebuilds = 0   // Neuaufbauten ohne ein einziges Lebenszeichen dazwischen
             while (true) {
                 delay(30_000)
                 val last = lastHeartbeatMs
-                val stale = last != 0L &&
-                    client.state.value is ConnectionState.Connected &&
-                    SystemClock.elapsedRealtime() - last > STALE_MS
-                if (stale) {
-                    _scriptOk.value = false
-                    // Kein Lebenszeichen mehr, aber die Verbindung gilt als offen:
-                    // entweder steht das Script, oder der Socket ist eine Leiche
-                    // (Doze). In beiden Faellen ist alles, was uns der Shelly von
-                    // sich aus melden wuerde — vor allem der Schalterzustand, den
-                    // ein anderes Geraet umgelegt haben kann — womoeglich veraltet.
-                    // EINMAL je Stille-Phase nachfragen: das holt den echten Stand
-                    // und laesst einen toten Socket auffliegen (Transportfehler ->
-                    // der Client verbindet neu). Nicht wiederholt, damit ein wirklich
-                    // gestopptes Script keinen Dauer-Poll auf dem schwachen Shelly
-                    // ausloest.
-                    if (!probedStale && !listenOnly.value && initialLoadDone.value &&
-                        client.rateLimitedForMs() <= 0
-                    ) {
-                        probedStale = true
+                val since = connectedSinceMs
+                val now = SystemClock.elapsedRealtime()
+                // Auch eine Verbindung, die seit ihrem Aufbau NOCH NIE ein Lebenszeichen bekommen
+                // hat, gilt nach STALE_MS als stumm. Frueher zaehlte nur „hatte eins, jetzt keins
+                // mehr" — eine von Anfang an taube Verbindung (siehe ShellyClient.src) fiel so
+                // nie auf und stand beliebig lange auf „verbunden".
+                val stale = client.state.value is ConnectionState.Connected && (
+                    (last != 0L && now - last > STALE_MS) ||
+                        (last == 0L && since != 0L && now - since > STALE_MS)
+                    )
+                if (!stale) {
+                    staleRounds = 0
+                    if (last != 0L) silentRebuilds = 0
+                    continue
+                }
+                _scriptOk.value = false
+                staleRounds++
+                // Kein Lebenszeichen, aber die Verbindung gilt als offen: entweder steht das
+                // Script, oder der Socket ist eine Leiche (Doze), oder der Kanal ist taub
+                // (Antworten ja, Broadcasts nein — siehe ShellyClient.src). Erste stumme Runde:
+                // EINMAL nachfragen. Das holt den echten Stand (vor allem den Schalterzustand,
+                // den ein anderes Geraet umgelegt haben kann) und laesst einen toten Socket
+                // auffliegen (Transportfehler -> der Client verbindet neu).
+                if (staleRounds == 1) {
+                    if (!listenOnly.value && initialLoadDone.value && client.rateLimitedForMs() <= 0) {
                         Log.i(TAG, "Kein Heartbeat seit >${STALE_MS / 1000}s – Zustand einmal aktiv nachfragen")
                         runCatching { pollStatus() }
                     }
-                } else {
-                    probedStale = false
+                    continue
+                }
+                // Weiter stumm: Das heilt nur ein Neuaufbau — ein gestopptes Script setzt
+                // onConnected dabei wieder in Gang, ein tauber Kanal bekommt eine frische
+                // Kennung. Bleibt es auch danach stumm (Script wirklich weg), wird der Abstand
+                // jedes Mal eine Minute laenger, Deckel zehn Minuten — kein Dauerfeuer auf den
+                // schwachen Shelly, aber auch kein ewiges „verbunden" ohne Klingel.
+                if (staleRounds >= 2 + 2 * minOf(silentRebuilds, 9)) {
+                    Log.w(TAG, "Weiter kein Heartbeat – Verbindung neu aufbauen (Nr. ${silentRebuilds + 1})")
+                    events.log("Verbindung stumm (kein Lebenszeichen) -> Neuaufbau")
+                    staleRounds = 0
+                    silentRebuilds++
+                    client.close()
                 }
             }
         }

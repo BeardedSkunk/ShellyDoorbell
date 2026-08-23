@@ -152,7 +152,23 @@ class ShellyClient(
     private val gate: suspend (ip: String, forced: Boolean) -> GateDecision =
         { _, _ -> GateDecision.Attempt(30_000L) },
 ) {
-    private val src = "dbellapp-" + Random.nextInt(0x100000).toString(16)
+    /**
+     * Absenderkennung (`src`) der RPC-Frames — **je Verbindung neu**, nicht je Client.
+     *
+     * Am Geraet nachgewiesen (23.08.2026, zwei PC-Verbindungen mit derselben Kennung): Der Shelly
+     * liefert Notifications (NotifyEvent/NotifyStatus) nur an den ERSTEN Kanal, der sich mit einer
+     * Kennung gemeldet hat. Ein zweiter Kanal mit derselben Kennung bekommt Antworten auf seine
+     * eigenen Aufrufe, aber keinen einzigen Broadcast — er ist taub. Mit einer festen Kennung je
+     * Client war genau das der Dauerzustand nach jedem Abriss ohne sauberes Ende (Tunnel weg, WLAN
+     * aus, Doze): Der Shelly hielt den Zombie-Kanal minutenlang, die neue Verbindung stand auf
+     * „verbunden" und hoerte nichts — das Klingeln von 10:28 Uhr ging so verloren, und die
+     * Verbindung von 10:33 Uhr blieb ueber zehn Minuten stumm, waehrend jede frische Verbindung
+     * vom PC sofort alles bekam. Siehe [newSrc] in [runSession].
+     */
+    @Volatile
+    private var src = newSrc()
+
+    private fun newSrc(): String = "dbellapp-" + Random.nextInt(0x100000).toString(16)
     private val nextId = AtomicInteger(1)
     private val pending = ConcurrentHashMap<Int, CompletableDeferred<JSONObject>>()
 
@@ -443,6 +459,9 @@ class ShellyClient(
         cachedChallenge = null
         ncCounter.set(0)
         authEstablished = false
+        // Frische Kennung je Verbindung — sonst ist diese Verbindung taub, solange der Shelly
+        // die vorige (ohne FIN gestorbene) noch fuer dieselbe Kennung haelt. Siehe [src].
+        src = newSrc()
         val opened = CompletableDeferred<Boolean>()
         val closed = CompletableDeferred<Unit>()
         val ws = http.newWebSocket(
