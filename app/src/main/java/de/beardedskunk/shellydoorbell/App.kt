@@ -17,6 +17,15 @@ class App : Application() {
 object Channels {
     const val SERVICE = "service"
 
+    /**
+     * Klingeln unterwegs bei aktivem „Nicht stoeren": bewusst OHNE setBypassDnd, ohne Ton,
+     * ohne Vibration. Daheim durchbricht der Alarm „Nicht stoeren" absichtlich (Kanal unten);
+     * unterwegs soll er es nicht — so hat es der Nutzer entschieden (docs/vpn-von-unterwegs.md).
+     * Der Dienst waehlt diesen Kanal nur, wenn die Verbindung ueber den Tunnel laeuft UND
+     * „Nicht stoeren" an ist; sonst klingelt es wie daheim.
+     */
+    const val RING_QUIET = "ring_quiet"
+
     private const val SP = "channels"
     private const val KEY_ALARM_VER = "alarm_ver"
 
@@ -32,6 +41,17 @@ object Channels {
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
                 setShowBadge(false)
+            }
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(
+                RING_QUIET,
+                context.getString(R.string.channel_ring_quiet),
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                setSound(null, null)
+                enableVibration(false)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
         )
         nm.createNotificationChannel(

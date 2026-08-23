@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.doublePreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -26,6 +27,16 @@ data class LocalSettings(
      * die Steuer-Elemente werden ausgeblendet. Klingel-Alarm laeuft trotzdem.
      */
     val listenOnly: Boolean,
+    /**
+     * true = „Auch unterwegs erreichbar": Ohne Heim-WLAN verbindet sich die App ueber den
+     * WireGuard-Tunnel (siehe docs/vpn-von-unterwegs.md). Voreinstellung aus — wer keinen Tunnel
+     * nach Hause hat, merkt von alledem nichts.
+     */
+    val awayEnabled: Boolean,
+    /** Name des WireGuard-Tunnels nach Hause (wie in der WireGuard-App), leer = keiner. */
+    val wgTunnel: String,
+    /** Unix-Millisekunden, wann der Shelly zuletzt ueber den Tunnel erreicht wurde; null = nie. */
+    val tunnelReachedAt: Long?,
 )
 
 private val Context.dataStore by preferencesDataStore(name = "settings")
@@ -39,6 +50,9 @@ class Prefs(private val context: Context) {
         val AUTOSTART = booleanPreferencesKey("autostart")
         val ALARM_ENABLED = booleanPreferencesKey("alarm_enabled")
         val LISTEN_ONLY = booleanPreferencesKey("listen_only")
+        val AWAY_ENABLED = booleanPreferencesKey("away_enabled")
+        val WG_TUNNEL = stringPreferencesKey("wg_tunnel")
+        val TUNNEL_REACHED_AT = longPreferencesKey("tunnel_reached_at")
 
         // Interne, in der UI unsichtbare WLAN-Listen (siehe WifiGate):
         // Whitelist = SSIDs, in denen der Shelly nachweislich erreichbar war.
@@ -61,6 +75,9 @@ class Prefs(private val context: Context) {
             autostart = p[Keys.AUTOSTART] ?: true,
             alarmEnabled = p[Keys.ALARM_ENABLED] ?: true,
             listenOnly = p[Keys.LISTEN_ONLY] ?: false,
+            awayEnabled = p[Keys.AWAY_ENABLED] ?: false,
+            wgTunnel = p[Keys.WG_TUNNEL] ?: "",
+            tunnelReachedAt = p[Keys.TUNNEL_REACHED_AT],
         )
     }
 
@@ -84,6 +101,18 @@ class Prefs(private val context: Context) {
 
     suspend fun setAlarmEnabled(enabled: Boolean) {
         context.dataStore.edit { it[Keys.ALARM_ENABLED] = enabled }
+    }
+
+    suspend fun setAwayEnabled(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.AWAY_ENABLED] = enabled }
+    }
+
+    suspend fun setWgTunnel(name: String) {
+        context.dataStore.edit { it[Keys.WG_TUNNEL] = name.trim() }
+    }
+
+    suspend fun setTunnelReachedAt(epochMs: Long) {
+        context.dataStore.edit { it[Keys.TUNNEL_REACHED_AT] = epochMs }
     }
 
     suspend fun setListenOnly(enabled: Boolean) {

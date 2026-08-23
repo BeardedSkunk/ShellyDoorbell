@@ -49,6 +49,9 @@
         <intent>
             <action android:name="de.videoapp.action.OPEN_DOOR" />
         </intent>
+        <!-- WireGuard: ob es installiert ist, entscheidet, ob die Einstellung
+             "Auch unterwegs erreichbar" ueberhaupt schaltbar ist (siehe WireGuard.kt). -->
+        <package android:name="com.wireguard.android" />
     </queries>
 
     <application

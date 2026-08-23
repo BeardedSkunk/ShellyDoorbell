@@ -40,6 +40,7 @@ import de.beardedskunk.shellydoorbell.shelly.BellEntry
 import de.beardedskunk.shellydoorbell.shelly.BellTimes
 import de.beardedskunk.shellydoorbell.shelly.BellWindow
 import de.beardedskunk.shellydoorbell.shelly.GateDecision
+import de.beardedskunk.shellydoorbell.shelly.Link
 import de.beardedskunk.shellydoorbell.shelly.SharedSettings
 import de.beardedskunk.shellydoorbell.shelly.ShellyClient
 import de.beardedskunk.shellydoorbell.shelly.ShellyRpcException
@@ -53,11 +54,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
@@ -104,6 +108,43 @@ class DoorbellService : Service() {
     private val ip = MutableStateFlow("")
     private val password = MutableStateFlow("")
     private val wifi = MutableStateFlow<Network?>(null)
+
+    /** Aktuelles VPN-Netz (WireGuard-Tunnel) oder null. Ohne Berechtigung beobachtbar. */
+    private val vpn = MutableStateFlow<Network?>(null)
+
+    /** „Auch unterwegs erreichbar" (LocalSettings.awayEnabled). */
+    private val awayEnabled = MutableStateFlow(false)
+
+    /** true, solange ein WLAN mit bekannt-gutem Namen (Whitelist) anliegt — also das Heim-WLAN.
+     *  Gespeist vom [WifiWatcher], sobald der Name da ist. Steht dann der Tunnel, ist das
+     *  genau der Fall, in dem er abgeschaltet gehoert (siehe notifView). */
+    private val homeWifi = MutableStateFlow(false)
+
+    /**
+     * Das Netz, ueber das der Client den Shelly erreichen soll.
+     *
+     * **Der Tunnel hat Vorrang, sobald er steht** — nicht aus Vorliebe, sondern weil Android es so
+     * erzwingt: Ein VPN ist standardmaessig nicht umgehbar und faengt auch Sockets ein, die
+     * ausdruecklich ans WLAN gebunden sind (am 23.08.2026 vom Nutzer beobachtet: Tunnel an im
+     * Heim-WLAN, Klingel unerreichbar). Ein stehender Tunnel IST also der Weg, ob man will oder
+     * nicht; ehrlicher ist, ihn dann auch so zu benutzen und zu benennen. Ohne den Schalter
+     * „Auch unterwegs erreichbar" zaehlt ein VPN nicht — dann kann es auch ein fremdes sein
+     * (Firmen-VPN, Privatsphaere-Dienst), und die App verhaelt sich exakt wie vor v1.3.
+     */
+    private val link: StateFlow<Link?> = combine(wifi, vpn, awayEnabled) { w, v, away ->
+        when {
+            away && v != null -> Link(v, tunnel = true)
+            w != null -> Link(w, tunnel = false)
+            else -> null
+        }
+    }.stateIn(scope, SharingStarted.Eagerly, null)
+
+    /** Fuer die UI: steht gerade ein VPN-Netz? (unabhaengig davon, ob wir es benutzen) */
+    val vpnUp: StateFlow<Boolean> = vpn.map { it != null }.stateIn(scope, SharingStarted.Eagerly, false)
+
+    /** Fuer die UI: laeuft die Verbindung ueber den Tunnel? */
+    val viaTunnel: StateFlow<Boolean> = link.map { it?.tunnel == true }.stateIn(scope, SharingStarted.Eagerly, false)
+
     private val uiVisible = MutableStateFlow(false)
     private var alarmUri: String? = null
     private var localAlarmEnabled = true
@@ -160,6 +201,7 @@ class DoorbellService : Service() {
     private var scriptId: Int? = null
     private var lastAlarmAtMs = 0L
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var vpnCallback: ConnectivityManager.NetworkCallback? = null
     private val refreshMutex = Mutex()
 
     /** Verhindert, dass onConnected und „Verbindung pruefen" das Script parallel einspielen. */
@@ -201,7 +243,8 @@ class DoorbellService : Service() {
         // Frueher wurde die Homezone ZUERST gefragt. Seit nicht mehr dauernd gemessen wird, waere
         // das eine Falle: Ein stehengebliebenes "unterwegs" haette auch im eigenen Heim-WLAN
         // blockiert. Siehe docs/standort-nur-wenn-noetig.md.
-        client = ShellyClient(scope, ip, wifi, password) { ipStr, forced ->
+        // Ueber den Tunnel wird dieses Tor gar nicht gefragt (siehe Link) — hier geht es nur ums WLAN.
+        client = ShellyClient(scope, ip, link, password) { ipStr, forced ->
             val decision = wifiGate.decide(ipStr, forced)
             // Die Ortung kommt erst dran, wenn die Versuche in diesem Netz schon eine Weile
             // scheitern. Sonst fragt sie bei jedem WLAN-Zucken — und Zucken gibt es reichlich
@@ -242,8 +285,10 @@ class DoorbellService : Service() {
         alarm.prepare(alarmUri?.let { Uri.parse(it) })
         localAlarmEnabled = initial.alarmEnabled
         listenOnly.value = initial.listenOnly
+        awayEnabled.value = initial.awayEnabled
         if (localAlarmEnabled) startForegroundCompat()
         requestWifi()
+        requestVpn()
         client.start()
 
         scope.launch {
@@ -255,6 +300,10 @@ class DoorbellService : Service() {
                 alarm.prepare(alarmUri?.let { u -> Uri.parse(u) })
                 val listenChanged = listenOnly.value != it.listenOnly
                 listenOnly.value = it.listenOnly
+                if (awayEnabled.value != it.awayEnabled) {
+                    awayEnabled.value = it.awayEnabled
+                    events.log("Unterwegs-Modus ${if (it.awayEnabled) "ein" else "aus"}geschaltet")
+                }
                 setLocalAlarmEnabled(it.alarmEnabled)
                 // Beim Umschalten des Lauschmodus die Verbindung neu bewerten:
                 // eingeschaltet -> keine Auth-Aufrufe mehr; ausgeschaltet ->
@@ -266,10 +315,11 @@ class DoorbellService : Service() {
         }
         scope.launch {
             client.state.collect {
+                val via = if (link.value?.tunnel == true) " ueber Tunnel" else ""
                 val label = when (it) {
-                    is ConnectionState.Connected -> "verbunden (${it.deviceName})"
-                    ConnectionState.Connecting -> "verbinde"
-                    ConnectionState.NoWifi -> "kein WLAN"
+                    is ConnectionState.Connected -> "verbunden (${it.deviceName})$via"
+                    ConnectionState.Connecting -> "verbinde$via"
+                    ConnectionState.NoWifi -> if (awayEnabled.value) "kein WLAN, kein Tunnel" else "kein WLAN"
                     is ConnectionState.OtherNetwork -> "anderes Netz (${it.reason})"
                 }
                 Log.d(TAG, "Verbindungszustand: $label")
@@ -298,14 +348,18 @@ class DoorbellService : Service() {
             // muteUntil/onAt (die beiden temporaeren Schaltpunkte) zu einem Paar
             // buendeln, damit combine bei fuenf Quellen bleibt.
             val tempSwitch = combine(_muteUntil, _onAt) { mute, on -> mute to on }
+            // Homezone und Tunnel-Lage zu einem Kontext buendeln (combine bleibt bei fuenf Quellen).
+            val ctx = combine(homeZone.status, viaTunnel, awayEnabled, vpnUp, homeWifi) { home, tunnel, away, up, hw ->
+                NetCtx(home, tunnel, away, up, hw)
+            }
             combine(
                 client.state,
                 tempSwitch,
                 _bellOn,
                 _bellTimes,
-                homeZone.status,
-            ) { state, (mute, on), bell, times, home ->
-                notifView(state, mute, on, bell, times, home)
+                ctx,
+            ) { state, (mute, on), bell, times, c ->
+                notifView(state, mute, on, bell, times, c)
             }.distinctUntilChanged().collect { updateServiceNotification(it) }
         }
         scope.launch {
@@ -333,10 +387,18 @@ class DoorbellService : Service() {
         }
         scope.launch {
             client.connectedEvents.collect {
-                // Erreichbar in diesem WLAN -> SSID whitelisten, Homezone lernen,
-                // dann Daten laden.
-                wifiGate.onConnected()
-                homeZone.recordConnected()
+                if (link.value?.tunnel == true) {
+                    // Ueber den Tunnel darf NICHTS gelernt werden: Das Handy steht dabei womoeglich
+                    // in einem fremden WLAN an einem fremden Ort (beim Vater) — der WLAN-Name
+                    // gehoert nicht auf die Whitelist, der Ort nicht in die Homezone. Gemerkt wird
+                    // nur, dass der Tunnel nachweislich zur Klingel fuehrt.
+                    events.log("Klingel ueber den Tunnel erreicht")
+                    scope.launch { runCatching { prefs.setTunnelReachedAt(System.currentTimeMillis()) } }
+                } else {
+                    // Erreichbar in diesem WLAN -> SSID whitelisten, Homezone lernen.
+                    wifiGate.onConnected()
+                    homeZone.recordConnected()
+                }
                 onConnected()
             }
         }
@@ -484,6 +546,9 @@ class DoorbellService : Service() {
         networkCallback?.let {
             runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
         }
+        vpnCallback?.let {
+            runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
+        }
         events.log("Dienst beendet")
         homeZone.stop()
         alarm.release()
@@ -521,6 +586,45 @@ class DoorbellService : Service() {
         // requestNetwork (statt registerNetworkCallback) haelt das WLAN aktiv,
         // auch wenn das System sonst auf Mobilfunk wechseln wuerde.
         cm.requestNetwork(request, callback)
+    }
+
+    /**
+     * Den WireGuard-Tunnel beobachten (nur beobachten — `registerNetworkCallback`, kein
+     * `requestNetwork`: Ein VPN fordert man nicht an, es ist da oder nicht).
+     *
+     * **Falle:** Ein `NetworkRequest` hat `NET_CAPABILITY_NOT_VPN` voreingestellt. Ohne das
+     * `removeCapability` unten bekaeme dieser Callback nie ein VPN-Netz zu sehen.
+     *
+     * Keine Berechtigung, keine Ortung: Ein VPN-Netz traegt keinen WLAN-Namen, es gibt hier nichts
+     * zu schwaerzen.
+     */
+    private fun requestVpn() {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+            .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                if (vpn.value != network) {
+                    Log.i(TAG, "VPN-Netz da: $network")
+                    events.log("VPN-Tunnel steht")
+                }
+                vpn.value = network
+                client.reconnectNow()
+            }
+
+            override fun onLost(network: Network) {
+                if (vpn.value != network) return
+                Log.i(TAG, "VPN-Netz weg: $network")
+                events.log("VPN-Tunnel weg")
+                vpn.value = null
+                client.reconnectNow()
+            }
+        }
+        vpnCallback = cb
+        runCatching { cm.registerNetworkCallback(request, cb) }
+            .onFailure { Log.w(TAG, "VPN-Callback nicht registrierbar: $it") }
     }
 
     /**
@@ -563,6 +667,7 @@ class DoorbellService : Service() {
             // Whitelist-Abkuerzung dauerhaft blind. Den Namen liefert [startSsidProbe].
             readSsid(caps)?.let { ssid = it }
             wifiGate.onNetwork(network, ssid, ipv4, prefix)
+            homeWifi.value = wifiGate.isKnownGood()
         }
 
         /**
@@ -617,6 +722,7 @@ class DoorbellService : Service() {
             ssid = name
             Log.d(TAG, "WLAN-Name geholt: $name")
             wifiGate.onNetwork(network, name, ipv4, prefix)
+            homeWifi.value = wifiGate.isKnownGood()
             stopSsidProbe()
         }
 
@@ -637,6 +743,7 @@ class DoorbellService : Service() {
             ipv4 = null
             prefix = 0
             if (wifi.value == network) wifi.value = null
+            homeWifi.value = false
             // Ohne WLAN wird ohnehin kein Verbindungsversuch unternommen — eine Messung
             // koennte an nichts etwas aendern. Nur das Urteil verfaellt.
             homeZone.onNetworkChanged(null)
@@ -968,7 +1075,53 @@ class DoorbellService : Service() {
         events.log("Klingel-Ereignis empfangen (lokalerAlarm=$localAlarmEnabled)")
         scope.launch { recordProvisional(ts) }
         // Lokal stummgeschaltet: Ereignis landet trotzdem in der History
-        if (localAlarmEnabled) startAlarm()
+        if (!localAlarmEnabled) return
+        // Unterwegs (ueber den Tunnel) und „Nicht stoeren" ist an: leise melden statt Alarm.
+        // Daheim durchbricht der Alarm „Nicht stoeren" absichtlich — das bleibt so.
+        if (link.value?.tunnel == true && systemDndActive()) {
+            events.log("Klingeln leise gemeldet (unterwegs, Nicht stoeren)")
+            postQuietRingNotification()
+        } else {
+            startAlarm()
+        }
+    }
+
+    /** Ist am Handy „Nicht stoeren" aktiv? Ohne Berechtigung lesbar (im Gegensatz zum Aendern). */
+    private fun systemDndActive(): Boolean {
+        val f = getSystemService(NotificationManager::class.java)?.currentInterruptionFilter
+            ?: return false
+        return f != NotificationManager.INTERRUPTION_FILTER_ALL &&
+            f != NotificationManager.INTERRUPTION_FILTER_UNKNOWN
+    }
+
+    /**
+     * Das leise Klingeln: eine gewoehnliche Benachrichtigung auf dem Kanal ohne DND-Durchbruch —
+     * kein Weckerton, keine Vibration, kein Vollbild, kein Anruf-Banner. Nur „Tuer ansehen", falls
+     * die Tuersprecher-App da ist (ueber den Tunnel funktioniert sie, videoapp ab v1.66).
+     */
+    private fun postQuietRingNotification() {
+        val door = DoorIntents.doorIntent(this)
+        val builder = NotificationCompat.Builder(this, Channels.RING_QUIET)
+            .setSmallIcon(R.drawable.ic_stat_bell)
+            .setContentTitle(getString(R.string.notif_ring_title))
+            .setContentText(getString(R.string.notif_ring_quiet_text))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_EVENT)
+            .setAutoCancel(true)
+            .setContentIntent(
+                PendingIntent.getActivity(
+                    this, 4,
+                    Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                    PendingIntent.FLAG_IMMUTABLE,
+                ),
+            )
+        if (door != null) {
+            builder.addAction(
+                0, getString(R.string.notif_ring_door),
+                PendingIntent.getActivity(this, 5, door, PendingIntent.FLAG_IMMUTABLE),
+            )
+        }
+        runCatching { getSystemService(NotificationManager::class.java).notify(NOTIF_ID_RING_QUIET, builder.build()) }
     }
 
     private fun onHeartbeat(data: JSONObject?) {
@@ -1623,6 +1776,19 @@ class DoorbellService : Service() {
     /** Gebuendelter Anzeigezustand der Dauer-Notification. */
     private data class NotifView(val color: NotifColor, val dnd: Boolean, val text: String)
 
+    /** Netz-Lage fuer die Dauer-Notification: Homezone plus Tunnel (siehe notifView). */
+    private data class NetCtx(
+        val home: HomeStatus,
+        /** Verbindung laeuft ueber den Tunnel. */
+        val tunnel: Boolean,
+        /** „Auch unterwegs erreichbar" ist an. */
+        val away: Boolean,
+        /** Ein VPN-Netz steht (ob benutzt oder nicht). */
+        val vpnUp: Boolean,
+        /** Ein WLAN aus der Whitelist liegt an — das Heim-WLAN. */
+        val homeWifi: Boolean,
+    )
+
     /**
      * Braucht der Dauerdienst den FGS-Typ `location` ueberhaupt?
      *
@@ -1728,7 +1894,7 @@ class DoorbellService : Service() {
         onAt: Long?,
         bellOn: Boolean?,
         bellTimes: List<BellEntry>?,
-        home: HomeStatus,
+        ctx: NetCtx,
     ): NotifView = when (state) {
         is ConnectionState.Connected -> {
             // Wahrheit ist der tatsaechliche Schalterzustand — exakt wie die
@@ -1741,7 +1907,8 @@ class DoorbellService : Service() {
             val nowS = System.currentTimeMillis() / 1000
             val off = bellOn == false
             if (!off) {
-                NotifView(NotifColor.BLUE, false, getString(R.string.notif_listening))
+                val text = if (ctx.tunnel) R.string.notif_listening_vpn else R.string.notif_listening
+                NotifView(NotifColor.BLUE, false, getString(text))
             } else {
                 val muted = (muteUntil ?: 0L) > nowS
                 val onAtPending = (onAt ?: 0L) > nowS
@@ -1770,23 +1937,36 @@ class DoorbellService : Service() {
                 NotifView(NotifColor.BLUE, true, text)
             }
         }
-        ConnectionState.Connecting ->
-            NotifView(NotifColor.GREY, false, getString(R.string.notif_connecting))
-        ConnectionState.NoWifi -> when (home) {
-            HomeStatus.INSIDE -> NotifView(NotifColor.RED, false, getString(R.string.notif_home_no_wifi))
-            HomeStatus.OUTSIDE -> NotifView(NotifColor.GREY, false, getString(R.string.notif_away))
-            HomeStatus.UNKNOWN -> NotifView(NotifColor.GREY, false, getString(R.string.notif_no_wifi))
+        ConnectionState.Connecting -> when {
+            // Tunnel steht, aber das Heim-WLAN liegt auch an: Dann faengt das VPN den WLAN-Verkehr
+            // ein und die Klingel ist nicht erreichbar (siehe link). Der Nutzer kann das beheben —
+            // deshalb rot und eine Handlungsanweisung, nicht grau.
+            ctx.tunnel && ctx.homeWifi -> NotifView(NotifColor.RED, false, getString(R.string.notif_home_vpn_on))
+            ctx.tunnel -> NotifView(NotifColor.GREY, false, getString(R.string.notif_connecting_vpn))
+            else -> NotifView(NotifColor.GREY, false, getString(R.string.notif_connecting))
+        }
+        ConnectionState.NoWifi -> when {
+            ctx.home == HomeStatus.INSIDE -> NotifView(NotifColor.RED, false, getString(R.string.notif_home_no_wifi))
+            // Unterwegs-Modus an, aber kein Tunnel: Das ist der Hinweis, der hilft.
+            ctx.away && !ctx.vpnUp -> NotifView(NotifColor.GREY, false, getString(R.string.notif_away_vpn_off))
+            ctx.home == HomeStatus.OUTSIDE -> NotifView(NotifColor.GREY, false, getString(R.string.notif_away))
+            else -> NotifView(NotifColor.GREY, false, getString(R.string.notif_no_wifi))
         }
         // Alle Fremdnetz-Faelle heissen gleich — falsches Subnetz, Greylist, Homezone. Woran die
         // App gemerkt hat, dass sie nicht daheim ist, aendert fuer den Nutzer nichts und stand
         // frueher nur als Rauschen in der Leiste (samt Shelly-IP). Der Grund steht im
         // Ereignisprotokoll, siehe ConnectionState.OtherNetwork.reason.
         is ConnectionState.OtherNetwork ->
-            NotifView(NotifColor.GREY, false, getString(R.string.notif_away))
+            if (ctx.away && !ctx.vpnUp) {
+                NotifView(NotifColor.GREY, false, getString(R.string.notif_away_vpn_off))
+            } else {
+                NotifView(NotifColor.GREY, false, getString(R.string.notif_away))
+            }
     }
 
     private fun currentNotifView(): NotifView = notifView(
-        client.state.value, _muteUntil.value, _onAt.value, _bellOn.value, _bellTimes.value, homeZone.status.value,
+        client.state.value, _muteUntil.value, _onAt.value, _bellOn.value, _bellTimes.value,
+        NetCtx(homeZone.status.value, viaTunnel.value, awayEnabled.value, vpnUp.value, homeWifi.value),
     )
 
     /** Zuletzt gepostete Ansicht — verhindert unnoetiges Neu-Posten (Minuten-Ticker). */
@@ -1811,6 +1991,7 @@ class DoorbellService : Service() {
 
         private const val NOTIF_ID_SERVICE = 1
         private const val NOTIF_ID_RING = 2
+        private const val NOTIF_ID_RING_QUIET = 3
 
         /** Poll-Abstand fuer die reine Watt-Anzeige (Live-Aenderungen pusht der
          *  Shelly ohnehin per NotifyStatus – gemaechlich genuegt, spart Anfragen). */

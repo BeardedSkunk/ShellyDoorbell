@@ -4,6 +4,7 @@
 
     <string name="channel_service">Hintergrunddienst</string>
     <string name="channel_alarm">Klingel-Alarm</string>
+    <string name="channel_ring_quiet">Klingeln unterwegs (leise)</string>
 
     <string name="notif_listening">Verbunden – lausche auf die Klingel</string>
     <string name="notif_listening_quiet_until">Ruhe bis %s</string>
@@ -12,9 +13,15 @@
     <string name="notif_no_wifi">Kein WLAN – warte auf Verbindung</string>
     <string name="notif_home_no_wifi">Zu Hause, aber kein WLAN</string>
     <string name="notif_away">Unterwegs – warte aufs Heimnetz</string>
+    <!-- Nur mit „Auch unterwegs erreichbar" (WireGuard-Tunnel), sonst nie zu sehen -->
+    <string name="notif_listening_vpn">Verbunden übers VPN – lausche auf die Klingel</string>
+    <string name="notif_connecting_vpn">Verbinde übers VPN …</string>
+    <string name="notif_away_vpn_off">Unterwegs – VPN ist aus</string>
+    <string name="notif_home_vpn_on">Zu Hause – VPN abschalten</string>
 
     <string name="notif_ring_title">Es klingelt!</string>
     <string name="notif_ring_text">Jemand ist an der Tür.</string>
+    <string name="notif_ring_quiet_text">Jemand ist an der Tür (leise, „Nicht stören“ ist an).</string>
     <string name="notif_ring_stop">Stopp</string>
     <string name="notif_ring_door">🚪 Tür ansehen</string>
     <!-- Name des "Anrufers" in der Anruf-Benachrichtigung (CallStyle) -->

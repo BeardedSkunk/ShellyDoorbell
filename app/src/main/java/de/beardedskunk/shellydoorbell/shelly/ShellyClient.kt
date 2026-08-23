@@ -79,6 +79,24 @@ private const val POST_AUTH_GAP_MS = 120L
 /** Erster Reconnect-Abstand; verdoppelt sich bis zum Deckel der Tor-Entscheidung. */
 private const val INITIAL_BACKOFF_MS = 5_000L
 
+/** Backoff-Deckel ueber den Tunnel. Dort gibt es kein Tor (siehe [Link.tunnel]), nur diesen
+ *  Deckel: Aussetzer im Mobilfunk sind kurz, und ein stehender Tunnel ist absichtlich „zu Hause"
+ *  — 30 Minuten Wiedervorlage wie bei einem Fremdnetz waeren hier fehl am Platz. */
+private const val TUNNEL_MAX_BACKOFF_MS = 60_000L
+
+/**
+ * Das Netz, ueber das der Client den Shelly erreichen soll — plus die Information, ob es der
+ * WireGuard-Tunnel ist.
+ *
+ * Warum die Unterscheidung wichtig ist: Die drei Tore (Subnetz, WLAN-Listen, Homezone)
+ * beantworten die Frage „bin ich zu Hause?". Ein Tunnel nach Hause ist *absichtlich* zu Hause —
+ * fuer ihn gibt es kein Tor, und der Service darf aus einer Verbindung darueber auch nichts
+ * lernen (weder den WLAN-Namen whitelisten noch den Ort als Zuhause merken: Beim Vater steht
+ * das Handy in einem fremden WLAN an einem fremden Ort, waehrend es ueber den Tunnel mit der
+ * Klingel spricht).
+ */
+data class Link(val net: Network, val tunnel: Boolean)
+
 sealed class ConnectionState {
     /** Kein WLAN verfuegbar (oder keine IP konfiguriert). */
     data object NoWifi : ConnectionState()
@@ -117,17 +135,19 @@ class ShellyRpcException(val code: Int, message: String) : Exception(message) {
 /**
  * Haelt dauerhaft eine WebSocket-RPC-Verbindung zu ws://<ip>/rpc.
  *
- * Die Verbindung laeuft ausschliesslich ueber das uebergebene WLAN-[Network]
- * (SocketFactory + DNS daran gebunden), Mobilfunk wird nie benutzt. Bei
- * Verbindungsabbruch wird mit exponentiellem Backoff neu verbunden; wechselt
- * IP oder Netzwerk, wird die laufende Verbindung ersetzt.
+ * Die Verbindung laeuft ausschliesslich ueber das uebergebene [Network] aus dem [Link]
+ * (SocketFactory + DNS daran gebunden) — das WLAN oder der WireGuard-Tunnel. Nacktes Mobilfunk
+ * wird nie benutzt: Ohne Tunnel gibt es unterwegs kein Netz, an das gebunden werden koennte,
+ * also auch keinen Versuch. Bei Verbindungsabbruch wird mit exponentiellem Backoff neu
+ * verbunden; wechselt IP oder Netzwerk, wird die laufende Verbindung ersetzt.
  */
 class ShellyClient(
     private val scope: CoroutineScope,
     private val ipFlow: StateFlow<String>,
-    private val networkFlow: StateFlow<Network?>,
+    private val networkFlow: StateFlow<Link?>,
     private val passwordFlow: StateFlow<String>,
-    /** Netzwerk-Tor: entscheidet vor jedem Versuch, ob/ wie verbunden wird.
+    /** Netzwerk-Tor: entscheidet vor jedem Versuch ueber das WLAN, ob/ wie verbunden wird.
+     *  Ueber den Tunnel wird es nicht gefragt (siehe [Link]).
      *  Default = immer verbinden (Deckel 30 s), falls kein Tor gesetzt ist. */
     private val gate: suspend (ip: String, forced: Boolean) -> GateDecision =
         { _, _ -> GateDecision.Attempt(30_000L) },
@@ -316,12 +336,12 @@ class ShellyClient(
         scope.launch {
             combine(ipFlow, networkFlow) { ip, net -> ip to net }
                 .distinctUntilChanged()
-                .collectLatest { (ip, net) ->
-                    if (net == null || ip.isBlank()) {
+                .collectLatest { (ip, link) ->
+                    if (link == null || ip.isBlank()) {
                         _state.value = ConnectionState.NoWifi
                         return@collectLatest
                     }
-                    val http = buildClient(net)
+                    val http = buildClient(link.net)
                     try {
                         var backoff = INITIAL_BACKOFF_MS
                         while (currentCoroutineContext().isActive) {
@@ -334,7 +354,14 @@ class ShellyClient(
                                 continue
                             }
                             val forced = pendingForce.getAndSet(false)
-                            when (val decision = gate(ip, forced)) {
+                            // Ueber den Tunnel gibt es kein Tor: Er fuehrt per Definition nach
+                            // Hause, die Frage „bin ich daheim?" stellt sich nicht.
+                            val decision = if (link.tunnel) {
+                                GateDecision.Attempt(TUNNEL_MAX_BACKOFF_MS)
+                            } else {
+                                gate(ip, forced)
+                            }
+                            when (decision) {
                                 is GateDecision.Block -> {
                                     // Bewusst nicht verbinden (falsches Netz / Greylist).
                                     _state.value = decision.holdState
@@ -346,7 +373,7 @@ class ShellyClient(
                                 }
                                 is GateDecision.Attempt -> {
                                     _state.value = ConnectionState.Connecting
-                                    Log.d(TAG, "Verbinde mit ws://$ip/rpc")
+                                    Log.d(TAG, "Verbinde mit ws://$ip/rpc" + if (link.tunnel) " (Tunnel)" else "")
                                     val ok = runSession(http, ip)
                                     _state.value = ConnectionState.Connecting
                                     backoff = if (ok) INITIAL_BACKOFF_MS

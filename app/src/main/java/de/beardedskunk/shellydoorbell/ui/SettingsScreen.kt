@@ -58,6 +58,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
 import de.beardedskunk.shellydoorbell.Channels
+import de.beardedskunk.shellydoorbell.WireGuard
 import de.beardedskunk.shellydoorbell.data.Prefs
 import de.beardedskunk.shellydoorbell.service.ConnCheck
 import de.beardedskunk.shellydoorbell.service.DoorbellService
@@ -87,6 +88,10 @@ fun SettingsScreen(
     val conn by service.connectionState.collectAsState()
     val connected = conn is ConnectionState.Connected
     val listenOnly = settings?.listenOnly ?: false
+    val vpnUp by service.vpnUp.collectAsState()
+    val viaTunnel by service.viaTunnel.collectAsState()
+    val wireGuardInstalled = remember(resumeTick) { WireGuard.isInstalled(context) }
+    var tunnelField by remember(settings?.wgTunnel) { mutableStateOf(settings?.wgTunnel ?: "") }
 
     // Berechtigungs-Status; resumeTick sorgt fuer Neubewertung nach Rueckkehr aus den System-Settings
     val powerManager = context.getSystemService(PowerManager::class.java)
@@ -289,6 +294,19 @@ fun SettingsScreen(
                 }
             }
 
+            AwayCard(
+                installed = wireGuardInstalled,
+                tunnelName = tunnelField,
+                onTunnelNameChange = { tunnelField = it },
+                savedTunnelName = settings?.wgTunnel ?: "",
+                onSaveTunnelName = { scope.launch { prefs.setWgTunnel(tunnelField) } },
+                enabled = settings?.awayEnabled ?: false,
+                onEnabledChange = { on -> scope.launch { prefs.setAwayEnabled(on) } },
+                vpnUp = vpnUp,
+                viaTunnel = viaTunnel && connected,
+                reachedAt = settings?.tunnelReachedAt,
+            )
+
             Card {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("Zuverlässigkeit", style = MaterialTheme.typography.titleMedium)
@@ -376,6 +394,93 @@ fun SettingsScreen(
                 onDismiss = { if (!checking) checkResult = null },
             )
         }
+    }
+}
+
+/**
+ * „Unterwegs": die Klingel auch ohne Heim-WLAN, ueber den WireGuard-Tunnel nach Hause.
+ *
+ * Der Schalter ist ausgegraut, solange WireGuard fehlt oder kein Tunnelname gespeichert ist —
+ * die App kann die Tunnelliste nicht lesen, der Name muss getippt werden (siehe `WireGuard.kt`).
+ * Wer keinen Tunnel hat, sieht hier nur, dass es die Moeglichkeit gibt; sonst aendert sich fuer
+ * ihn nichts (docs/vpn-von-unterwegs.md, „Schritt 2").
+ */
+@Composable
+private fun AwayCard(
+    installed: Boolean,
+    tunnelName: String,
+    onTunnelNameChange: (String) -> Unit,
+    savedTunnelName: String,
+    onSaveTunnelName: () -> Unit,
+    enabled: Boolean,
+    onEnabledChange: (Boolean) -> Unit,
+    vpnUp: Boolean,
+    viaTunnel: Boolean,
+    reachedAt: Long?,
+) {
+    val nameSaved = savedTunnelName.isNotBlank()
+    val nameChanged = tunnelName.trim() != savedTunnelName
+    Card {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Unterwegs", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Ohne Heim-WLAN verbindet sich die App über den WireGuard-Tunnel nach Hause und " +
+                    "meldet das Klingeln auch unterwegs. Ist am Handy „Nicht stören“ an, kommt es leise.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            OutlinedTextField(
+                value = tunnelName,
+                onValueChange = onTunnelNameChange,
+                label = { Text("WireGuard-Tunnel (Name wie in der WireGuard-App)") },
+                singleLine = true,
+                enabled = installed,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            if (installed && nameChanged) {
+                Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                    Button(onClick = onSaveTunnelName, enabled = tunnelName.isNotBlank()) { Text("Übernehmen") }
+                }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Auch unterwegs erreichbar", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        when {
+                            !installed -> "Braucht die WireGuard-App mit einem Tunnel ins Heimnetz."
+                            !nameSaved -> "Erst oben den Tunnelnamen eintragen."
+                            else -> "Den Tunnel vorerst selbst schalten: unterwegs an, zu Hause aus — " +
+                                "steht er daheim, findet die App die Klingel nicht."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Switch(
+                    checked = enabled && installed && nameSaved,
+                    onCheckedChange = onEnabledChange,
+                    enabled = installed && nameSaved,
+                )
+            }
+            Column {
+                StatusLine("WireGuard", if (installed) "installiert" else "fehlt")
+                StatusLine("Tunnel", if (vpnUp) "aktiv" else "aus")
+                StatusLine(
+                    "Klingel über den Tunnel erreicht",
+                    when {
+                        viaTunnel -> "jetzt"
+                        reachedAt != null -> "zuletzt " + Fmt.dayTime(reachedAt / 1000)
+                        else -> "noch nie"
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusLine(label: String, value: String) {
+    Row(Modifier.fillMaxWidth()) {
+        Text("$label: ", style = MaterialTheme.typography.bodySmall)
+        Text(value, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
     }
 }
 

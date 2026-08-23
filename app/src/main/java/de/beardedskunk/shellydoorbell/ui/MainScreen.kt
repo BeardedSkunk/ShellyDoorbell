@@ -103,6 +103,7 @@ fun MainScreen(
     val onAt by service.onAt.collectAsState()
     val scriptOk by service.scriptOk.collectAsState()
     val alarmActive by service.alarmActive.collectAsState()
+    val viaTunnel by service.viaTunnel.collectAsState()
     val connected = conn is ConnectionState.Connected
 
     Scaffold(
@@ -126,7 +127,7 @@ fun MainScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             if (alarmActive) AlarmBanner(onStop = { service.stopAlarm() })
-            ConnectionCard(conn, watts, onReconnect = { service.reconnect() })
+            ConnectionCard(conn, watts, viaTunnel, onReconnect = { service.reconnect() })
             if (connected && scriptOk == false) ScriptWarning()
             BellCard(
                 bellOn = bellOn,
@@ -248,15 +249,18 @@ private fun AlarmBanner(onStop: () -> Unit) {
 }
 
 @Composable
-private fun ConnectionCard(conn: ConnectionState, watts: Double?, onReconnect: () -> Unit) {
+private fun ConnectionCard(conn: ConnectionState, watts: Double?, viaTunnel: Boolean, onReconnect: () -> Unit) {
     Card {
         Row(
             Modifier.fillMaxWidth().padding(16.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            // „übers VPN" nur, wenn die Verbindung wirklich durch den Tunnel laeuft (Unterwegs-Modus).
             val (color, title, sub) = when (conn) {
-                is ConnectionState.Connected -> Triple(Color(0xFF43A047), "Verbunden", conn.deviceName)
-                ConnectionState.Connecting -> Triple(Color(0xFFFB8C00), "Verbinde …", "Shelly wird gesucht")
+                is ConnectionState.Connected ->
+                    Triple(Color(0xFF43A047), if (viaTunnel) "Verbunden übers VPN" else "Verbunden", conn.deviceName)
+                ConnectionState.Connecting ->
+                    Triple(Color(0xFFFB8C00), if (viaTunnel) "Verbinde übers VPN …" else "Verbinde …", "Shelly wird gesucht")
                 ConnectionState.NoWifi -> Triple(Color(0xFFE53935), "Kein WLAN", "Warte auf Heimnetz")
                 is ConnectionState.OtherNetwork -> Triple(Color(0xFF9E9E9E), "Unterwegs", "Warte aufs Heimnetz")
             }
