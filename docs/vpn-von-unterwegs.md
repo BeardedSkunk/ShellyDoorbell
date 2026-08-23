@@ -1,15 +1,18 @@
 # Von unterwegs erreichbar sein (WireGuard)
 
-Status: **Schritt 1 erledigt am 21.08.2026** (videoapp v1.66). Schritt 2 (Klingel-App) steht aus.
+Status: **Schritt 1 erledigt am 21.08.2026** (videoapp v1.66), Test von außen bestanden. Schritt 2
+(Klingel-App) ist **geplant, nicht gebaut** — der Plan steht unten („Schritt 2 — der Plan").
 
 Vorgehen ist bewusst schrittweise. Reihenfolge und Stand:
 
 | Schritt | Stand |
 |---|---|
 | videoapp: VPN als erreichbares Netz | **fertig** (v1.66, nur aufs Pixel) |
-| Pixel mit der FRITZ!Box-Verbindung koppeln | offen — macht der Nutzer |
-| Test von außen (WLAN aus, nur Mobilfunk) | offen |
-| Klingel-App: Schalter „auch unterwegs" | offen |
+| Pixel mit der FRITZ!Box-Verbindung koppeln | **fertig** (Tunnel „Home64", 21.08.) |
+| Test von außen (WLAN aus, nur Mobilfunk) | **bestanden** 21.08. — FRITZ!Box und Video erreichbar |
+| `AllowedIPs` auf das Heimnetz eingrenzen | offen — macht der Nutzer in der WireGuard-App |
+| Klingel-App: Schalter „auch unterwegs" (2a) | geplant, siehe unten |
+| Klingel-App schaltet den Tunnel selbst (2b) | geplant, nach 2a |
 
 **Die Klingel bekommt einen Schalter, die videoapp nicht.** So hat es der Nutzer entschieden, und
 es ist richtig: Die Videoübertragung weckt niemanden — wenn sie von unterwegs kann, soll sie es
@@ -157,3 +160,123 @@ die Ladesteckdosen und die Balkonkraftwerk-Dose feste Adressen haben.
 2. videoapp (klein, sofort vorzeigbar).
 3. ShellyDoorbell (größer).
 4. Takte neu setzen.
+
+## Schritt 2 — der Plan (23.08.2026, abgesprochen, nicht gebaut)
+
+Was der Nutzer will, in seinen Worten zusammengefasst: Für alle, die die App ohne WireGuard-Zugang
+ins Heimnetz benutzen, **ändert sich nichts** — dieselbe Dauer-Notification, dieselben Hinweise.
+Wer einen Tunnel nach Hause hat, bekommt ein neues Verhalten: unterwegs informiert werden, die
+App schaltet den Tunnel **selbst ein, wenn das Heim-WLAN fehlt, und wieder aus, wenn es da ist**.
+Ein Schalter in der App stellt das Ganze ab. Und: Ist am Handy „Nicht stören" an, klingelt es
+unterwegs **leise**.
+
+### Was die App erkennen kann — und was nicht
+
+| Frage | Antwort | Wie |
+|---|---|---|
+| Ist WireGuard installiert? | **ja** | `PackageManager` + `<queries><package android:name="com.wireguard.android"/>` im Manifest (dieselbe Mechanik wie die Türsprecher-Erkennung) |
+| Steht gerade ein Tunnel? | **ja, ohne Berechtigung** | `NetworkCallback` auf `TRANSPORT_VPN`. **Falle:** Ein `NetworkRequest` hat `NET_CAPABILITY_NOT_VPN` voreingestellt — ohne `removeCapability(NOT_VPN)` sieht man VPN-Netze nie. |
+| Hat WireGuard einen Tunnel **in mein Heimnetz**? | **nicht lesbar** | Die App gibt ihre Tunnelliste nicht heraus (kein Provider, kein Abfrage-Intent). |
+| Führt der Tunnel wirklich zur Klingel? | **beweisbar statt lesbar** | Der Shelly antwortet durch den Tunnel — einmal gelungen, merkt sich die App das (wie die WLAN-Whitelist). |
+| Wie heißt der Tunnel (fürs Schalten)? | **muss eingetippt werden** | Ein Textfeld, z. B. `Home64`. Die App prüft den Namen: Nach `SET_TUNNEL_UP` muss binnen Sekunden ein VPN-Netz auftauchen, sonst stimmt der Name nicht oder die Fernsteuerung ist nicht erlaubt. |
+
+Daraus folgt die Bedienung: Der Schalter **„Auch unterwegs erreichbar"** ist ausgegraut, solange
+WireGuard fehlt oder kein Tunnelname eingetragen ist. Genau der Vorschlag des Nutzers („ein Setting
+vorher, in dem man die Verbindung benennt") — er ist nicht der Notnagel, sondern der einzige Weg.
+
+**Drei Bedingungen, alle billig:** WireGuard installiert → Schalter an → Tunnel steht. Fehlt eine,
+verhält sich die App exakt wie heute. Die Voreinstellung ist „aus".
+
+### Die Falle, die der Nutzer am 23.08. selbst gefunden hat
+
+**Tunnel an + Heim-WLAN ⇒ die App erreicht den Shelly nicht.** Das ist nicht bloß „die App kennt
+VPN noch nicht": Die Verbindung ist ans WLAN-`Network` gebunden, und trotzdem kam nichts an. Der
+Grund liegt bei Android: Ein VPN ist standardmäßig **nicht umgehbar** — solange es steht, wandert
+der Verkehr *aller* Apps hinein, **auch der, den eine App ausdrücklich an ein anderes Netz gebunden
+hat** (`VpnService.Builder.allowBypass()` würde das erlauben; WireGuard ruft es nicht auf). Die
+Pakete an `192.168.178.20` gingen also in den Tunnel, von dort zur öffentlichen Adresse der
+FRITZ!Box — von innen. Ob die Box das nicht annimmt oder schon der Handshake von innen scheitert,
+ist nicht gemessen und für die Bauweise egal. **Folge: „zu Hause angekommen ⇒ Tunnel aus" ist
+keine Bequemlichkeit, sondern Pflicht.** Ohne das ist die Klingel daheim tot, sobald der Tunnel
+einmal an war.
+
+### 2a — die App nutzt einen stehenden Tunnel
+
+Der WLAN-Pfad bleibt **unverändert und vorrangig**. Daneben ein zweiter, schlichter Pfad:
+
+- **Ein zweiter Wächter** neben `WifiWatcher`: `registerNetworkCallback` auf `TRANSPORT_VPN`
+  (mit `removeCapability(NOT_VPN)`), liefert `vpn: StateFlow<Network?>`. Keine Berechtigung,
+  keine Ortung — ein VPN-Netz hat keinen WLAN-Namen.
+- **Netzwahl:** Steht der WLAN-Pfad auf `NoWifi` oder `OtherNetwork`, ist der Schalter an und gibt
+  es ein VPN-Netz, dann baut `ShellyClient` den Client **an das VPN-`Network` gebunden** — dieselbe
+  Bindung wie beim WLAN (`socketFactory` + `Dns` über `net.getAllByName`). Das hält das Versprechen
+  „Mobilfunk wird nie benutzt" wörtlich: Ohne Tunnel gibt es kein Netz, an das gebunden werden
+  könnte, also keinen Versuch.
+- **Kein Tor für den Tunnel.** Subnetz, Whitelist, Greylist, Homezone beantworten „bin ich zu
+  Hause?" — ein Tunnel ist *absichtlich* zu Hause. Es bleibt der normale Backoff, Deckel 60 s
+  (Aussetzer im Mobilfunk sind kurz).
+- **Texte:** verbunden über den Tunnel → „Verbunden übers VPN – lausche auf die Klingel" (blau,
+  mit DND-Zeichen bei Ruhe wie daheim). Schalter an, unterwegs, kein Tunnel → „Unterwegs – VPN ist
+  aus" (grau). Alles andere bleibt; mit Schalter aus bleiben **alle** Texte wie heute.
+- **Klingeln unterwegs:** Ist „Nicht stören" am Handy aktiv (`currentInterruptionFilter != ALL`,
+  ohne Berechtigung lesbar), kommt das Klingeln **leise**: eine Benachrichtigung auf einem
+  zweiten Kanal ohne `setBypassDnd`, ohne Wecker-Stream, ohne Vollbild — mit „Tür ansehen", und
+  eine Zeile im Ereignisprotokoll. Ist „Nicht stören" aus, klingelt es wie daheim (Wecker-Stream,
+  Anruf-Darstellung). Daheim ändert sich nichts: Dort durchbricht der Alarm „Nicht stören"
+  weiterhin absichtlich (Einstellungen → Zuverlässigkeit).
+- **Einstellungen-Karte „Unterwegs":** Textfeld *WireGuard-Tunnel*, Schalter *Auch unterwegs
+  erreichbar* (ausgegraut ohne WireGuard / ohne Namen), darunter Zustandszeilen: *WireGuard:
+  installiert / fehlt* · *Tunnel: aktiv / aus* · *Klingel über den Tunnel erreicht: zuletzt … /
+  noch nie*.
+
+### 2b — die App schaltet den Tunnel
+
+**Am Pixel nachgeprüft (23.08.2026, `dumpsys package com.wireguard.android`, Version
+1.0.20260315):** Es gibt den Empfänger `com.wireguard.android/.model.TunnelManager$IntentReceiver`
+für die Aktionen `com.wireguard.android.action.SET_TUNNEL_UP`, `SET_TUNNEL_DOWN` und
+`REFRESH_TUNNEL_STATES`, und die App deklariert eine eigene Berechtigung
+`com.wireguard.android.permission.CONTROL_TUNNELS` mit Schutzstufe `dangerous`.
+
+**Aus dem Quelltext der WireGuard-App, am Gerät noch nicht ausprobiert:** Der Tunnelname geht als
+Extra `tunnel` mit; der Empfänger verlangt die Berechtigung oben (unsere App muss sie im Manifest
+anfordern und zur Laufzeit erfragen — sie ist `dangerous`, Android zeigt dafür einen Dialog); und
+in den WireGuard-Einstellungen muss die Fernsteuerung durch andere Apps erlaubt sein, sonst wirft
+der Empfänger den Intent still weg. **Erster Schritt von 2b ist deshalb ein Probelauf per
+`adb shell am broadcast …` auf dem Pixel** — der schaltet den Tunnel dort tatsächlich, also nur
+mit Ansage.
+
+**Die Schaltregeln, bewusst konservativ** (das WLAN des Pixel zuckt im Minutentakt — jede Regel
+muss das aushalten):
+
+| Richtung | Auslöser | Schranke |
+|---|---|---|
+| **AN** | WLAN-Pfad steht auf `NoWifi` **oder** `OtherNetwork` — egal ob unterwegs oder daheim mit WLAN aus, Mobilfunk an (ausdrücklicher Wunsch) | erst nach **2 min** am Stück, und nur, wenn kein VPN-Netz da ist |
+| **AUS** | ein WLAN mit Namen aus der **Whitelist** ist beigetreten | sofort; danach auf `onLost` des VPN-Netzes warten, dann `reconnectNow()` |
+| **AUS** | der Nutzer stellt den Schalter ab | sofort |
+
+Die 2-Minuten-Schranke kostet höchstens ein Klingeln in den ersten zwei Minuten nach dem
+Verlassen des Hauses — das ist der Preis dafür, dass ein WLAN-Zucker daheim den Tunnel nicht
+hochreißt (und damit, siehe Falle oben, die Klingel abwürgt). **Nie AN**, solange ein WLAN da ist,
+dessen Subnetz passt und dessen Versuche noch nicht als gescheitert gelten (Greylist-Logik bleibt
+zuständig). **AUS nur über die Whitelist**, nicht übers Subnetz — beim Vater passt das Subnetz
+auch, und dort soll der Tunnel stehen bleiben.
+
+Bekannte Grenze: Auf einem frischen Handy ist die Whitelist leer, die App kann den Tunnel daheim
+also nicht selbst abschalten, bevor sie dort einmal direkt verbunden war. Einmal von Hand aus,
+dann trägt sich das Heim-WLAN ein, ab da läuft es. Das gehört in die Zustandszeile der Karte.
+
+### 2c — Takte (unverändert später)
+
+WebSocket-Ping 25 s und Script-Heartbeat 30 s bleiben vorerst. Solange der Tunnel steht, klopft
+WireGuard ohnehin alle 25 s; unser Ping kostet dann nichts zusätzlich. Erst wenn 2b läuft, lohnt
+es sich zu messen, was der Tunnel am Tag an Akku kostet.
+
+### Reihenfolge und Abnahme
+
+1. **2a bauen**, aufs Pixel, Nutzer testet unterwegs mit von Hand geschaltetem Tunnel: Klingeln
+   kommt an, „Tür ansehen" öffnet die videoapp über den Tunnel, mit „Nicht stören" kommt es leise.
+2. **Probelauf Fernsteuerung** per adb (mit Ansage), dann **2b bauen**. Abnahme: Haus verlassen →
+   nach 2 min steht der Tunnel; nach Hause kommen → Tunnel aus, Klingel direkt verbunden.
+   Prüfstein am Gerät: Ereignisprotokoll der App (`files/log/events.log`) zeigt beide Schaltungen
+   mit Grund.
+3. Takte messen (2c).
