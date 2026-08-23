@@ -42,6 +42,11 @@
     <uses-permission
         android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation" />
+    <!-- WireGuard fernsteuern (Tunnel an/aus, siehe WireGuard.kt). Eine von der WireGuard-App
+         deklarierte "dangerous"-Berechtigung: Android fragt den Nutzer, und zusaetzlich muss in
+         den WireGuard-Einstellungen die Fernsteuerung durch andere Apps erlaubt sein. Ist
+         WireGuard nicht installiert, existiert die Berechtigung nicht und bleibt wirkungslos. -->
+    <uses-permission android:name="com.wireguard.android.permission.CONTROL_TUNNELS" />
 
     <!-- Sichtbarkeit der Türsprecher-App (Android 11+): nur so lässt sich
          erkennen, ob deren "Tür öffnen"-Einsprung installiert ist. -->

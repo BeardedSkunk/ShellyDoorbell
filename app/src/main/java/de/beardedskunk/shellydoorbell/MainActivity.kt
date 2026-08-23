@@ -61,6 +61,11 @@ class MainActivity : ComponentActivity() {
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
+    // WireGuard fernsteuern (Tunnel an/aus). Auf Activity-Ebene wie die anderen Launcher; nach
+    // dem Dialog die Karte neu bewerten lassen.
+    private val tunnelPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { resumeTick.intValue++ }
+
     // WLAN-Namen (SSID) lesen + Standort fuer die Homezone. Beides optional:
     // ohne SSID faellt die App auf reine Subnetz-Erkennung zurueck, ohne Standort
     // entfallen die Homezone-Funktionen.
@@ -121,6 +126,7 @@ class MainActivity : ComponentActivity() {
                         service = service.value,
                         resumeTick = resumeTick.intValue,
                         onPickRingtone = ringtonePicker::launch,
+                        onRequestTunnelControl = { tunnelPermission.launch(WireGuard.PERMISSION) },
                         // „Im Hintergrund weiterlaufen": Task in den Hintergrund, der
                         // Dauerdienst (und seine Notification) bleiben bestehen.
                         onRunInBackground = { moveTaskToBack(true) },
@@ -162,6 +168,7 @@ private fun AppRoot(
     service: DoorbellService?,
     resumeTick: Int,
     onPickRingtone: (Intent) -> Unit,
+    onRequestTunnelControl: () -> Unit,
     onRunInBackground: () -> Unit,
     onQuit: () -> Unit,
 ) {
@@ -206,6 +213,7 @@ private fun AppRoot(
             service = service,
             resumeTick = resumeTick,
             onPickRingtone = onPickRingtone,
+            onRequestTunnelControl = onRequestTunnelControl,
             onBack = { screen = Screen.Main },
         )
     }

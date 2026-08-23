@@ -30,6 +30,7 @@ import de.beardedskunk.shellydoorbell.DoorIntents
 import de.beardedskunk.shellydoorbell.MainActivity
 import de.beardedskunk.shellydoorbell.OpenDoorActivity
 import de.beardedskunk.shellydoorbell.R
+import de.beardedskunk.shellydoorbell.WireGuard
 import de.beardedskunk.shellydoorbell.data.AppDb
 import de.beardedskunk.shellydoorbell.data.EventLog
 import de.beardedskunk.shellydoorbell.data.Prefs
@@ -114,6 +115,22 @@ class DoorbellService : Service() {
 
     /** „Auch unterwegs erreichbar" (LocalSettings.awayEnabled). */
     private val awayEnabled = MutableStateFlow(false)
+
+    /** Name des WireGuard-Tunnels nach Hause (LocalSettings.wgTunnel), leer = keiner. */
+    private val wgTunnel = MutableStateFlow("")
+
+    /** Letzte Aktion der Tunnel-Automatik, fuer die Einstellungen-Karte (null = noch keine). */
+    private val _tunnelAuto = MutableStateFlow<String?>(null)
+    val tunnelAuto: StateFlow<String?> = _tunnelAuto
+
+    /** true, wenn die Automatik den stehenden Tunnel selbst eingeschaltet hat. Nur den darf sie
+     *  beim Abschalten des Schalters wieder ausmachen — einen vom Nutzer von Hand gestarteten
+     *  Tunnel nicht (der kann andere Gruende haben). */
+    @Volatile private var appRaisedTunnel = false
+    private var awaySinceMs = 0L        // seit wann der WLAN-Pfad ohne Heimnetz ist (0 = nicht)
+    private var lastUpMs = 0L           // letzte AN-Sendung (elapsedRealtime)
+    private var lastDownMs = 0L         // letzte AUS-Sendung
+    private var upPendingSinceMs = 0L   // AN gesendet, VPN-Netz noch nicht da (0 = nichts offen)
 
     /** true, solange ein WLAN mit bekannt-gutem Namen (Whitelist) anliegt — also das Heim-WLAN.
      *  Gespeist vom [WifiWatcher], sobald der Name da ist. Steht dann der Tunnel, ist das
@@ -305,6 +322,7 @@ class DoorbellService : Service() {
         localAlarmEnabled = initial.alarmEnabled
         listenOnly.value = initial.listenOnly
         awayEnabled.value = initial.awayEnabled
+        wgTunnel.value = initial.wgTunnel
         if (localAlarmEnabled) startForegroundCompat()
         requestWifi()
         requestVpn()
@@ -322,7 +340,16 @@ class DoorbellService : Service() {
                 if (awayEnabled.value != it.awayEnabled) {
                     awayEnabled.value = it.awayEnabled
                     events.log("Unterwegs-Modus ${if (it.awayEnabled) "ein" else "aus"}geschaltet")
+                    // Schalter aus, und der stehende Tunnel stammt von uns: wieder ausmachen.
+                    if (!it.awayEnabled && appRaisedTunnel && vpn.value != null) {
+                        if (WireGuard.setTunnel(this@DoorbellService, wgTunnel.value, up = false)) {
+                            appRaisedTunnel = false
+                            events.log("Tunnel-Automatik: aus (Unterwegs-Modus abgeschaltet)")
+                            _tunnelAuto.value = "ausgeschaltet ${Fmt.time(System.currentTimeMillis() / 1000)} (Modus aus)"
+                        }
+                    }
                 }
+                wgTunnel.value = it.wgTunnel
                 setLocalAlarmEnabled(it.alarmEnabled)
                 // Beim Umschalten des Lauschmodus die Verbindung neu bewerten:
                 // eingeschaltet -> keine Auth-Aufrufe mehr; ausgeschaltet ->
@@ -504,6 +531,15 @@ class DoorbellService : Service() {
             }
         }
         scope.launch {
+            // Tunnel-Automatik (Schritt 2b, docs/vpn-von-unterwegs.md): alle 10 s nachsehen.
+            // Eine Uhr statt Ereignisse, weil die Bedingungen Dauer brauchen („2 min ohne
+            // Heimnetz") und das WLAN des Pixel im Minutentakt zuckt.
+            while (true) {
+                delay(TUNNEL_POLL_MS)
+                runCatching { tunnelAutomation() }.onFailure { Log.w(TAG, "Tunnel-Automatik: $it") }
+            }
+        }
+        scope.launch {
             // Live-Watt nur pollen, solange die App sichtbar ist — und nicht im
             // Lauschmodus (Switch.GetStatus wuerde ohne Passwort 401 spammen;
             // Watt/Schalterzustand kommen dort ohnehin per NotifyStatus). Live-
@@ -665,6 +701,7 @@ class DoorbellService : Service() {
                     events.log("VPN-Tunnel steht")
                 }
                 vpn.value = network
+                upPendingSinceMs = 0L
                 client.reconnectNow()
             }
 
@@ -1130,13 +1167,88 @@ class DoorbellService : Service() {
         scope.launch { recordProvisional(ts) }
         // Lokal stummgeschaltet: Ereignis landet trotzdem in der History
         if (!localAlarmEnabled) return
-        // Unterwegs (ueber den Tunnel) und „Nicht stoeren" ist an: leise melden statt Alarm.
-        // Daheim durchbricht der Alarm „Nicht stoeren" absichtlich — das bleibt so.
-        if (link.value?.tunnel == true && systemDndActive()) {
-            events.log("Klingeln leise gemeldet (unterwegs, Nicht stoeren)")
+        // „Nicht stoeren" am Handy heisst: nicht stoeren — daheim wie unterwegs, WLAN wie Tunnel
+        // (festgelegt am 23.08.2026). Dann gibt es statt Weckerton und Vollbild eine stille
+        // Benachrichtigung. AUSSER der Nutzer hat in den Einstellungen „Nicht stoeren durchbrechen"
+        // eingeschaltet (Nicht-stoeren-Zugriff erteilt, Kanal darf durchbrechen): Dann klingelt es
+        // trotz „Nicht stoeren" wie immer — genau dafuer ist die Einstellung da. Die Klingel im
+        // Flur laeutet in jedem Fall; wer auch die abstellen will, nimmt „Ruhe bis".
+        if (systemDndActive() && !Channels.canBypassDnd(this)) {
+            events.log("Klingeln leise gemeldet (Nicht stoeren ist an, kein Durchbrechen)")
             postQuietRingNotification()
         } else {
             startAlarm()
+        }
+    }
+
+    /**
+     * Schritt 2b: Die App schaltet den WireGuard-Tunnel selbst. Regeln (bewusst traege, siehe
+     * docs/vpn-von-unterwegs.md):
+     *
+     *  - **AN**, wenn der WLAN-Pfad seit [TUNNEL_UP_AFTER_MS] am Stueck ohne Heimnetz ist
+     *    (`NoWifi` oder `OtherNetwork`) und kein VPN-Netz steht — egal ob unterwegs oder daheim
+     *    mit WLAN aus und Mobilfunk an. Solange in einem WLAN noch versucht wird (`Connecting`),
+     *    nie: Das koennte das Heimnetz sein.
+     *  - **AUS**, sobald bei stehendem Tunnel das Heim-WLAN anliegt (Name in der Whitelist) —
+     *    sofort, denn ein stehender Tunnel faengt den WLAN-Verkehr ein und macht die Klingel
+     *    daheim unerreichbar. Zweiter AUS-Grund: WLAN da und der Tunnel liefert seit 45 s keine
+     *    Verbindung (`stuck`) — dann lieber das WLAN direkt probieren. Beim Vater (fremdes WLAN,
+     *    Tunnel funktioniert) greift keiner von beiden: kein Whitelist-Name, Verbindung steht.
+     *  - Wiederholungen fruehestens alle [TUNNEL_RETRY_MS]; ein AN, auf das binnen
+     *    [TUNNEL_UP_TIMEOUT_MS] kein VPN-Netz folgt, landet als Hinweis in Protokoll und Karte
+     *    (Name falsch oder Fernsteuerung in WireGuard nicht erlaubt — das laesst sich nicht
+     *    abfragen, nur beobachten).
+     *
+     * Laeuft nur mit Schalter „Auch unterwegs erreichbar", eingetragenem Tunnelnamen und erteilter
+     * Berechtigung. Alles andere ist die alte App.
+     */
+    private fun tunnelAutomation() {
+        val name = wgTunnel.value
+        if (!awayEnabled.value || name.isBlank() || !WireGuard.canControl(this)) {
+            awaySinceMs = 0L
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        val nowS = System.currentTimeMillis() / 1000
+        if (vpn.value != null) {
+            awaySinceMs = 0L
+            val reason = when {
+                homeWifi.value -> "Heim-WLAN da"
+                wifi.value != null && stuck.value -> "WLAN da, Tunnel liefert nichts"
+                else -> null
+            }
+            if (reason != null && now - lastDownMs >= TUNNEL_RETRY_MS) {
+                lastDownMs = now
+                if (WireGuard.setTunnel(this, name, up = false)) {
+                    appRaisedTunnel = false
+                    events.log("Tunnel-Automatik: aus ($reason)")
+                    _tunnelAuto.value = "ausgeschaltet ${Fmt.time(nowS)} ($reason)"
+                }
+            }
+            return
+        }
+        // Kein VPN-Netz. Ein offenes AN, dem nichts gefolgt ist, ist ein Hinweis wert.
+        if (upPendingSinceMs != 0L && now - upPendingSinceMs > TUNNEL_UP_TIMEOUT_MS) {
+            upPendingSinceMs = 0L
+            events.log("Tunnel-Automatik: Tunnel '$name' kam nicht (Name pruefen, Fernsteuerung in WireGuard erlauben)")
+            _tunnelAuto.value = "Tunnel '$name' kam nicht – Name prüfen, Fernsteuerung in WireGuard erlauben"
+        }
+        val st = client.state.value
+        val away = st is ConnectionState.NoWifi || st is ConnectionState.OtherNetwork
+        if (!away) {
+            awaySinceMs = 0L
+            return
+        }
+        if (awaySinceMs == 0L) awaySinceMs = now
+        if (now - awaySinceMs < TUNNEL_UP_AFTER_MS) return
+        if (now - lastUpMs < TUNNEL_RETRY_MS) return
+        lastUpMs = now
+        if (WireGuard.setTunnel(this, name, up = true)) {
+            upPendingSinceMs = now
+            appRaisedTunnel = true
+            val why = if (st is ConnectionState.NoWifi) "kein WLAN" else "Fremdnetz"
+            events.log("Tunnel-Automatik: an ($why)")
+            _tunnelAuto.value = "eingeschaltet ${Fmt.time(nowS)} ($why)"
         }
     }
 
@@ -1149,9 +1261,11 @@ class DoorbellService : Service() {
     }
 
     /**
-     * Das leise Klingeln: eine gewoehnliche Benachrichtigung auf dem Kanal ohne DND-Durchbruch —
-     * kein Weckerton, keine Vibration, kein Vollbild, kein Anruf-Banner. Nur „Tuer ansehen", falls
-     * die Tuersprecher-App da ist (ueber den Tunnel funktioniert sie, videoapp ab v1.66).
+     * Das leise Klingeln bei „Nicht stoeren": eine gewoehnliche Benachrichtigung auf dem Kanal
+     * ohne DND-Durchbruch — kein Weckerton, keine Vibration, kein Vollbild, kein Anruf-Banner. Ob
+     * sie sichtbar ist oder bis zum Ende von „Nicht stoeren" versteckt bleibt, entscheidet die
+     * Nicht-stoeren-Einstellung des Nutzers, nicht die App. Nur „Tuer ansehen", falls die
+     * Tuersprecher-App da ist (ueber den Tunnel funktioniert sie, videoapp ab v1.66).
      */
     private fun postQuietRingNotification() {
         val door = DoorIntents.doorIntent(this)
@@ -2069,6 +2183,22 @@ class DoorbellService : Service() {
          *  lang wie HOME_ASK_AFTER_MS, aus demselben Grund: Ein normaler Reconnect daheim kommt
          *  hier nie an, und das WLAN-Zucken auch nicht. */
         private const val STUCK_AFTER_MS = 45_000L
+
+        /** Takt der Tunnel-Automatik (siehe tunnelAutomation). */
+        private const val TUNNEL_POLL_MS = 10_000L
+
+        /** So lange muss der WLAN-Pfad am Stueck ohne Heimnetz sein, bevor der Tunnel angeht.
+         *  Kostet hoechstens ein Klingeln in den ersten zwei Minuten nach dem Verlassen des
+         *  Hauses; dafuer reisst kein WLAN-Zucker daheim den Tunnel hoch (der die Klingel
+         *  daheim abwuergen wuerde, siehe link). */
+        private const val TUNNEL_UP_AFTER_MS = 2 * 60_000L
+
+        /** Mindestabstand zwischen zwei gleichen Schaltbefehlen — WireGuard antwortet nicht, also
+         *  nicht haemmern, wenn es nicht wirkt (Fernsteuerung nicht erlaubt, Name falsch). */
+        private const val TUNNEL_RETRY_MS = 5 * 60_000L
+
+        /** Kommt nach einem AN so lange kein VPN-Netz, hat WireGuard den Befehl verworfen. */
+        private const val TUNNEL_UP_TIMEOUT_MS = 20_000L
 
         /** So lange bleibt der kurzlebige Callback mit Standort-Flagge hoechstens angemeldet.
          *  Kommt bis dahin kein WLAN-Name, kommt auch keiner mehr — dann lieber abmelden, sonst

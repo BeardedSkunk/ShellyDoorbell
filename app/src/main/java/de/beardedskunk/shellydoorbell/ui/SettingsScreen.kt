@@ -73,6 +73,7 @@ fun SettingsScreen(
     service: DoorbellService,
     resumeTick: Int,
     onPickRingtone: (Intent) -> Unit,
+    onRequestTunnelControl: () -> Unit,
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -91,6 +92,8 @@ fun SettingsScreen(
     val vpnUp by service.vpnUp.collectAsState()
     val viaTunnel by service.viaTunnel.collectAsState()
     val wireGuardInstalled = remember(resumeTick) { WireGuard.isInstalled(context) }
+    val tunnelControlOk = remember(resumeTick) { WireGuard.canControl(context) }
+    val tunnelAuto by service.tunnelAuto.collectAsState()
     var tunnelField by remember(settings?.wgTunnel) { mutableStateOf(settings?.wgTunnel ?: "") }
 
     // Berechtigungs-Status; resumeTick sorgt fuer Neubewertung nach Rueckkehr aus den System-Settings
@@ -305,6 +308,10 @@ fun SettingsScreen(
                 vpnUp = vpnUp,
                 viaTunnel = viaTunnel && connected,
                 reachedAt = settings?.tunnelReachedAt,
+                controlOk = tunnelControlOk,
+                onRequestControl = onRequestTunnelControl,
+                onOpenWireGuard = { WireGuard.launchIntent(context)?.let { context.startActivity(it) } },
+                autoStatus = tunnelAuto,
             )
 
             Card {
@@ -372,10 +379,11 @@ fun SettingsScreen(
                         ok = dndBypassOk,
                         title = "„Nicht stören“ durchbrechen",
                         detail = if (dndBypassOk) {
-                            "Der Alarm erscheint auch bei aktivem Nicht-stören-Modus."
+                            "Der Alarm klingelt auch bei aktivem Nicht-stören-Modus."
                         } else {
-                            "Alarm-Benachrichtigung erscheint auch bei aktivem Nicht-stören-Modus. " +
-                                "Dafür der App den Nicht-stören-Zugriff geben und danach hierher zurückkehren."
+                            "Aus: Bei aktivem Nicht-stören-Modus meldet sich die Klingel nur still, " +
+                                "zu Hause wie unterwegs. Zum Durchbrechen der App den Nicht-stören-Zugriff " +
+                                "geben und danach hierher zurückkehren."
                         },
                         buttonText = if (dndBypassOk) "Ändern" else "Zugriff geben",
                         notOkIcon = DndIcon,
@@ -417,6 +425,10 @@ private fun AwayCard(
     vpnUp: Boolean,
     viaTunnel: Boolean,
     reachedAt: Long?,
+    controlOk: Boolean,
+    onRequestControl: () -> Unit,
+    onOpenWireGuard: () -> Unit,
+    autoStatus: String?,
 ) {
     val nameSaved = savedTunnelName.isNotBlank()
     val nameChanged = tunnelName.trim() != savedTunnelName
@@ -448,8 +460,10 @@ private fun AwayCard(
                         when {
                             !installed -> "Braucht die WireGuard-App mit einem Tunnel ins Heimnetz."
                             !nameSaved -> "Erst oben den Tunnelnamen eintragen."
-                            else -> "Den Tunnel vorerst selbst schalten: unterwegs an, zu Hause aus — " +
-                                "steht er daheim, findet die App die Klingel nicht."
+                            controlOk -> "Die App schaltet den Tunnel selbst: an nach 2 Minuten ohne " +
+                                "Heim-WLAN, aus sobald das Heim-WLAN da ist."
+                            else -> "Ohne Fernsteuerung (unten) den Tunnel selbst schalten: unterwegs an, " +
+                                "zu Hause aus — steht er daheim, findet die App die Klingel nicht."
                         },
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -471,6 +485,24 @@ private fun AwayCard(
                         else -> "noch nie"
                     },
                 )
+                if (controlOk) StatusLine("Automatik", autoStatus ?: "noch nichts geschaltet")
+            }
+            if (installed && nameSaved) {
+                PermissionRow(
+                    ok = controlOk,
+                    title = "WireGuard fernsteuern",
+                    detail = if (controlOk) {
+                        "Die App darf den Tunnel schalten. Kommt er trotzdem nicht, in den " +
+                            "WireGuard-Einstellungen die Fernsteuerung durch andere Apps erlauben."
+                    } else {
+                        "Damit die App den Tunnel selbst ein- und ausschaltet: Berechtigung geben " +
+                            "und in den WireGuard-Einstellungen die Fernsteuerung durch andere Apps erlauben."
+                    },
+                    buttonText = if (controlOk) "WireGuard öffnen" else "Erlauben",
+                    alwaysShowButton = true,
+                ) {
+                    if (controlOk) onOpenWireGuard() else onRequestControl()
+                }
             }
         }
     }
