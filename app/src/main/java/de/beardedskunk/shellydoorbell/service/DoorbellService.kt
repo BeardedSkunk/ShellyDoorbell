@@ -128,8 +128,9 @@ class DoorbellService : Service() {
      *  Tunnel nicht (der kann andere Gruende haben). */
     @Volatile private var appRaisedTunnel = false
     private var awaySinceMs = 0L        // seit wann der WLAN-Pfad ohne Heimnetz ist (0 = nicht)
-    private var lastUpMs = 0L           // letzte AN-Sendung (elapsedRealtime)
+    private var upFailedAtMs = 0L       // letztes AN blieb ohne VPN-Netz (0 = keins offen)
     private var lastDownMs = 0L         // letzte AUS-Sendung
+    private var lastDownVpn: Network? = null // ... und fuer welches VPN-Netz
     private var upPendingSinceMs = 0L   // AN gesendet, VPN-Netz noch nicht da (0 = nichts offen)
 
     /** true, solange ein WLAN mit bekannt-gutem Namen (Whitelist) anliegt — also das Heim-WLAN.
@@ -702,7 +703,11 @@ class DoorbellService : Service() {
                 }
                 vpn.value = network
                 upPendingSinceMs = 0L
+                upFailedAtMs = 0L
                 client.reconnectNow()
+                // Tunnel kam, waehrend das Heim-WLAN anliegt (von Hand gestartet oder ein
+                // Zucker hat ihn doch hochgebracht): sofort wieder aus, nicht erst im Takt.
+                if (homeWifi.value) runCatching { tunnelAutomation() }
             }
 
             override fun onLost(network: Network) {
@@ -758,7 +763,7 @@ class DoorbellService : Service() {
             // Whitelist-Abkuerzung dauerhaft blind. Den Namen liefert [startSsidProbe].
             readSsid(caps)?.let { ssid = it }
             wifiGate.onNetwork(network, ssid, ipv4, prefix)
-            homeWifi.value = wifiGate.isKnownGood()
+            noteHomeWifi()
         }
 
         /**
@@ -813,7 +818,7 @@ class DoorbellService : Service() {
             ssid = name
             Log.d(TAG, "WLAN-Name geholt: $name")
             wifiGate.onNetwork(network, name, ipv4, prefix)
-            homeWifi.value = wifiGate.isKnownGood()
+            noteHomeWifi()
             stopSsidProbe()
         }
 
@@ -822,6 +827,17 @@ class DoorbellService : Service() {
             ipv4 = (la?.address as? Inet4Address)?.address
             prefix = la?.prefixLength ?: 0
             wifiGate.onNetwork(network, ssid, ipv4, prefix)
+        }
+
+        /** Heim-WLAN (Whitelist) anliegend? Wird es gerade erkannt und steht ein Tunnel, soll der
+         *  sofort weg — nicht erst beim naechsten Takt (Entscheidung 23.08.2026). */
+        private fun noteHomeWifi() {
+            val home = wifiGate.isKnownGood()
+            val changed = homeWifi.value != home
+            homeWifi.value = home
+            if (changed && home && vpn.value != null) {
+                runCatching { tunnelAutomation() }.onFailure { Log.w(TAG, "Tunnel-Automatik: $it") }
+            }
         }
 
         fun lost(network: Network) {
@@ -1194,14 +1210,21 @@ class DoorbellService : Service() {
      *    daheim unerreichbar. Zweiter AUS-Grund: WLAN da und der Tunnel liefert seit 45 s keine
      *    Verbindung (`stuck`) — dann lieber das WLAN direkt probieren. Beim Vater (fremdes WLAN,
      *    Tunnel funktioniert) greift keiner von beiden: kein Whitelist-Name, Verbindung steht.
-     *  - Wiederholungen fruehestens alle [TUNNEL_RETRY_MS]; ein AN, auf das binnen
-     *    [TUNNEL_UP_TIMEOUT_MS] kein VPN-Netz folgt, landet als Hinweis in Protokoll und Karte
-     *    (Name falsch oder Fernsteuerung in WireGuard nicht erlaubt — das laesst sich nicht
-     *    abfragen, nur beobachten).
+     *  - Ein AN, auf das binnen [TUNNEL_UP_TIMEOUT_MS] kein VPN-Netz folgt, landet als Hinweis
+     *    in Protokoll und Karte (Name falsch oder Fernsteuerung in WireGuard nicht erlaubt — das
+     *    laesst sich nicht abfragen, nur beobachten); danach wird fruehestens nach
+     *    [TUNNEL_RETRY_MS] erneut geschickt. Ein AUS wird je VPN-Netz einmal geschickt, bei
+     *    Wirkungslosigkeit ebenfalls erst nach [TUNNEL_RETRY_MS] wieder. Hat ein Befehl gewirkt,
+     *    gibt es keine Sperre: Kurz weg und zurueck schaltet so oft wie noetig.
      *
      * Laeuft nur mit Schalter „Auch unterwegs erreichbar", eingetragenem Tunnelnamen und erteilter
      * Berechtigung. Alles andere ist die alte App.
+     *
+     * Aufgerufen im [TUNNEL_POLL_MS]-Takt (fuers AN, das Dauer braucht) UND ereignisgesteuert
+     * (Heim-WLAN-Name erkannt, VPN-Netz aufgetaucht — fuers AUS, das sofort passieren soll).
+     * Deshalb synchronisiert: Die Zeitstempel werden sonst von zwei Threads geschrieben.
      */
+    @Synchronized
     private fun tunnelAutomation() {
         val name = wgTunnel.value
         if (!awayEnabled.value || name.isBlank() || !WireGuard.canControl(this)) {
@@ -1217,8 +1240,10 @@ class DoorbellService : Service() {
                 wifi.value != null && stuck.value -> "WLAN da, Tunnel liefert nichts"
                 else -> null
             }
-            if (reason != null && now - lastDownMs >= TUNNEL_RETRY_MS) {
+            val sameVpn = vpn.value == lastDownVpn
+            if (reason != null && (!sameVpn || now - lastDownMs >= TUNNEL_RETRY_MS)) {
                 lastDownMs = now
+                lastDownVpn = vpn.value
                 if (WireGuard.setTunnel(this, name, up = false)) {
                     appRaisedTunnel = false
                     events.log("Tunnel-Automatik: aus ($reason)")
@@ -1230,6 +1255,7 @@ class DoorbellService : Service() {
         // Kein VPN-Netz. Ein offenes AN, dem nichts gefolgt ist, ist ein Hinweis wert.
         if (upPendingSinceMs != 0L && now - upPendingSinceMs > TUNNEL_UP_TIMEOUT_MS) {
             upPendingSinceMs = 0L
+            upFailedAtMs = now
             events.log("Tunnel-Automatik: Tunnel '$name' kam nicht (Name pruefen, Fernsteuerung in WireGuard erlauben)")
             _tunnelAuto.value = "Tunnel '$name' kam nicht – Name prüfen, Fernsteuerung in WireGuard erlauben"
         }
@@ -1241,8 +1267,8 @@ class DoorbellService : Service() {
         }
         if (awaySinceMs == 0L) awaySinceMs = now
         if (now - awaySinceMs < TUNNEL_UP_AFTER_MS) return
-        if (now - lastUpMs < TUNNEL_RETRY_MS) return
-        lastUpMs = now
+        if (upPendingSinceMs != 0L) return                                   // AN laeuft noch
+        if (upFailedAtMs != 0L && now - upFailedAtMs < TUNNEL_RETRY_MS) return // ins Leere -> warten
         if (WireGuard.setTunnel(this, name, up = true)) {
             upPendingSinceMs = now
             appRaisedTunnel = true
@@ -2184,14 +2210,16 @@ class DoorbellService : Service() {
          *  hier nie an, und das WLAN-Zucken auch nicht. */
         private const val STUCK_AFTER_MS = 45_000L
 
-        /** Takt der Tunnel-Automatik (siehe tunnelAutomation). */
-        private const val TUNNEL_POLL_MS = 10_000L
+        /** Takt der Tunnel-Automatik fuers EINschalten (das braucht Dauer, siehe tunnelAutomation);
+         *  das AUSschalten laeuft ereignisgesteuert (Heim-WLAN erkannt, VPN aufgetaucht). */
+        private const val TUNNEL_POLL_MS = 5_000L
 
         /** So lange muss der WLAN-Pfad am Stueck ohne Heimnetz sein, bevor der Tunnel angeht.
-         *  Kostet hoechstens ein Klingeln in den ersten zwei Minuten nach dem Verlassen des
-         *  Hauses; dafuer reisst kein WLAN-Zucker daheim den Tunnel hoch (der die Klingel
-         *  daheim abwuergen wuerde, siehe link). */
-        private const val TUNNEL_UP_AFTER_MS = 2 * 60_000L
+         *  Bemessen an den gemessenen WLAN-Aussetzern des Pixel daheim (23.08.: fuenf Stueck,
+         *  alle unter 5 s) — die duerfen den Tunnel nicht hochreissen, weil ein Tunnel im
+         *  Heim-WLAN die Klingel abwuergt (siehe link). Mehr als das ist nur Verzoegerung:
+         *  Erst waren es 120 s, auf Wunsch des Nutzers 20 s (Entscheidung 23.08.2026). */
+        private const val TUNNEL_UP_AFTER_MS = 20_000L
 
         /** Mindestabstand zwischen zwei gleichen Schaltbefehlen — WireGuard antwortet nicht, also
          *  nicht haemmern, wenn es nicht wirkt (Fernsteuerung nicht erlaubt, Name falsch). */

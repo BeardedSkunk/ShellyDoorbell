@@ -13,8 +13,8 @@ android {
         applicationId = "de.beardedskunk.shellydoorbell"
         minSdk = 29
         targetSdk = 36
-        versionCode = 12
-        versionName = "1.4.0"
+        versionCode = 13
+        versionName = "1.4.1"
     }
 
     buildTypes {
