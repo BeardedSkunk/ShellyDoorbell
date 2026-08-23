@@ -1,7 +1,8 @@
 # Von unterwegs erreichbar sein (WireGuard)
 
-Status: **Schritt 1 erledigt am 21.08.2026** (videoapp v1.66), Test von außen bestanden. Schritt 2
-(Klingel-App) ist **geplant, nicht gebaut** — der Plan steht unten („Schritt 2 — der Plan").
+Status: **Schritt 1 erledigt am 21.08.2026** (videoapp v1.66), Test von außen bestanden.
+**Schritt 2a gebaut am 23.08.2026** (ShellyDoorbell v1.3.0, auf dem Pixel) — die App nutzt einen
+stehenden Tunnel. Schritt 2b (die App schaltet den Tunnel selbst) steht aus; Plan unten.
 
 Vorgehen ist bewusst schrittweise. Reihenfolge und Stand:
 
@@ -11,8 +12,8 @@ Vorgehen ist bewusst schrittweise. Reihenfolge und Stand:
 | Pixel mit der FRITZ!Box-Verbindung koppeln | **fertig** (Tunnel „Home64", 21.08.) |
 | Test von außen (WLAN aus, nur Mobilfunk) | **bestanden** 21.08. — FRITZ!Box und Video erreichbar |
 | `AllowedIPs` auf das Heimnetz eingrenzen | offen — macht der Nutzer in der WireGuard-App |
-| Klingel-App: Schalter „auch unterwegs" (2a) | geplant, siehe unten |
-| Klingel-App schaltet den Tunnel selbst (2b) | geplant, nach 2a |
+| Klingel-App: Schalter „auch unterwegs" (2a) | **gebaut** (v1.3.0, 23.08.) — Test unterwegs durch den Nutzer offen |
+| Klingel-App schaltet den Tunnel selbst (2b) | geplant, nach dem Test von 2a |
 
 **Die Klingel bekommt einen Schalter, die videoapp nicht.** So hat es der Nutzer entschieden, und
 es ist richtig: Die Videoübertragung weckt niemanden — wenn sie von unterwegs kann, soll sie es
@@ -200,9 +201,17 @@ ist nicht gemessen und für die Bauweise egal. **Folge: „zu Hause angekommen �
 keine Bequemlichkeit, sondern Pflicht.** Ohne das ist die Klingel daheim tot, sobald der Tunnel
 einmal an war.
 
-### 2a — die App nutzt einen stehenden Tunnel
+### 2a — die App nutzt einen stehenden Tunnel (gebaut, v1.3.0)
 
-Der WLAN-Pfad bleibt **unverändert und vorrangig**. Daneben ein zweiter, schlichter Pfad:
+Der WLAN-Pfad bleibt **unverändert**. Daneben ein zweiter, schlichter Pfad — mit einer Abweichung
+vom ursprünglichen Plan: **Steht der Tunnel, hat er Vorrang**, nicht das WLAN. Nicht aus Vorliebe,
+sondern weil Android es erzwingt (siehe die Falle oben): Ein stehender Tunnel fängt den
+WLAN-Verkehr ohnehin ein, also ist er der Weg, ob man will oder nicht — ehrlicher ist, ihn dann
+auch so zu benutzen und zu benennen. Ohne den Schalter zählt ein VPN nicht (es könnte ein fremdes
+sein, Firmen-VPN oder Privatsphäre-Dienst); dann verhält sich die App wie vor v1.3.
+
+Umgesetzt in `DoorbellService` (`link`, `requestVpn`, `NetCtx`, `postQuietRingNotification`),
+`ShellyClient` (`Link`, kein Tor über den Tunnel), `SettingsScreen` (`AwayCard`), `WireGuard.kt`.
 
 - **Ein zweiter Wächter** neben `WifiWatcher`: `registerNetworkCallback` auf `TRANSPORT_VPN`
   (mit `removeCapability(NOT_VPN)`), liefert `vpn: StateFlow<Network?>`. Keine Berechtigung,
@@ -216,8 +225,11 @@ Der WLAN-Pfad bleibt **unverändert und vorrangig**. Daneben ein zweiter, schlic
   Hause?" — ein Tunnel ist *absichtlich* zu Hause. Es bleibt der normale Backoff, Deckel 60 s
   (Aussetzer im Mobilfunk sind kurz).
 - **Texte:** verbunden über den Tunnel → „Verbunden übers VPN – lausche auf die Klingel" (blau,
-  mit DND-Zeichen bei Ruhe wie daheim). Schalter an, unterwegs, kein Tunnel → „Unterwegs – VPN ist
-  aus" (grau). Alles andere bleibt; mit Schalter aus bleiben **alle** Texte wie heute.
+  mit DND-Zeichen bei Ruhe wie daheim), „Verbinde übers VPN …" (grau). Schalter an, unterwegs,
+  kein Tunnel → „Unterwegs – VPN ist aus" (grau). **Tunnel an und Heim-WLAN (Whitelist) liegt an,
+  ohne Verbindung → „Zu Hause – VPN abschalten" (rot)** — das ist die Falle von oben, und der
+  Nutzer kann sie beheben, deshalb rot mit Handlungsanweisung. Alles andere bleibt; mit Schalter
+  aus bleiben **alle** Texte wie heute.
 - **Klingeln unterwegs:** Ist „Nicht stören" am Handy aktiv (`currentInterruptionFilter != ALL`,
   ohne Berechtigung lesbar), kommt das Klingeln **leise**: eine Benachrichtigung auf einem
   zweiten Kanal ohne `setBypassDnd`, ohne Wecker-Stream, ohne Vollbild — mit „Tür ansehen", und
@@ -273,8 +285,11 @@ es sich zu messen, was der Tunnel am Tag an Akku kostet.
 
 ### Reihenfolge und Abnahme
 
-1. **2a bauen**, aufs Pixel, Nutzer testet unterwegs mit von Hand geschaltetem Tunnel: Klingeln
-   kommt an, „Tür ansehen" öffnet die videoapp über den Tunnel, mit „Nicht stören" kommt es leise.
+1. **2a gebaut (v1.3.0).** Einrichten: Einstellungen → „Unterwegs" → Tunnelname `Home64`
+   eintragen, Übernehmen, Schalter an. Nutzer testet unterwegs mit von Hand geschaltetem Tunnel:
+   Klingeln kommt an, „Tür ansehen" öffnet die videoapp über den Tunnel, mit „Nicht stören" kommt
+   es leise. Prüfstein: Ereignisprotokoll zeigt `VPN-Tunnel steht`, `verbunden (…) ueber Tunnel`,
+   `Klingel ueber den Tunnel erreicht`; die Karte zeigt „zuletzt …" statt „noch nie".
 2. **Probelauf Fernsteuerung** per adb (mit Ansage), dann **2b bauen**. Abnahme: Haus verlassen →
    nach 2 min steht der Tunnel; nach Hause kommen → Tunnel aus, Klingel direkt verbunden.
    Prüfstein am Gerät: Ereignisprotokoll der App (`files/log/events.log`) zeigt beide Schaltungen

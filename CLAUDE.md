@@ -48,8 +48,10 @@ Schwelle + Sperrzeit und broadcastet an alle verbundenen Clients. Die App entsch
 das Klingeln — sie hört zu und schlägt Alarm.
 
 **Die Handys verbinden sich ZUM Shelly** (`ws://<ip>/rpc`), nie umgekehrt. Jede App hält per
-Foreground-Service eine dauerhafte WebSocket-Verbindung, gebunden ans WLAN-`Network` (SocketFactory
-+ DNS) — **Mobilfunk wird nie benutzt**. Idle sind das ~ein Ping alle 25 s.
+Foreground-Service eine dauerhafte WebSocket-Verbindung, gebunden an ein `Network` (SocketFactory
++ DNS): das WLAN oder — seit v1.3.0, nur mit dem Schalter „Auch unterwegs erreichbar" — den
+WireGuard-Tunnel (`Link` in `ShellyClient`). **Nacktes Mobilfunk wird nie benutzt**: Ohne Tunnel
+gibt es unterwegs kein Netz, an das gebunden werden könnte. Idle sind das ~ein Ping alle 25 s.
 
 **Script-Single-Source:** `shelly/doorbell.js` wird von `CopyDoorbellScriptTask`
 (`app/build.gradle.kts`) als Asset gebündelt — **nie ein Duplikat unter `app/src/main/assets/`
@@ -196,8 +198,15 @@ bessere Beweis. Zu Hause wird deshalb **nie** gemessen.
 > **Prüfstein:** `dumpsys activity services de.beardedskunk.shellydoorbell` → `types=0x40000000`
 > ist nur `specialUse` (gut), `0x40000008` hätte `location` dabei.
 
-Zurückgestellt: der Zugriff **von unterwegs** über WireGuard — durchdacht, nichts gebaut, alles in
-`docs/vpn-von-unterwegs.md`.
+> **Der Tunnel hat Vorrang, sobald er steht** (`DoorbellService.link`). Das ist keine Wahl: Ein
+> Android-VPN ist ohne `allowBypass()` nicht umgehbar und fängt auch Sockets ein, die ausdrücklich
+> ans WLAN gebunden sind — am 23.08.2026 vom Nutzer beobachtet (Tunnel an im Heim-WLAN, Klingel
+> tot). Über den Tunnel gibt es **kein Tor und kein Lernen**: keine Whitelist, keine Homezone —
+> beim Vater steht das Handy in fremdem WLAN an fremdem Ort, während es mit der Klingel spricht.
+> Liegt das Heim-WLAN (Whitelist) an und der Tunnel steht, sagt die Notification rot „Zu Hause –
+> VPN abschalten". Klingeln über den Tunnel bei aktivem „Nicht stören": leise (Kanal
+> `ring_quiet`, kein DND-Durchbruch). Geschichte, Plan und der noch offene Schritt 2b (die App
+> schaltet den Tunnel selbst) in `docs/vpn-von-unterwegs.md`.
 
 **Die HomeZone-Zahlen sind bewusst großzügig**, und zwar asymmetrisch: der Radius ist 80 m statt der
 gewünschten 15 m, weil stehende GPS-Fixes real 30–50 m driften. Ein Fix mit schlechterer Genauigkeit
@@ -243,7 +252,7 @@ sobald die UI sichtbar wird.
 | `data/Db.kt` / `Prefs.kt` | Room (lokale History) / DataStore (lokale Einstellungen, WLAN-Listen, Homezone) |
 | `ui/MainScreen.kt` | Verbindungs-, Klingel-, Klingelzeiten- und Ereignis-Karten |
 | `ui/SettingsScreen.kt` | Shelly-Zugang, Erkennung, Zuverlässigkeits-Checkliste (Berechtigungen) |
-| root | `MainActivity`, `AlarmActivity` (Vollbild über Sperrbildschirm), `OpenDoorActivity` (Trampolin), `DoorIntents`, `BootReceiver` |
+| root | `MainActivity`, `AlarmActivity` (Vollbild über Sperrbildschirm), `OpenDoorActivity` (Trampolin), `DoorIntents`, `WireGuard` (installiert? — mehr kann man nicht wissen), `BootReceiver` |
 
 > **Der Vollbild-Alarm bleibt bei eingeschaltetem Bildschirm absichtlich aus.** Android startet die
 > Activity aus einem `setFullScreenIntent` nur, wenn der Bildschirm **gesperrt oder aus** ist; sonst
@@ -289,11 +298,13 @@ einfach der Button.
 
 ## Aktueller Stand
 
-Branch `main`, **v1.2.1**, Script-Version 6. Auf dem Pixel installiert und am Geraet geprueft
-(20.08.2026): kein Standort-Abo mehr, und `wifi_whitelist` enthaelt erstmals das Heim-WLAN — der
-WLAN-Name kommt also an.
+Branch `main`, **v1.3.0**, Script-Version 6. Auf dem Pixel installiert (23.08.2026); der
+Unterwegs-Modus ist dort noch nicht eingeschaltet und unterwegs noch nicht getestet.
 
-Zuletzt: der Rueckfall vom 20.08. behoben (geschwaerzter WLAN-Name, siehe oben). Davor: das
+Zuletzt: Unterwegs-Modus 2a (Tunnel-Pfad, leises Klingeln, Karte „Unterwegs"). Davor v1.2.2–1.2.5:
+der blaue Punkt (FGS-Typ `location` nur ohne Hintergrund-Berechtigung, Ortung erst nach 45 s
+Fehlversuchen), einheitliche Fremdnetz-Texte. Davor der Rueckfall vom 20.08. behoben
+(geschwaerzter WLAN-Name, siehe oben). Davor: das
 Klingeln meldet sich als eingehender Anruf, dazu ein dauerhaftes Ereignis-Protokoll
 (neu: `data/EventLog.kt`), und der Alarmton kommt sofort statt nach viereinhalb Sekunden. Davor
 Homezone (Lernen, drei Altersfenster, Hintergrund-Berechtigung), die Dauer-Notification mit
