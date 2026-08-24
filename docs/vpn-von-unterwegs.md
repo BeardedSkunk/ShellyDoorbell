@@ -12,8 +12,9 @@ Vorgehen ist bewusst schrittweise. Reihenfolge und Stand:
 | Pixel mit der FRITZ!Box-Verbindung koppeln | **fertig** (Tunnel „Home64", 21.08.) |
 | Test von außen (WLAN aus, nur Mobilfunk) | **bestanden** 21.08. — FRITZ!Box und Video erreichbar |
 | `AllowedIPs` auf das Heimnetz eingrenzen | offen — macht der Nutzer in der WireGuard-App |
-| Klingel-App: Schalter „auch unterwegs" (2a) | **gebaut** (v1.3.0, 23.08.) — Test unterwegs durch den Nutzer offen |
-| Klingel-App schaltet den Tunnel selbst (2b) | geplant, nach dem Test von 2a |
+| Klingel-App: Schalter „auch unterwegs" (2a) | **gebaut und unterwegs getestet** (v1.3.0–1.3.1, 23.08.) |
+| Klingel-App schaltet den Tunnel selbst (2b) | **gebaut** (v1.4.0–1.4.1); AUS am 24.08. beobachtet, Auto-AN unterwegs offen |
+| `AllowedIPs` auf das Heimnetz eingrenzen | **offen** — wichtiger denn je: Die Automatik schaltet den Voll-Tunnel jetzt selbst ein |
 
 **Die Klingel bekommt einen Schalter, die videoapp nicht.** So hat es der Nutzer entschieden, und
 es ist richtig: Die Videoübertragung weckt niemanden — wenn sie von unterwegs kann, soll sie es
@@ -245,7 +246,28 @@ Umgesetzt in `DoorbellService` (`link`, `requestVpn`, `NetCtx`, `postQuietRingNo
   installiert / fehlt* · *Tunnel: aktiv / aus* · *Klingel über den Tunnel erreicht: zuletzt … /
   noch nie*.
 
-### 2b — die App schaltet den Tunnel
+### 2b — die App schaltet den Tunnel (gebaut, v1.4.0–1.4.1)
+
+**Regeln wie gebaut:** AN nach **20 s** am Stück ohne Heimnetz (`NoWifi`/`OtherNetwork`, Takt 5 s)
+— 120 s waren Verzögerung ohne Nutzen, die gemessenen WLAN-Aussetzer daheim liegen alle unter 5 s.
+AUS **ereignisgesteuert sofort**: Heim-WLAN-Name erkannt, oder ein VPN-Netz taucht auf, während
+das Heim-WLAN anliegt; zweiter AUS-Grund im Takt: WLAN da, Tunnel liefert 45 s nichts. Schalter
+aus ⇒ nur ein von der App gestarteter Tunnel wird beendet. Wirkungslose Befehle (AN ohne
+folgendes VPN-Netz; AUS je VPN-Netz einmal) werden erst nach 5 min wiederholt — gewirkte sofort
+wieder, kurz weg und zurück schaltet so oft wie nötig.
+
+**Einrichtung, beides nötig:** (1) Berechtigung „WireGuard fernsteuern" in der Karte „Unterwegs"
+erlauben. (2) **In WireGuard unter Advanced die Fernsteuerung (Remote control apps) einschalten**
+— am 24.08. bestätigt: ohne sie wirft WireGuard die Befehle still weg, die App kann das nur am
+ausbleibenden VPN-Netz erkennen („Tunnel kam nicht"). Ein bereits ins Leere geschicktes AUS wird
+erst nach 5 min wiederholt — deshalb dauerte der erste Ab-Schaltvorgang nach dem Freischalten
+länger als erwartet; einmalig, kein Fehler.
+
+**Nebenbefund (24.08.):** Bei stehendem Voll-Tunnel ist das Pixel im Heimnetz unter seiner
+**Tunnel-Adresse** `192.168.178.203` erreichbar (adb!), nicht unter der WLAN-Adresse — die
+FRITZ!Box routet LAN → WireGuard-Client. Nützlich für Diagnose.
+
+#### Die ursprüngliche Erkundung (23.08.)
 
 **Am Pixel nachgeprüft (23.08.2026, `dumpsys package com.wireguard.android`, Version
 1.0.20260315):** Es gibt den Empfänger `com.wireguard.android/.model.TunnelManager$IntentReceiver`

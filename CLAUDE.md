@@ -204,9 +204,17 @@ bessere Beweis. Zu Hause wird deshalb **nie** gemessen.
 > tot). Über den Tunnel gibt es **kein Tor und kein Lernen**: keine Whitelist, keine Homezone —
 > beim Vater steht das Handy in fremdem WLAN an fremdem Ort, während es mit der Klingel spricht.
 > Liegt das Heim-WLAN (Whitelist) an und der Tunnel steht, sagt die Notification rot „Zu Hause –
-> VPN abschalten". Klingeln über den Tunnel bei aktivem „Nicht stören": leise (Kanal
-> `ring_quiet`, kein DND-Durchbruch). Geschichte, Plan und der noch offene Schritt 2b (die App
-> schaltet den Tunnel selbst) in `docs/vpn-von-unterwegs.md`.
+> VPN abschalten" — und seit v1.4.0 schaltet ihn die **Tunnel-Automatik** selbst
+> (`tunnelAutomation`): AN nach 20 s am Stück ohne Heimnetz, AUS ereignisgesteuert sofort, wenn
+> der Heim-WLAN-Name erkannt ist. Braucht die WireGuard-Berechtigung `CONTROL_TUNNELS` (Laufzeit-
+> Dialog) **und** in den WireGuard-Einstellungen (Advanced) die erlaubte Fernsteuerung — Letzteres
+> ist nicht abfragbar; ein AN ohne folgendes VPN-Netz landet als Hinweis in Karte und Protokoll,
+> wirkungslose Befehle werden erst nach 5 min wiederholt. Geschichte und Regeln in
+> `docs/vpn-von-unterwegs.md`.
+>
+> **„Nicht stören" gilt auch für die Klingel** (23.08.2026): an + „durchbrechen" aus ⇒ stille
+> Benachrichtigung (Kanal `ring_quiet`) statt Alarm — daheim wie unterwegs. Die Einstellungs-Zeile
+> „Nicht stören durchbrechen" bleibt; mit ihr klingelt es weiterhin durch.
 
 **Die HomeZone-Zahlen sind bewusst großzügig**, und zwar asymmetrisch: der Radius ist 80 m statt der
 gewünschten 15 m, weil stehende GPS-Fixes real 30–50 m driften. Ein Fix mit schlechterer Genauigkeit
@@ -282,6 +290,15 @@ einfach der Button.
 
 ## Fallstricke
 
+- **Der Shelly liefert Notifications nur an den ERSTEN Kanal einer `src`-Kennung.** Am Gerät
+  nachgewiesen (23.08.2026, zwei PC-Verbindungen mit derselben Kennung): Die zweite bekommt
+  Antworten auf eigene Aufrufe, aber keinen einzigen Broadcast — sie ist taub, und zwar ohne jedes
+  Fehlzeichen. Mit einer festen Kennung je Client war jede Neuverbindung nach einem Abriss ohne
+  FIN (IP-Wechsel, Tunnel weg, WLAN aus) minutenlang taub: „verbunden", Watt-Anzeige lief über
+  NotifyStatus an den Zombie … nein — gar nichts kam, ein Klingeln ging verloren. Deshalb erzeugt
+  `runSession()` **je Verbindung eine frische `src`**, und der Heartbeat-Wächter zählt auch
+  Verbindungen, die seit dem Aufbau NIE ein Lebenszeichen sahen (95 s → einmal nachfragen → weiter
+  stumm → Neuaufbau mit wachsendem Abstand). Gilt für alle Shelly-Gen2/3-Projekte.
 - **Script-Version vergessen hochzuzählen** = das Update kommt auf keinem Handy an. Erste Zeile.
 - **Kein Duplikat des Scripts** unter `app/src/main/assets/` anlegen — der Gradle-Task erzeugt es.
 - **Nicht parallel RPCs feuern.** Der Shelly ist schwach: parallele Calls quittiert er mit 429 und
@@ -298,10 +315,14 @@ einfach der Button.
 
 ## Aktueller Stand
 
-Branch `main`, **v1.3.0**, Script-Version 6. Auf dem Pixel installiert (23.08.2026); der
-Unterwegs-Modus ist dort noch nicht eingeschaltet und unterwegs noch nicht getestet.
+Branch `main`, **v1.4.1**, Script-Version 6. Auf dem Pixel installiert (23.08.2026); Unterwegs-
+Modus samt Tunnel-Automatik dort aktiv (Fernsteuerung in WireGuard freigegeben am 24.08., erster
+Ab-Schaltvorgang beobachtet). Offen: Test des Auto-AN unterwegs; `AllowedIPs` auf dem Pixel ist
+noch Voll-Tunnel.
 
-Zuletzt: Unterwegs-Modus 2a (Tunnel-Pfad, leises Klingeln, Karte „Unterwegs"). Davor v1.2.2–1.2.5:
+Zuletzt: Tunnel-Automatik 2b (20 s / ereignisgesteuert, v1.4.0–1.4.1), die Nicht-stören-Regel,
+davor der Taubheits-Fix (frische `src` je Verbindung + stummer-Kanal-Wächter, v1.3.2, siehe
+Fallstricke) und Unterwegs-Modus 2a (Tunnel-Pfad, leises Klingeln, v1.3.0–1.3.1). Davor v1.2.2–1.2.5:
 der blaue Punkt (FGS-Typ `location` nur ohne Hintergrund-Berechtigung, Ortung erst nach 45 s
 Fehlversuchen), einheitliche Fremdnetz-Texte. Davor der Rueckfall vom 20.08. behoben
 (geschwaerzter WLAN-Name, siehe oben). Davor: das
