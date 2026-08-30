@@ -212,6 +212,12 @@ bessere Beweis. Zu Hause wird deshalb **nie** gemessen.
 > wirkungslose Befehle werden erst nach 5 min wiederholt. Geschichte und Regeln in
 > `docs/vpn-von-unterwegs.md`.
 >
+> Zwei Nebenwirkungen des Tunnels, die man kennen muss: **Bei stehendem Tunnel ist das Pixel im
+> eigenen LAN unter seiner Tunnel-Adresse `192.168.178.203` per adb erreichbar, nicht unter der
+> WLAN-Adresse.** Und die AllowedIPs `192.168.176.0/22` fangen in fremden Netzen mit
+> 178.x-Adressen (z. B. beim Vater — FRITZ!Box-Voreinstellung) auch das dortige lokale Netz ab:
+> für die Klingel gewollt, lokale Geräte dort sind dann aber nicht erreichbar.
+>
 > **„Nicht stören" gilt auch für die Klingel** (23.08.2026): an + „durchbrechen" aus ⇒ stille
 > Benachrichtigung (Kanal `ring_quiet`) statt Alarm — daheim wie unterwegs. Die Einstellungs-Zeile
 > „Nicht stören durchbrechen" bleibt; mit ihr klingelt es weiterhin durch.
