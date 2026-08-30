@@ -293,6 +293,9 @@ einfach der Button.
   in einen Sammel-Commit. Message auf Deutsch im Stil der History: Betreff = Problem/Bereich, dann
   Ursache und Wirkung. Mehrzeilig über `git commit -F` (PowerShell zerlegt Here-Strings).
   **Nicht pushen** ohne Auftrag.
+- **Jeder Commit, der die App verändert, zählt `versionCode` (+1) und mindestens die dritte
+  Stelle des `versionName` hoch** (globales Memory `versionsnummer-pro-commit`; reine
+  Doku-Commits ausgenommen). Das Shelly-Skript zählt zusätzlich seine eigene Version in Zeile 1.
 
 ## Fallstricke
 
